@@ -1,0 +1,154 @@
+{
+  "schema_version": "1.0",
+  "scenario_id": "town03-long-patrol-v1",
+  "scenario_name": "Town03三车长程连续巡检可视化演示",
+  "instruction": "三类装备分别执行两段连续巡检；观察相机跟随当前最高优先级任务车辆，全部任务完成后驻车。",
+  "carla": {
+    "root": "/home/hjy/桌面/carla0.9.10_package/CARLA_0.9.10-dirty",
+    "host": "127.0.0.1",
+    "port": 2000,
+    "timeout_seconds": 10.0,
+    "map_name": "Town03"
+  },
+  "vehicles": [
+    {
+      "vehicle_id": "inspection_vehicle_01",
+      "display_name": "等效感知巡检车01",
+      "equipment_type": "perception_inspection",
+      "role_name": "inspection_vehicle_01",
+      "blueprint": "vehicle.tesla.model3",
+      "spawn_point_index": 136,
+      "mock_position": {"x": 0.0, "y": 0.0, "z": 0.0},
+      "target_speed_kmh": 12.0,
+      "capabilities": [
+        "inspection",
+        "camera",
+        "visual_patrol"
+      ]
+    },
+    {
+      "vehicle_id": "inspection_vehicle_02",
+      "display_name": "等效融合巡检车02",
+      "equipment_type": "fusion_inspection",
+      "role_name": "inspection_vehicle_02",
+      "blueprint": "vehicle.audi.tt",
+      "spawn_point_index": 122,
+      "mock_position": {"x": 30.0, "y": 0.0, "z": 0.0},
+      "target_speed_kmh": 14.0,
+      "capabilities": [
+        "inspection",
+        "camera",
+        "lidar",
+        "fusion_patrol"
+      ]
+    },
+    {
+      "vehicle_id": "emergency_vehicle_01",
+      "display_name": "等效应急执行车01",
+      "equipment_type": "emergency_execution",
+      "role_name": "emergency_vehicle_01",
+      "blueprint": "vehicle.lincoln.mkz2017",
+      "spawn_point_index": 0,
+      "mock_position": {"x": 60.0, "y": 0.0, "z": 0.0},
+      "target_speed_kmh": 14.0,
+      "capabilities": [
+        "inspection",
+        "camera",
+        "emergency_response",
+        "road_control",
+        "support_patrol"
+      ]
+    }
+  ],
+  "zones": [
+    {
+      "zone_id": "visual_patrol_stage_01",
+      "display_name": "感知巡检第一段",
+      "priority": 100,
+      "required_capabilities": [
+        "inspection",
+        "visual_patrol"
+      ],
+      "target_spawn_point_index": 256,
+      "mock_position": {"x": 10.0, "y": 0.0, "z": 0.0},
+      "initial_task": true
+    },
+    {
+      "zone_id": "visual_patrol_stage_02",
+      "display_name": "感知巡检第二段",
+      "priority": 40,
+      "required_capabilities": [
+        "inspection",
+        "visual_patrol"
+      ],
+      "target_spawn_point_index": 110,
+      "mock_position": {"x": 20.0, "y": 0.0, "z": 0.0},
+      "initial_task": true
+    },
+    {
+      "zone_id": "fusion_patrol_stage_01",
+      "display_name": "融合巡检第一段",
+      "priority": 90,
+      "required_capabilities": [
+        "inspection",
+        "lidar",
+        "fusion_patrol"
+      ],
+      "target_spawn_point_index": 243,
+      "mock_position": {"x": 40.0, "y": 0.0, "z": 0.0},
+      "initial_task": true
+    },
+    {
+      "zone_id": "fusion_patrol_stage_02",
+      "display_name": "融合巡检第二段",
+      "priority": 30,
+      "required_capabilities": [
+        "inspection",
+        "lidar",
+        "fusion_patrol"
+      ],
+      "target_spawn_point_index": 20,
+      "mock_position": {"x": 50.0, "y": 0.0, "z": 0.0},
+      "initial_task": true
+    },
+    {
+      "zone_id": "support_patrol_stage_01",
+      "display_name": "应急支援巡检第一段",
+      "priority": 80,
+      "required_capabilities": [
+        "inspection",
+        "road_control",
+        "support_patrol"
+      ],
+      "target_spawn_point_index": 42,
+      "mock_position": {"x": 70.0, "y": 0.0, "z": 0.0},
+      "initial_task": true
+    },
+    {
+      "zone_id": "support_patrol_stage_02",
+      "display_name": "应急支援巡检第二段",
+      "priority": 20,
+      "required_capabilities": [
+        "inspection",
+        "road_control",
+        "support_patrol"
+      ],
+      "target_spawn_point_index": 179,
+      "mock_position": {"x": 80.0, "y": 0.0, "z": 0.0},
+      "initial_task": true
+    }
+  ],
+  "demo": {
+    "failure_vehicle_id": "inspection_vehicle_01",
+    "failure_tick": 500,
+    "random_seed": 202616,
+    "arrival_tolerance_m": 10.0,
+    "task_timeout_ticks": 12000,
+    "fault_pull_over_offset_m": 0.0
+  },
+  "notes": [
+    "该场景用于可视化展示，不替代town03.json快速健康检查。",
+    "路线依据Town03全局规划器校准；10米到达阈值用于吸收车辆停车点与道路生成点的离散误差。",
+    "专属能力标签仅用于保证三辆代理车分别执行两段任务。"
+  ]
+}

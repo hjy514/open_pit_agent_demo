@@ -1,0 +1,98 @@
+{
+  "schema_version": "1.0",
+  "scenario_id": "town03-risk-response-v1",
+  "scenario_name": "Town03合成边坡橙色风险驱动复核任务验证",
+  "instruction": "安排装备执行常规巡检；融合固定站与移动巡检数据，2号风险区达到橙色以上时立即派出相机和激光雷达融合巡检车复核。",
+  "carla": {
+    "root": "/home/hjy/桌面/carla0.9.10_package/CARLA_0.9.10-dirty",
+    "host": "127.0.0.1",
+    "port": 2000,
+    "timeout_seconds": 10.0,
+    "map_name": "Town03"
+  },
+  "vehicles": [
+    {
+      "vehicle_id": "inspection_vehicle_01",
+      "display_name": "等效感知巡检车01",
+      "equipment_type": "perception_inspection",
+      "role_name": "inspection_vehicle_01",
+      "blueprint": "vehicle.tesla.model3",
+      "spawn_point_index": 0,
+      "mock_position": {"x": 0.0, "y": 0.0, "z": 0.0},
+      "target_speed_kmh": 18.0,
+      "capabilities": ["inspection", "camera"]
+    },
+    {
+      "vehicle_id": "inspection_vehicle_02",
+      "display_name": "等效融合巡检车02",
+      "equipment_type": "fusion_inspection",
+      "role_name": "inspection_vehicle_02",
+      "blueprint": "vehicle.audi.tt",
+      "spawn_point_index": 122,
+      "mock_position": {"x": 30.0, "y": 0.0, "z": 0.0},
+      "target_speed_kmh": 18.0,
+      "capabilities": ["inspection", "camera", "lidar"]
+    },
+    {
+      "vehicle_id": "emergency_vehicle_01",
+      "display_name": "等效应急执行车01",
+      "equipment_type": "emergency_execution",
+      "role_name": "emergency_vehicle_01",
+      "blueprint": "vehicle.lincoln.mkz2017",
+      "spawn_point_index": 4,
+      "mock_position": {"x": 60.0, "y": 0.0, "z": 0.0},
+      "target_speed_kmh": 20.0,
+      "capabilities": ["inspection", "camera", "emergency_response", "road_control"]
+    }
+  ],
+  "zones": [
+    {
+      "zone_id": "routine_zone_01",
+      "display_name": "常规巡检1号区域",
+      "priority": 30,
+      "required_capabilities": ["inspection"],
+      "target_spawn_point_index": 122,
+      "mock_position": {"x": 10.0, "y": 0.0, "z": 0.0},
+      "initial_task": true
+    },
+    {
+      "zone_id": "routine_zone_03",
+      "display_name": "常规巡检3号区域",
+      "priority": 50,
+      "required_capabilities": ["inspection"],
+      "target_spawn_point_index": 228,
+      "mock_position": {"x": 40.0, "y": 0.0, "z": 0.0},
+      "initial_task": true
+    },
+    {
+      "zone_id": "routine_emergency_zone",
+      "display_name": "应急车常规检查区域",
+      "priority": 20,
+      "required_capabilities": ["inspection", "emergency_response"],
+      "target_spawn_point_index": 170,
+      "mock_position": {"x": 70.0, "y": 0.0, "z": 0.0},
+      "initial_task": true
+    },
+    {
+      "zone_id": "risk_zone_02",
+      "display_name": "虚拟东帮边坡2号风险区",
+      "priority": 200,
+      "required_capabilities": ["inspection", "camera", "lidar"],
+      "target_spawn_point_index": 136,
+      "mock_position": {"x": 45.0, "y": 0.0, "z": 0.0},
+      "initial_task": false
+    }
+  ],
+  "demo": {
+    "failure_vehicle_id": "inspection_vehicle_01",
+    "failure_tick": 80,
+    "random_seed": 202616,
+    "arrival_tolerance_m": 8.0,
+    "task_timeout_ticks": 2400,
+    "fault_pull_over_offset_m": 0.0
+  },
+  "notes": [
+    "Town03只承担普通车辆代理环境下的软件闭环验证。",
+    "风险观测和阈值来自独立合成数据配置，不是实际矿山测量结果。"
+  ]
+}

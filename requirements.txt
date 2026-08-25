@@ -1,0 +1,3 @@
+# CARLA 0.9.10 itself and its Python egg are supplied by the simulator package.
+fastapi==0.95.2
+uvicorn==0.22.0

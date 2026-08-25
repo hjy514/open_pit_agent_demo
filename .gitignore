@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 本机 Python 环境与敏感配置。
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# 本地备份、日志与构建产物。
+*.bak
+*.log
+build/
+dist/
+
+# 每次演示自动生成的证据，不提交到代码仓库。
+artifacts/runs/
+artifacts/control/
+
+# 本地覆盖配置可能包含机器路径。
+configs/local.json

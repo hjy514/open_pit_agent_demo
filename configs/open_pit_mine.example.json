@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "scenario_id": "open-pit-mine-future-v1",
+  "scenario_name": "露天矿边坡风险装备集群验证（待配置）",
+  "instruction": "安排装备巡检东帮边坡，优先检查2号区域，发现橙色以上风险立即复核。",
+  "carla": {
+    "root": "/home/hjy/桌面/carla0.9.10_package/CARLA_0.9.10-dirty",
+    "host": "127.0.0.1",
+    "port": 2000,
+    "timeout_seconds": 10.0,
+    "map_name": "REPLACE_WITH_OPEN_PIT_MAP"
+  },
+  "vehicles": [],
+  "zones": [],
+  "demo": {
+    "failure_vehicle_id": "inspection_vehicle_01",
+    "failure_tick": 80,
+    "random_seed": 202616,
+    "arrival_tolerance_m": 3.0,
+    "task_timeout_ticks": 2400,
+    "fault_pull_over_offset_m": 0.0
+  },
+  "notes": [
+    "此文件是迁移模板，不是可运行配置。",
+    "矿山地图、车辆蓝图、出生点、巡检区和能力信息完成核对后再填入。",
+    "不得将Town03功能测试结果表述为露天矿工业验证结果。"
+  ]
+}

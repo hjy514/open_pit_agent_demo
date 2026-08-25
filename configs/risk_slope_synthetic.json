@@ -1,0 +1,97 @@
+{
+  "schema_version": "1.0",
+  "scenario_id": "synthetic-east-slope-escalation-v1",
+  "dataset_label": "SYNTHETIC_DEMO_DATA_NOT_REAL_MINE_MEASUREMENTS",
+  "synthetic_data": true,
+  "model_version": "transparent-threshold-baseline-v1",
+  "thresholds": {
+    "yellow": {
+      "fixed_displacement_mm": 20.0,
+      "fixed_velocity_mm_h": 1.0,
+      "rainfall_mm_24h": 50.0,
+      "pore_pressure_kpa": 55.0,
+      "mobile_crack_width_mm": 8.0,
+      "mobile_displacement_mm": 20.0
+    },
+    "orange": {
+      "fixed_displacement_mm": 40.0,
+      "fixed_velocity_mm_h": 3.0,
+      "rainfall_mm_24h": 80.0,
+      "pore_pressure_kpa": 70.0,
+      "mobile_crack_width_mm": 15.0,
+      "mobile_displacement_mm": 40.0
+    },
+    "red": {
+      "fixed_displacement_mm": 80.0,
+      "fixed_velocity_mm_h": 8.0,
+      "rainfall_mm_24h": 120.0,
+      "pore_pressure_kpa": 90.0,
+      "mobile_crack_width_mm": 30.0,
+      "mobile_displacement_mm": 80.0
+    }
+  },
+  "action": {
+    "trigger_levels": ["orange", "red"],
+    "zone_id": "risk_zone_02",
+    "task_id_prefix": "risk-review",
+    "task_priority": 200,
+    "required_capabilities": ["inspection", "camera", "lidar"],
+    "task_type": "risk_review",
+    "work_order_type": "slope_risk_review",
+    "auto_review_delay_ticks": 20
+  },
+  "observations": [
+    {
+      "sample_id": "sample-000",
+      "tick": 0,
+      "zone_id": "risk_zone_02",
+      "stage": "normal",
+      "fixed_station": {
+        "fixed_displacement_mm": 5.0,
+        "fixed_velocity_mm_h": 0.2,
+        "rainfall_mm_24h": 10.0,
+        "pore_pressure_kpa": 35.0
+      },
+      "mobile_equipment": {
+        "mobile_crack_width_mm": 2.0,
+        "mobile_displacement_mm": 4.0
+      }
+    },
+    {
+      "sample_id": "sample-040",
+      "tick": 40,
+      "zone_id": "risk_zone_02",
+      "stage": "slow_deformation",
+      "fixed_station": {
+        "fixed_displacement_mm": 22.0,
+        "fixed_velocity_mm_h": 1.2,
+        "rainfall_mm_24h": 55.0,
+        "pore_pressure_kpa": 58.0
+      },
+      "mobile_equipment": {
+        "mobile_crack_width_mm": 9.0,
+        "mobile_displacement_mm": 21.0
+      }
+    },
+    {
+      "sample_id": "sample-080",
+      "tick": 80,
+      "zone_id": "risk_zone_02",
+      "stage": "accelerating_deformation",
+      "fixed_station": {
+        "fixed_displacement_mm": 45.0,
+        "fixed_velocity_mm_h": 3.8,
+        "rainfall_mm_24h": 86.0,
+        "pore_pressure_kpa": 74.0
+      },
+      "mobile_equipment": {
+        "mobile_crack_width_mm": 17.0,
+        "mobile_displacement_mm": 43.0
+      }
+    }
+  ],
+  "notes": [
+    "所有数值和阈值仅用于软件闭环演示，不代表真实矿山预警阈值。",
+    "真实应用前必须结合矿区地质条件、监测规范和历史数据重新标定并验证。"
+  ]
+}

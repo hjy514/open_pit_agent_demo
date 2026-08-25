@@ -1,0 +1,131 @@
+{
+  "schema_version": "1.0",
+  "scenario_id": "town03-fault-recovery-v1",
+  "scenario_name": "Town03普通车辆安全靠边故障与集群接管验证",
+  "instruction": "安排装备巡检三个区域；应急执行车安全靠边后发生执行能力故障时，立即抢占并接管高优先级任务，随后恢复原巡检任务。",
+  "carla": {
+    "root": "/home/hjy/桌面/carla0.9.10_package/CARLA_0.9.10-dirty",
+    "host": "127.0.0.1",
+    "port": 2000,
+    "timeout_seconds": 10.0,
+    "map_name": "Town03"
+  },
+  "vehicles": [
+    {
+      "vehicle_id": "inspection_vehicle_01",
+      "display_name": "等效感知巡检车01",
+      "equipment_type": "perception_inspection",
+      "role_name": "inspection_vehicle_01",
+      "blueprint": "vehicle.tesla.model3",
+      "spawn_point_index": 0,
+      "mock_position": {"x": 0.0, "y": 0.0, "z": 0.0},
+      "target_speed_kmh": 18.0,
+      "capabilities": ["inspection", "camera"]
+    },
+    {
+      "vehicle_id": "inspection_vehicle_02",
+      "display_name": "等效融合巡检车02",
+      "equipment_type": "fusion_inspection",
+      "role_name": "inspection_vehicle_02",
+      "blueprint": "vehicle.audi.tt",
+      "spawn_point_index": 122,
+      "mock_position": {"x": 30.0, "y": 0.0, "z": 0.0},
+      "target_speed_kmh": 18.0,
+      "capabilities": ["inspection", "camera", "lidar"]
+    },
+    {
+      "vehicle_id": "emergency_vehicle_01",
+      "display_name": "等效应急执行车01",
+      "equipment_type": "emergency_execution",
+      "role_name": "emergency_vehicle_01",
+      "blueprint": "vehicle.lincoln.mkz2017",
+      "spawn_point_index": 218,
+      "mock_position": {"x": 60.0, "y": 0.0, "z": 0.0},
+      "target_speed_kmh": 20.0,
+      "capabilities": ["inspection", "camera", "emergency_response", "road_control"]
+    }
+  ],
+  "zones": [
+    {
+      "zone_id": "inspection_zone_01",
+      "display_name": "虚拟巡检1号区域",
+      "priority": 30,
+      "required_capabilities": ["inspection"],
+      "target_spawn_point_index": 122,
+      "mock_position": {"x": 10.0, "y": 25.0, "z": 0.0}
+    },
+    {
+      "zone_id": "inspection_zone_02",
+      "display_name": "虚拟巡检2号区域",
+      "priority": 100,
+      "required_capabilities": ["inspection", "camera"],
+      "target_spawn_point_index": 136,
+      "mock_position": {"x": 45.0, "y": 30.0, "z": 0.0}
+    },
+    {
+      "zone_id": "inspection_zone_03",
+      "display_name": "虚拟巡检3号区域",
+      "priority": 50,
+      "required_capabilities": ["inspection"],
+      "target_spawn_point_index": 228,
+      "mock_position": {"x": 80.0, "y": 25.0, "z": 0.0}
+    }
+  ],
+  "scenario_variables": {
+    "profile_version": "2.0",
+    "environment": {
+      "temperature_c": 38.0,
+      "wind_speed_mps": 8.0,
+      "visibility_m": 1200.0,
+      "dust_intensity_0_1": 0.25,
+      "road_friction_0_1": 0.85,
+      "communication_latency_ms": 80
+    },
+    "disaster": {
+      "hazard_type": "slope_instability",
+      "active": false,
+      "zone_id": "inspection_zone_02",
+      "stage": "normal",
+      "data_source": "SYNTHETIC_DEMO_DATA"
+    },
+    "mission": {
+      "mission_type": "routine_inspection_with_fault_recovery",
+      "natural_language_instruction": "安排装备巡检三个区域，装备故障时立即接管未完成任务。",
+      "success_criteria": [
+        "all_tasks_completed",
+        "failed_vehicle_excluded",
+        "released_task_reassigned",
+        "all_events_auditable"
+      ]
+    },
+    "randomization": {
+      "mode": "fixed",
+      "seed": 202616,
+      "events": [
+        {
+          "event_id": "equipment-failure-01",
+          "event_type": "vehicle_failure",
+          "enabled": true,
+          "probability": 1.0,
+          "candidate_vehicle_ids": [
+            "emergency_vehicle_01"
+          ],
+          "tick_range": [70, 100]
+        }
+      ]
+    }
+  },
+  "demo": {
+    "failure_vehicle_id": "emergency_vehicle_01",
+    "failure_tick": 80,
+    "random_seed": 202616,
+    "arrival_tolerance_m": 8.0,
+    "task_timeout_ticks": 2400,
+    "fault_pull_over_offset_m": 12.0
+  },
+  "notes": [
+    "12米横向安全隔离是为超过CARLA 0.9.10 BasicAgent的10米车辆避障阈值，不是矿山统一靠边距离。",
+    "该场景注入的是车辆安全隔离后的执行能力故障，不代表道路中央抛锚。",
+    "道路阻断、封控和绕行属于后续独立验证场景。"
+  ]
+}
