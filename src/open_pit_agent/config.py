@@ -209,6 +209,32 @@ def _validate(config: ScenarioConfig) -> None:
     if not isinstance(config.scenario_variables, dict):
         raise ConfigError("scenario_variables must be an object")
 
+    emergency = config.scenario_variables.get("emergency_event")
+    if emergency is not None:
+        if not isinstance(emergency, dict):
+            raise ConfigError(
+                "scenario_variables.emergency_event must be an object"
+            )
+        safe_route = emergency.get("safe_route")
+        if safe_route is not None:
+            if not isinstance(safe_route, dict):
+                raise ConfigError(
+                    "emergency_event.safe_route must be an object"
+                )
+            if not str(safe_route.get("route_plan_id", "")).strip():
+                raise ConfigError(
+                    "emergency_event.safe_route requires route_plan_id"
+                )
+            if int(safe_route.get("waypoint_spawn_point_index", -1)) < 0:
+                raise ConfigError(
+                    "safe route waypoint_spawn_point_index cannot be negative"
+                )
+            task_types = safe_route.get("task_types", [])
+            if not isinstance(task_types, list) or not task_types:
+                raise ConfigError(
+                    "emergency_event.safe_route task_types must be a non-empty list"
+                )
+
     all_capabilities = {
         capability
         for vehicle in config.vehicles

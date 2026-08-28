@@ -8,16 +8,16 @@
     "host": "127.0.0.1",
     "port": 2000,
     "timeout_seconds": 10.0,
-    "map_name": "Town03"
+    "map_name": "0325_5"
   },
   "vehicles": [
     {
       "vehicle_id": "inspection_vehicle_01",
-      "display_name": "边坡智能感知巡检装备01",
+      "display_name": "矿区巡检矿卡01",
       "equipment_type": "slope_perception_inspection",
       "role_name": "inspection_vehicle_01",
-      "blueprint": "vehicle.tesla.model3",
-      "spawn_point_index": 228,
+      "blueprint": "vehicle.cat.cat",
+      "spawn_point_index": 15,
       "mock_position": {"x": 0.0, "y": 0.0, "z": 0.0},
       "target_speed_kmh": 18.0,
       "capabilities": [
@@ -28,24 +28,24 @@
     },
     {
       "vehicle_id": "inspection_vehicle_02",
-      "display_name": "边坡融合感知巡检装备01",
+      "display_name": "边坡复核矿卡02",
       "equipment_type": "fusion_slope_monitoring",
       "role_name": "inspection_vehicle_02",
-      "blueprint": "vehicle.audi.tt",
-      "spawn_point_index": 122,
+      "blueprint": "vehicle.cat.cat",
+      "spawn_point_index": 78,
       "mock_position": {"x": 30.0, "y": 0.0, "z": 0.0},
-      "target_speed_kmh": 18.0,
+      "target_speed_kmh": 30.0,
       "capabilities": ["inspection", "camera", "lidar"]
     },
     {
       "vehicle_id": "emergency_vehicle_01",
-      "display_name": "矿山应急响应装备01",
+      "display_name": "应急处置矿卡03",
       "equipment_type": "mine_emergency_execution",
       "role_name": "emergency_vehicle_01",
-      "blueprint": "vehicle.lincoln.mkz2017",
-      "spawn_point_index": 0,
+      "blueprint": "vehicle.cat.cat",
+      "spawn_point_index": 63,
       "mock_position": {"x": 60.0, "y": 0.0, "z": 0.0},
-      "target_speed_kmh": 20.0,
+      "target_speed_kmh": 30.0,
       "capabilities": [
         "inspection",
         "camera",
@@ -64,7 +64,7 @@
         "inspection",
         "fault_recovery"
       ],
-      "target_spawn_point_index": 85,
+      "target_spawn_point_index": 5,
       "mock_position": {"x": 10.0, "y": 0.0, "z": 0.0},
       "initial_task": true
     },
@@ -73,7 +73,7 @@
       "display_name": "东帮边坡融合感知巡检区域",
       "priority": 50,
       "required_capabilities": ["inspection", "lidar"],
-      "target_spawn_point_index": 31,
+      "target_spawn_point_index": 49,
       "mock_position": {"x": 40.0, "y": 0.0, "z": 0.0},
       "initial_task": false
     },
@@ -82,7 +82,7 @@
       "display_name": "东帮边坡2号风险区",
       "priority": 260,
       "required_capabilities": ["inspection", "camera", "lidar"],
-      "target_spawn_point_index": 136,
+      "target_spawn_point_index": 12,
       "mock_position": {"x": 45.0, "y": 0.0, "z": 0.0},
       "initial_task": false
     },
@@ -91,7 +91,7 @@
       "display_name": "矿区运输道路风险管控点",
       "priority": 300,
       "required_capabilities": ["inspection", "road_control"],
-      "target_spawn_point_index": 218,
+      "target_spawn_point_index": 5,
       "mock_position": {"x": 65.0, "y": 0.0, "z": 0.0},
       "initial_task": false
     },
@@ -104,7 +104,7 @@
         "camera",
         "emergency_response"
       ],
-      "target_spawn_point_index": 228,
+      "target_spawn_point_index": 5,
       "mock_position": {"x": 75.0, "y": 0.0, "z": 0.0},
       "initial_task": false
     }
@@ -120,12 +120,41 @@
       "communication_latency_ms": 100
     },
     "disaster": {
+      "event_id": "east-slope-heavy-rain-instability-01",
+      "event_name": "强降雨诱发东帮边坡失稳",
       "hazard_type": "slope_instability",
       "active": true,
       "zone_id": "risk_zone_02",
       "initial_stage": "normal",
       "final_stage": "pre_failure",
       "data_source": "SYNTHETIC_DEMO_DATA_NOT_REAL_MINE_MEASUREMENTS"
+    },
+    "emergency_event": {
+      "trigger_level": "red",
+      "trigger_tick": 520,
+      "trigger_evidence": [
+        "24小时降雨量超过红色阈值",
+        "固定站位移速率超过红色阈值",
+        "移动装备裂缝宽度超过红色阈值"
+      ],
+      "blocked_road_segment_id": "east-slope-haul-road-risk-segment-02",
+      "response_sequence": [
+        "边坡融合复核",
+        "危险运输路段封控",
+        "安全路线重规划",
+        "应急装备调度",
+        "复核合格后解除管控"
+      ],
+      "safe_route": {
+        "route_plan_id": "east-slope-safe-bypass-route-01",
+        "strategy": "carla_basic_agent_via_safe_waypoint",
+        "waypoint_spawn_point_index": 15,
+        "task_types": [
+          "risk_review",
+          "road_control",
+          "emergency_response"
+        ]
+      }
     },
     "mission": {
       "mission_type": "slope_monitoring_warning_and_emergency_response",
@@ -158,16 +187,16 @@
     "failure_vehicle_id": "inspection_vehicle_01",
     "failure_tick": 120,
     "random_seed": 202616,
-    "arrival_tolerance_m": 8.0,
-    "task_timeout_ticks": 4000,
+    "arrival_tolerance_m": 12.0,
+    "task_timeout_ticks": 5000,
     "fault_pull_over_offset_m": 12.0,
-    "idle_pull_over_offset_m": 12.0
+    "idle_pull_over_offset_m": 0.0
   },
   "notes": [
     "该场景是纸质材料与录屏使用的一键综合功能验证。",
     "融合巡检车与应急执行车初始待命，在故障和风险事件出现后投入任务。",
     "环境和边坡数据均为参数化合成Demo数据，不代表真实矿山测量或预警阈值。",
-    "道路限制目前为策略层约束，route_avoidance_enforced=false。",
-    "当前阶段采用CARLA虚拟车辆代理验证露天矿装备集群智能调度闭环，后续接入矿山专用地图和矿用装备模型进行迁移验证。"
+    "红色风险触发危险路段封控，应急任务通过CARLA BasicAgent预设安全中间点分段导航。",
+    "当前场景使用CARLA自定义露天矿地图0325_5；车辆仍为功能代理，后续替换矿用装备模型。"
   ]
 }

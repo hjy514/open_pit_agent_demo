@@ -45,6 +45,24 @@ class RuntimeState:
         self.decision: Dict[str, Any] = {
             "status": "PASS",
         }
+        self.monitoring: Dict[str, Any] = {
+            "phase": "等待运行",
+            "phase_index": 0,
+            "fixed_station_count": 0,
+            "mobile_equipment_count": 0,
+            "fixed_observation_count": 0,
+            "mobile_observation_count": 0,
+            "risk_level": "UNKNOWN",
+            "previous_risk_level": "UNKNOWN",
+            "work_order_count": 0,
+            "closed_work_order_count": 0,
+            "feedback_count": 0,
+            "road_control_status": "未启动",
+            "route_safety_status": "等待路线规划",
+            "route_avoidance_enforced": False,
+            "closed_loop_complete": False,
+            "updated_at": None,
+        }
         self.run_id = "runtime"
         self.map_name = "Town03"
 
@@ -63,6 +81,24 @@ class RuntimeState:
         }
         self.decision = {
             "status": "PASS",
+        }
+        self.monitoring = {
+            "phase": "等待运行",
+            "phase_index": 0,
+            "fixed_station_count": 0,
+            "mobile_equipment_count": 0,
+            "fixed_observation_count": 0,
+            "mobile_observation_count": 0,
+            "risk_level": "UNKNOWN",
+            "previous_risk_level": "UNKNOWN",
+            "work_order_count": 0,
+            "closed_work_order_count": 0,
+            "feedback_count": 0,
+            "road_control_status": "未启动",
+            "route_safety_status": "等待路线规划",
+            "route_avoidance_enforced": False,
+            "closed_loop_complete": False,
+            "updated_at": None,
         }
         self.run_id = "runtime"
         self.map_name = "Town03"
@@ -227,6 +263,13 @@ class RuntimeState:
         decision = payload.get("decision")
         if isinstance(decision, dict):
             self.decision = dict(decision)
+
+        monitoring = payload.get("monitoring")
+        if isinstance(monitoring, dict):
+            merged_monitoring = dict(self.monitoring)
+            merged_monitoring.update(monitoring)
+            merged_monitoring["updated_at"] = datetime.now().isoformat()
+            self.monitoring = merged_monitoring
 
         assignments = payload.get("assignments")
         if isinstance(assignments, list) and assignments:
@@ -410,7 +453,11 @@ class RuntimeState:
             "environment": self.environment,
             "risk": self.risk,
             "decision": self.decision,
+            "monitoring": self.monitoring,
         }
+
+    def get_monitoring(self):
+        return dict(self.monitoring)
 
     def get_dispatch(self):
         return {
@@ -439,6 +486,22 @@ class RuntimeState:
         for zone in self.environment.get("zones", []):
             if isinstance(zone, dict):
                 position = self._normalize_position(zone.get("position"))
+                if position is not None:
+                    points.append(position)
+
+        for area in self.environment.get("monitoring_areas", []):
+            if isinstance(area, dict):
+                position = self._normalize_position(
+                    area.get("center_position")
+                )
+                if position is not None:
+                    points.append(position)
+
+        for station in self.environment.get(
+            "fixed_monitoring_stations", []
+        ):
+            if isinstance(station, dict):
+                position = self._normalize_position(station.get("position"))
                 if position is not None:
                     points.append(position)
 
@@ -551,6 +614,10 @@ class RuntimeState:
         road_segments = self.environment.get("road_segments", [])
         zones = self.environment.get("zones", [])
         risk_areas = self.environment.get("risk_areas", [])
+        monitoring_areas = self.environment.get("monitoring_areas", [])
+        fixed_monitoring_stations = self.environment.get(
+            "fixed_monitoring_stations", []
+        )
 
         return {
             "map_name": self.map_name,
@@ -567,6 +634,16 @@ class RuntimeState:
             "risk_areas": (
                 risk_areas if isinstance(risk_areas, list) else []
             ),
+            "monitoring_areas": (
+                monitoring_areas
+                if isinstance(monitoring_areas, list)
+                else []
+            ),
+            "fixed_monitoring_stations": (
+                fixed_monitoring_stations
+                if isinstance(fixed_monitoring_stations, list)
+                else []
+            ),
             "updated_at": datetime.now().isoformat(),
         }
 
@@ -579,6 +656,7 @@ class RuntimeState:
             "environment": self.environment,
             "risk": self.risk,
             "decision": self.decision,
+            "monitoring": self.monitoring,
             "run_id": self.run_id,
             "map_name": self.map_name,
             "commands": self.get_commands(limit=100),

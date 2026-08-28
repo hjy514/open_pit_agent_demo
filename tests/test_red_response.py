@@ -118,6 +118,34 @@ class RedResponseTest(unittest.TestCase):
             registry.summary()["route_avoidance_enforced"]
         )
 
+        registry.mark_route_avoidance_enforced(
+            "safe-route-01",
+            "carla_basic_agent_via_safe_waypoint",
+        )
+        self.assertTrue(
+            registry.summary()["route_avoidance_enforced"]
+        )
+        self.assertEqual(
+            "safe-route-01",
+            registry.summary()["safe_route_plan_id"],
+        )
+
+        deactivated = registry.deactivate_all(
+            tick=self.red.tick + 100,
+            reason="all_feedback_reviews_safe",
+        )
+
+        self.assertEqual(1, len(deactivated))
+        self.assertEqual("inactive", restriction.status)
+        self.assertEqual(
+            0,
+            registry.summary()["active_road_restriction_count"],
+        )
+        self.assertEqual(
+            "all_feedback_reviews_safe",
+            restriction.deactivation_reason,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

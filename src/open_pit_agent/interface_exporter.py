@@ -56,6 +56,12 @@ def export_interface(summary, recorder):
                         ""
                     ),
 
+                "display_name":
+                    item.get(
+                        "display_name",
+                        ""
+                    ),
+
                 "type":
                     item.get(
                         "equipment_type",

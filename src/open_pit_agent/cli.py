@@ -22,11 +22,20 @@ from .decision_intelligence import (
 from .evidence import EvidenceRecorder
 from .interface_exporter import export_interface
 from .models import Task, VehicleState
+from .monitoring import (
+    MonitoringConfigError,
+    MonitoringLayout,
+    build_fixed_observations,
+    build_mobile_observations,
+    load_monitoring_layout,
+    monitoring_summary,
+)
 from .risk import (
     RiskConfigError,
     RiskScenario,
     RuleBasedRiskEngine,
     actions_for_assessment,
+    create_post_action_feedback_observation,
     create_risk_task,
     load_risk_scenario,
     observations_at_tick,
@@ -74,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--risk-config",
         type=Path,
         help="Synthetic risk observations and transparent rule thresholds",
+    )
+    parser.add_argument(
+        "--monitoring-config",
+        type=Path,
+        help="Fixed monitoring areas, stations and raw observations",
     )
     parser.add_argument(
         "--inject-failure",
@@ -215,6 +229,7 @@ def sync_runtime_state(
     risk=None,
     decision=None,
     environment=None,
+    monitoring=None,
 ):
     """
     通过HTTP把当前运行状态推送到独立API进程。
@@ -251,7 +266,14 @@ def sync_runtime_state(
     if decision is not None:
         payload["decision"] = decision
 
-    if environment is not None:
+    if monitoring is not None:
+        payload["monitoring"] = monitoring
+        mirrored_environment = dict(environment or {})
+        mirrored_environment["monitoring_runtime"] = dict(
+            monitoring
+        )
+        payload["environment"] = mirrored_environment
+    elif environment is not None:
         payload["environment"] = environment
 
     request_body = json.dumps(
@@ -476,11 +498,280 @@ def _realtime_wait(seconds: float, stage: str) -> None:
     time.sleep(seconds)
 
 
+def _record_fixed_monitoring(
+    recorder: EvidenceRecorder,
+    layout: Optional[MonitoringLayout],
+    risk_scenario: Optional[RiskScenario],
+) -> Dict[str, object]:
+    if layout is None:
+        return {}
+
+    observations = build_fixed_observations(
+        layout,
+        (
+            risk_scenario.observations
+            if risk_scenario is not None
+            else None
+        ),
+    )
+    summary = monitoring_summary(layout, observations)
+    recorder.write_jsonl(
+        "monitoring_observations.jsonl",
+        [item.to_dict() for item in observations],
+    )
+    recorder.record(
+        "monitoring_layout_loaded",
+        {
+            "layout_id": layout.layout_id,
+            "area_count": len(layout.areas),
+            "fixed_station_count": len(layout.stations),
+            "synthetic_data": layout.synthetic_data,
+            "dataset_label": layout.dataset_label,
+        },
+    )
+    for observation in observations:
+        recorder.record(
+            "fixed_monitoring_observation",
+            observation.to_dict(),
+        )
+    return summary
+
+
+def _record_mobile_monitoring(
+    recorder: EvidenceRecorder,
+    layout: Optional[MonitoringLayout],
+    states: List[VehicleState],
+    tick: int,
+    risk_observation=None,
+    telemetry_source: str = "carla_runtime",
+) -> int:
+    if layout is None:
+        return 0
+    observations = build_mobile_observations(
+        layout,
+        states,
+        tick,
+        risk_observation=risk_observation,
+        telemetry_source=telemetry_source,
+    )
+    recorder.append_jsonl(
+        "monitoring_observations.jsonl",
+        [item.to_dict() for item in observations],
+    )
+    for observation in observations:
+        recorder.record(
+            "mobile_monitoring_observation",
+            observation.to_dict(),
+        )
+    return len(observations)
+
+
+def _runtime_monitoring_payload(
+    monitoring_data: Dict[str, object],
+    mobile_observation_count: int,
+    phase: str,
+    phase_index: int,
+    work_orders: WorkOrderManager,
+    restrictions: RestrictionRegistry,
+    feedback_count: int = 0,
+    assessment=None,
+    latest_event: str = "",
+) -> Dict[str, object]:
+    work_order_summary = work_orders.summary()
+    restriction_summary = restrictions.summary()
+    risk_payload = (
+        assessment.to_dict()
+        if hasattr(assessment, "to_dict")
+        else (assessment if isinstance(assessment, dict) else {})
+    )
+    active_restrictions = int(
+        restriction_summary.get("active_road_restriction_count", 0)
+    )
+    all_closed = work_orders.all_closed()
+    if active_restrictions:
+        road_control_status = "风险区准入管控中"
+        route_safety_status = (
+            "危险路段已封控，安全中间点绕行已生效"
+            if restriction_summary.get("route_avoidance_enforced")
+            else "已启用策略级风险区规避"
+        )
+    elif all_closed and feedback_count:
+        road_control_status = "已解除"
+        route_safety_status = "复核安全，CARLA导航路线已恢复"
+    else:
+        road_control_status = "未启动"
+        route_safety_status = "CARLA导航路线已生成"
+    return {
+        "phase": phase,
+        "phase_index": int(phase_index),
+        "fixed_station_count": int(
+            monitoring_data.get("fixed_station_count", 0)
+        ),
+        "mobile_equipment_count": int(
+            monitoring_data.get("mobile_equipment_count", 0)
+        ),
+        "fixed_observation_count": int(
+            monitoring_data.get("fixed_observation_count", 0)
+        ),
+        "mobile_observation_count": int(mobile_observation_count),
+        "total_observation_count": int(
+            monitoring_data.get("fixed_observation_count", 0)
+        )
+        + int(mobile_observation_count),
+        "risk_level": risk_payload.get("level", "UNKNOWN"),
+        "previous_risk_level": risk_payload.get(
+            "previous_level", "UNKNOWN"
+        ),
+        "risk_trend": risk_payload.get("trend", "stable"),
+        "risk_zone": risk_payload.get("zone_id", "-"),
+        "work_order_count": int(
+            work_order_summary.get("work_order_count", 0)
+        ),
+        "closed_work_order_count": sum(
+            item.get("status") == "closed"
+            for item in work_order_summary.get("work_orders", [])
+        ),
+        "feedback_count": int(feedback_count),
+        "road_control_status": road_control_status,
+        "route_safety_status": route_safety_status,
+        "route_avoidance_enforced": bool(
+            restriction_summary.get("route_avoidance_enforced", False)
+        ),
+        "closed_loop_complete": bool(
+            feedback_count and all_closed
+        ),
+        "latest_event": latest_event,
+        "data_label": monitoring_data.get(
+            "monitoring_dataset_label", ""
+        ),
+    }
+
+
+def _activate_configured_safe_route(
+    adapter,
+    config,
+    restrictions: RestrictionRegistry,
+    restriction,
+    recorder,
+    tick: int,
+) -> Optional[Dict[str, object]]:
+    """Activate the configured CARLA emergency bypass once per run."""
+
+    if restrictions.summary().get("route_avoidance_enforced"):
+        return None
+    emergency = config.scenario_variables.get("emergency_event", {})
+    disaster = config.scenario_variables.get("disaster", {})
+    safe_route = (
+        emergency.get("safe_route", {})
+        if isinstance(emergency, dict)
+        else {}
+    )
+    configure = getattr(adapter, "configure_safe_route", None)
+    if not isinstance(safe_route, dict) or not callable(configure):
+        return None
+    route_plan_id = str(safe_route.get("route_plan_id", "")).strip()
+    task_types = safe_route.get("task_types", [])
+    waypoint_index = safe_route.get("waypoint_spawn_point_index")
+    if not route_plan_id or not isinstance(task_types, list):
+        return None
+    if waypoint_index is None:
+        return None
+    payload = configure(
+        route_plan_id=route_plan_id,
+        waypoint_spawn_point_index=int(waypoint_index),
+        task_types=[str(value) for value in task_types],
+        blocked_road_segment_id=restriction.road_segment_id,
+    )
+    restrictions.mark_route_avoidance_enforced(
+        route_plan_id,
+        str(
+            safe_route.get(
+                "strategy", "carla_basic_agent_via_safe_waypoint"
+            )
+        ),
+    )
+    event_payload = {
+        "tick": int(tick),
+        "event_id": emergency.get("event_id") or disaster.get("event_id"),
+        "event_name": emergency.get("event_name") or disaster.get("event_name"),
+        "trigger_evidence": emergency.get("trigger_evidence", []),
+        "blocked_road_segment_id": restriction.road_segment_id,
+        **payload,
+    }
+    recorder.record("safe_route_replanned", event_payload)
+    return event_payload
+
+
+def _process_closed_loop_feedback(
+    work_orders: WorkOrderManager,
+    risk_engine: RuleBasedRiskEngine,
+    risk_scenario: RiskScenario,
+    recorder: EvidenceRecorder,
+    tick: int,
+):
+    transitions = []
+    records = []
+    for order in work_orders.ready_for_feedback(tick):
+        feedback_id = "feedback-{}-{:06d}".format(
+            order.work_order_id, tick
+        )
+        observation = create_post_action_feedback_observation(
+            risk_scenario,
+            tick=tick,
+            feedback_id=feedback_id,
+            zone_id=risk_scenario.action.zone_id,
+        )
+        assessment = risk_engine.assess(observation)
+        transition = work_orders.review_with_feedback(
+            order.task_id,
+            tick=tick,
+            feedback_level=assessment.level,
+            feedback_id=feedback_id,
+        )
+        decision = (
+            "close_work_order"
+            if transition.to_status == "closed"
+            else "escalate_work_order"
+        )
+        record = {
+            "feedback_id": feedback_id,
+            "work_order_id": order.work_order_id,
+            "task_id": order.task_id,
+            "assigned_vehicle_id": order.assigned_vehicle_id,
+            "input_source": "synthetic_post_action_recheck",
+            "observation": observation.to_dict(),
+            "assessment": assessment.to_dict(),
+            "decision": decision,
+            "resulting_work_order_status": transition.to_status,
+        }
+        recorder.record(
+            "closed_loop_feedback_observation",
+            record,
+        )
+        recorder.record(
+            "closed_loop_feedback_decision",
+            {
+                "feedback_id": feedback_id,
+                "work_order_id": order.work_order_id,
+                "risk_level": assessment.level,
+                "decision": decision,
+                "resulting_work_order_status": transition.to_status,
+            },
+        )
+        recorder.append_jsonl(
+            "feedback_observations.jsonl", [record]
+        )
+        transitions.append(transition)
+        records.append(record)
+    return transitions, records
+
+
 def run_mock(
     config: ScenarioConfig,
     recorder: EvidenceRecorder,
     inject: bool,
     risk_scenario: Optional[RiskScenario],
+    monitoring_layout: Optional[MonitoringLayout],
     resolved_scenario: ResolvedScenario,
     realtime_delay: float,
 ) -> None:
@@ -500,6 +791,13 @@ def run_mock(
     risk_guidance = []
     adapter.connect()
     try:
+        monitoring_data = _record_fixed_monitoring(
+            recorder,
+            monitoring_layout,
+            risk_scenario,
+        )
+        mobile_observation_count = 0
+        mobile_equipment_ids = set()
         states = list(adapter.list_states())
         recorder.record(
             "imitation_memory_loaded", imitation_memory
@@ -562,6 +860,20 @@ def run_mock(
                 },
             )
             for observation in risk_scenario.observations:
+                mobile_states = list(adapter.list_states())
+                recorded_count = _record_mobile_monitoring(
+                    recorder,
+                    monitoring_layout,
+                    mobile_states,
+                    observation.tick,
+                    risk_observation=observation,
+                    telemetry_source="mock_adapter",
+                )
+                mobile_observation_count += recorded_count
+                if recorded_count:
+                    mobile_equipment_ids.update(
+                        item.vehicle_id for item in mobile_states
+                    )
                 recorder.record("risk_observation", observation.to_dict())
                 assessment = engine.assess(observation)
                 risk_assessments.append(assessment)
@@ -671,6 +983,18 @@ def run_mock(
                     decision_records,
                 )
                 adapter.dispatch(tasks, config.zones)
+        elif monitoring_layout is not None:
+            mobile_states = list(adapter.list_states())
+            mobile_observation_count += _record_mobile_monitoring(
+                recorder,
+                monitoring_layout,
+                mobile_states,
+                0,
+                telemetry_source="mock_adapter",
+            )
+            mobile_equipment_ids.update(
+                item.vehicle_id for item in mobile_states
+            )
 
         released = []
         reassigned = []
@@ -681,6 +1005,19 @@ def run_mock(
             adapter.inject_fault(failed)
             released = release_failed_vehicle_tasks(tasks, failed)
             states = list(adapter.list_states())
+
+            recorded_count = _record_mobile_monitoring(
+                recorder,
+                monitoring_layout,
+                states,
+                failure_tick,
+                telemetry_source="mock_adapter",
+            )
+            mobile_observation_count += recorded_count
+            if recorded_count:
+                mobile_equipment_ids.update(
+                    item.vehicle_id for item in states
+                )
 
             sync_runtime_state(
                 states,
@@ -745,6 +1082,13 @@ def run_mock(
             _print_json("故障后重新调度", [item.to_dict() for item in reassigned])
 
         final_states = list(adapter.list_states())
+        if monitoring_data:
+            monitoring_data["mobile_equipment_count"] = len(
+                mobile_equipment_ids
+            )
+            monitoring_data["mobile_observation_count"] = (
+                mobile_observation_count
+            )
         summary = {
             "mode": "mock",
             "scenario_id": config.scenario_id,
@@ -771,6 +1115,7 @@ def run_mock(
             "zones": _zones_payload(config.zones),
             "vehicle_states": _states_payload(final_states),
             "status": "PASS",
+            **monitoring_data,
             **(
                 {
                     **work_orders.summary(),
@@ -814,6 +1159,7 @@ def run_carla(
     ticks: int,
     inject: bool,
     risk_scenario: Optional[RiskScenario],
+    monitoring_layout: Optional[MonitoringLayout],
     resolved_scenario: ResolvedScenario,
 ) -> None:
     adapter = CarlaAdapter(config, load_map=load_map)
@@ -837,6 +1183,7 @@ def run_carla(
     risk_task_ids = []
     risk_guidance = []
     decision_records = []
+    closed_loop_feedback_records = []
     failure_vehicle_id, failure_tick = (
         resolved_scenario.failure_plan(config)
     )
@@ -847,8 +1194,17 @@ def run_carla(
     )
     adapter.connect()
     try:
+        monitoring_data = _record_fixed_monitoring(
+            recorder,
+            monitoring_layout,
+            risk_scenario,
+        )
+        mobile_observation_count = 0
+        mobile_equipment_ids = set()
         adapter.ensure_vehicles(spawn_missing=spawn_missing)
         states = list(adapter.list_states())
+        if monitoring_data:
+            monitoring_data["mobile_equipment_count"] = len(states)
         recorder.record(
             "imitation_memory_loaded", imitation_memory
         )
@@ -902,6 +1258,7 @@ def run_carla(
                 "status": (
                     "PASS" if len(states) == len(config.vehicles) else "INCOMPLETE"
                 ),
+                **monitoring_data,
             }
             recorder.write_json("summary.json", summary)
             export_interface(summary, recorder)
@@ -929,6 +1286,13 @@ def run_carla(
 
         map_environment = adapter.get_map_environment()
         map_environment["zones"] = _zones_payload(runtime_zones)
+        if monitoring_data:
+            map_environment["monitoring_areas"] = monitoring_data.get(
+                "monitoring_areas", []
+            )
+            map_environment["fixed_monitoring_stations"] = (
+                monitoring_data.get("fixed_monitoring_stations", [])
+            )
 
         # dispatch创建BasicAgent路线后重新读取一次状态，
         # 使首次地图快照即可携带规划路线。
@@ -943,6 +1307,15 @@ def run_carla(
             },
             run_id=recorder.run_id,
             environment=map_environment,
+            monitoring=_runtime_monitoring_payload(
+                monitoring_data,
+                mobile_observation_count,
+                phase="数据采集",
+                phase_index=0,
+                work_orders=work_orders,
+                restrictions=restrictions,
+                latest_event="固定站与移动装备开始协同采集",
+            ),
         )
         _record_adapter_events(adapter, recorder)
         recorder.record(
@@ -968,7 +1341,95 @@ def run_carla(
                 },
             )
         failure_done = False
+        risk_observations_by_tick = {
+            item.tick: item
+            for item in (
+                risk_scenario.observations
+                if risk_scenario is not None
+                else []
+            )
+        }
         for tick_index in range(max(0, ticks)):
+            if monitoring_layout is not None and tick_index % 20 == 0:
+                mobile_states = list(adapter.list_states())
+                recorded_count = _record_mobile_monitoring(
+                    recorder,
+                    monitoring_layout,
+                    mobile_states,
+                    tick_index,
+                    risk_observation=risk_observations_by_tick.get(
+                        tick_index
+                    ),
+                )
+                mobile_observation_count += recorded_count
+                if recorded_count:
+                    mobile_equipment_ids.update(
+                        item.vehicle_id for item in mobile_states
+                    )
+                    monitoring_data["mobile_equipment_count"] = len(
+                        mobile_equipment_ids
+                    )
+                current_assessment = (
+                    closed_loop_feedback_records[-1]["assessment"]
+                    if closed_loop_feedback_records
+                    else (
+                        risk_assessments[-1]
+                        if risk_assessments
+                        else None
+                    )
+                )
+                runtime_phase = (
+                    "闭环完成"
+                    if work_orders.all_closed()
+                    else (
+                        "复核反馈"
+                        if closed_loop_feedback_records
+                        else (
+                            "装备执行"
+                            if risk_task_ids
+                            else (
+                                "风险分析"
+                                if risk_assessments
+                                else "数据采集"
+                            )
+                        )
+                    )
+                )
+                runtime_phase_index = (
+                    5
+                    if work_orders.all_closed()
+                    else (
+                        4
+                        if closed_loop_feedback_records
+                        else (
+                            3
+                            if risk_task_ids
+                            else (1 if risk_assessments else 0)
+                        )
+                    )
+                )
+                sync_runtime_state(
+                    mobile_states,
+                    tasks,
+                    run_id=recorder.run_id,
+                    monitoring=_runtime_monitoring_payload(
+                        monitoring_data,
+                        mobile_observation_count,
+                        phase=runtime_phase,
+                        phase_index=runtime_phase_index,
+                        work_orders=work_orders,
+                        restrictions=restrictions,
+                        feedback_count=len(
+                            closed_loop_feedback_records
+                        ),
+                        assessment=current_assessment,
+                        latest_event=(
+                            "第{}批移动监测数据已回传"
+                        ).format(
+                            mobile_observation_count
+                        ),
+                    ),
+                )
             # 每2个CARLA tick读取一次UI命令，典型响应延迟约0.1~0.2秒。
             if tick_index % 2 == 0:
                 processed_commands = process_runtime_commands(
@@ -1026,6 +1487,16 @@ def run_carla(
                             restriction_action,
                             tick=tick_index,
                         )
+                        safe_route_payload = (
+                            _activate_configured_safe_route(
+                                adapter,
+                                config,
+                                restrictions,
+                                restriction,
+                                recorder,
+                                tick_index,
+                            )
+                        )
                         cancelled_task_ids = (
                             restrictions.apply_to_tasks(tasks)
                         )
@@ -1039,6 +1510,7 @@ def run_carla(
                                 "cancelled_task_ids": (
                                     cancelled_task_ids
                                 ),
+                                "safe_route": safe_route_payload,
                             },
                         )
                     created = []
@@ -1076,6 +1548,31 @@ def run_carla(
                         },
                         run_id=recorder.run_id,
                         risk=assessment.to_dict(),
+                        monitoring=_runtime_monitoring_payload(
+                            monitoring_data,
+                            mobile_observation_count,
+                            phase="任务调度",
+                            phase_index=2,
+                            work_orders=work_orders,
+                            restrictions=restrictions,
+                            feedback_count=len(
+                                closed_loop_feedback_records
+                            ),
+                            assessment=assessment,
+                            latest_event=(
+                                (
+                                    "突发事件：强降雨诱发东帮"
+                                    "边坡失稳；已生成{}个处置"
+                                    "工单并下发安全路线"
+                                ).format(len(created))
+                                if assessment.level == "red"
+                                else "{}风险触发，已生成{}"
+                                "个处置工单".format(
+                                    assessment.level.upper(),
+                                    len(created),
+                                )
+                            ),
+                        ),
                     )
                     assignment_by_task = {
                         item.task_id: item
@@ -1192,10 +1689,100 @@ def run_carla(
                 recorder,
             )
             if risk_scenario is not None:
-                _record_work_order_transitions(
-                    work_orders.auto_review(tick_index),
-                    recorder,
+                feedback_transitions, feedback_records = (
+                    _process_closed_loop_feedback(
+                        work_orders,
+                        risk_engine,
+                        risk_scenario,
+                        recorder,
+                        tick_index,
+                    )
                 )
+                _record_work_order_transitions(
+                    feedback_transitions, recorder
+                )
+                closed_loop_feedback_records.extend(
+                    feedback_records
+                )
+                if feedback_records and work_orders.all_closed():
+                    deactivated_restrictions = (
+                        restrictions.deactivate_all(
+                            tick_index,
+                            "all_feedback_reviews_safe",
+                        )
+                    )
+                    for restriction in deactivated_restrictions:
+                        recorder.record(
+                            "road_restriction_deactivated",
+                            restriction.to_dict(),
+                        )
+                    if deactivated_restrictions:
+                        clear_safe_route = getattr(
+                            adapter, "clear_safe_route", None
+                        )
+                        if callable(clear_safe_route):
+                            cleared_route = clear_safe_route(
+                                "all_feedback_reviews_safe"
+                            )
+                            if cleared_route:
+                                recorder.record(
+                                    "safe_route_deactivated",
+                                    {
+                                        "tick": tick_index,
+                                        **cleared_route,
+                                    },
+                                )
+                if feedback_records:
+                    feedback_assessment = feedback_records[-1][
+                        "assessment"
+                    ]
+                    sync_runtime_state(
+                        list(adapter.list_states()),
+                        tasks,
+                        event={
+                            "type": "closed_loop_feedback",
+                            "message": (
+                                "复核数据已回传，风险降为{}，"
+                                "工单已自动处理"
+                            ).format(
+                                feedback_assessment.get(
+                                    "level", "unknown"
+                                )
+                            ),
+                        },
+                        run_id=recorder.run_id,
+                        risk=feedback_assessment,
+                        monitoring=_runtime_monitoring_payload(
+                            monitoring_data,
+                            mobile_observation_count,
+                            phase=(
+                                "闭环完成"
+                                if work_orders.all_closed()
+                                else "复核反馈"
+                            ),
+                            phase_index=(
+                                5 if work_orders.all_closed() else 4
+                            ),
+                            work_orders=work_orders,
+                            restrictions=restrictions,
+                            feedback_count=len(
+                                closed_loop_feedback_records
+                            ),
+                            assessment=feedback_assessment,
+                            latest_event=(
+                                "复核风险{}，工单{}"
+                            ).format(
+                                feedback_assessment.get(
+                                    "level", "unknown"
+                                ).upper(),
+                                (
+                                    "已全部关闭"
+                                    if work_orders.all_closed()
+                                    else "持续处理"
+                                ),
+                            ),
+                        ),
+                    )
             if tick_index % 20 == 0:
                 recorder.record(
                     "carla_tick",
@@ -1303,6 +1890,19 @@ def run_carla(
                     ),
                 }
             )
+        if monitoring_data:
+            monitoring_data["mobile_equipment_count"] = len(
+                mobile_equipment_ids
+            )
+            monitoring_data["mobile_observation_count"] = (
+                mobile_observation_count
+            )
+        closed_loop_decision_counts = dict(
+            Counter(
+                item["decision"]
+                for item in closed_loop_feedback_records
+            )
+        )
         summary = {
             "mode": mode,
             "scenario_id": config.scenario_id,
@@ -1334,9 +1934,24 @@ def run_carla(
             "risk_triggered": bool(risk_task_ids),
             "risk_schedule_complete": risk_schedule_complete,
             "risk_response_metrics": risk_response_metrics,
+            "closed_loop_feedback_count": len(
+                closed_loop_feedback_records
+            ),
+            "closed_loop_feedback_records": (
+                closed_loop_feedback_records
+            ),
+            "closed_loop_decision_counts": (
+                closed_loop_decision_counts
+            ),
+            "monitoring_dispatch_closed_loop": (
+                bool(closed_loop_feedback_records)
+                and work_orders.all_terminal()
+            ),
+            "feedback_artifact": "feedback_observations.jsonl",
             "tasks": _tasks_payload(tasks),
             "zones": _zones_payload(runtime_zones),
             "vehicle_states": _states_payload(terminal_states),
+            **monitoring_data,
             **result,
             **(
                 {
@@ -1356,6 +1971,33 @@ def run_carla(
             },
             run_id=recorder.run_id,
             decision={"status": summary.get("status", "UNKNOWN")},
+            monitoring=_runtime_monitoring_payload(
+                monitoring_data,
+                mobile_observation_count,
+                phase=(
+                    "闭环完成"
+                    if summary.get("monitoring_dispatch_closed_loop")
+                    else "运行结束"
+                ),
+                phase_index=(
+                    5
+                    if summary.get("monitoring_dispatch_closed_loop")
+                    else 4
+                ),
+                work_orders=work_orders,
+                restrictions=restrictions,
+                feedback_count=len(closed_loop_feedback_records),
+                assessment=(
+                    closed_loop_feedback_records[-1]["assessment"]
+                    if closed_loop_feedback_records
+                    else (
+                        risk_assessments[-1]
+                        if risk_assessments
+                        else None
+                    )
+                ),
+                latest_event="CARLA综合演示运行结束",
+            ),
         )
         finalize_learning_and_acceptance(
             recorder, summary, decision_records
@@ -1375,6 +2017,11 @@ def main() -> None:
         risk_scenario = (
             load_risk_scenario(args.risk_config)
             if args.risk_config is not None
+            else None
+        )
+        monitoring_layout = (
+            load_monitoring_layout(args.monitoring_config)
+            if args.monitoring_config is not None
             else None
         )
         if args.seed is not None and args.randomize:
@@ -1420,6 +2067,7 @@ def main() -> None:
                 recorder,
                 inject=args.inject_failure,
                 risk_scenario=risk_scenario,
+                monitoring_layout=monitoring_layout,
                 resolved_scenario=resolved_scenario,
                 realtime_delay=args.realtime_delay,
             )
@@ -1433,10 +2081,12 @@ def main() -> None:
                 ticks=args.ticks,
                 inject=args.inject_failure,
                 risk_scenario=risk_scenario,
+                monitoring_layout=monitoring_layout,
                 resolved_scenario=resolved_scenario,
             )
     except (
         ConfigError,
+        MonitoringConfigError,
         RiskConfigError,
         SchedulingError,
         CarlaAdapterError,

@@ -201,6 +201,46 @@ class WorkOrderManager:
             )
         return transitions
 
+    def ready_for_feedback(self, tick: int) -> List[WorkOrder]:
+        return [
+            order
+            for order in self.orders()
+            if order.status == "pending_review"
+            and order.pending_review_tick is not None
+            and tick - order.pending_review_tick
+            >= order.auto_review_delay_ticks
+        ]
+
+    def review_with_feedback(
+        self,
+        task_id: str,
+        tick: int,
+        feedback_level: str,
+        feedback_id: str,
+    ) -> WorkOrderTransition:
+        order = self._order_for_task(task_id)
+        if order not in self.ready_for_feedback(tick):
+            raise WorkOrderError(
+                "Work order is not ready for feedback review: {}".format(
+                    order.work_order_id
+                )
+            )
+        order.reviewed_tick = tick
+        safe = str(feedback_level) in {"blue", "yellow"}
+        new_status = "closed" if safe else "escalated"
+        if safe:
+            order.closed_tick = tick
+        order.review_result = (
+            "feedback_{}_from_{}".format(feedback_level, feedback_id)
+        )
+        return self._transition(
+            order,
+            new_status,
+            tick,
+            actor="closed_loop_feedback_reviewer",
+            reason=order.review_result,
+        )
+
     def orders(self) -> List[WorkOrder]:
         return [
             self._orders[key] for key in sorted(self._orders)
@@ -209,6 +249,12 @@ class WorkOrderManager:
     def all_terminal(self) -> bool:
         return bool(self._orders) and all(
             order.status in TERMINAL_STATUSES
+            for order in self._orders.values()
+        )
+
+    def all_closed(self) -> bool:
+        return bool(self._orders) and all(
+            order.status == "closed"
             for order in self._orders.values()
         )
 

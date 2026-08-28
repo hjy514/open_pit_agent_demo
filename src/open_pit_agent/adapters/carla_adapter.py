@@ -32,6 +32,8 @@ class CarlaAdapter(EquipmentAdapter):
         self._task_queues: Dict[str, List[str]] = {}
         self._zones_by_id: Dict[str, ZoneConfig] = {}
         self._task_targets: Dict[str, Position] = {}
+        self._route_remaining_targets: Dict[str, List[Position]] = {}
+        self._safe_route_plan: Optional[Dict[str, object]] = None
         self._task_started_ticks: Dict[str, int] = {}
         self._events: List[Dict[str, object]] = []
         self._tick_index = 0
@@ -47,6 +49,83 @@ class CarlaAdapter(EquipmentAdapter):
         self._road_segments_cache: Optional[List[Dict[str, object]]] = None
         self._map_bounds_cache: Optional[Dict[str, float]] = None
         self.spawned_actor_ids: List[int] = []
+
+    def configure_safe_route(
+        self,
+        route_plan_id: str,
+        waypoint_spawn_point_index: int,
+        task_types: Sequence[str],
+        blocked_road_segment_id: str,
+    ) -> Dict[str, object]:
+        """Make emergency tasks travel through a configured safe waypoint.
+
+        CARLA 0.9.10's BasicAgent accepts one destination at a time.  The
+        adapter therefore executes the route as two real navigation legs:
+        current position -> safe waypoint -> emergency destination.
+        """
+
+        self._require_connected()
+        spawn_points = self.world.get_map().get_spawn_points()
+        if not spawn_points:
+            raise CarlaAdapterError("Current map has no vehicle spawn points")
+        waypoint_index = int(waypoint_spawn_point_index) % len(spawn_points)
+        location = spawn_points[waypoint_index].location
+        self._safe_route_plan = {
+            "route_plan_id": str(route_plan_id),
+            "waypoint_spawn_point_index": waypoint_index,
+            "waypoint_position": Position(
+                location.x, location.y, location.z
+            ),
+            "task_types": {str(value) for value in task_types},
+            "blocked_road_segment_id": str(blocked_road_segment_id),
+            "strategy": "carla_basic_agent_via_safe_waypoint",
+        }
+        replanned_task_ids = []
+        waypoint = self._safe_route_plan["waypoint_position"]
+        safe_task_types = self._safe_route_plan["task_types"]
+        for vehicle_id, task_id in list(self._task_ids.items()):
+            task = self._task_objects.get(task_id)
+            original_target = self._task_targets.get(task_id)
+            if (
+                task is None
+                or task.task_type not in safe_task_types
+                or original_target is None
+                or not isinstance(waypoint, Position)
+            ):
+                continue
+            self._route_remaining_targets[task_id] = [original_target]
+            self._release_agent(vehicle_id)
+            self._start_navigation_leg(vehicle_id, task_id, waypoint)
+            task.status_reason = "safe_route_replanned_during_execution"
+            replanned_task_ids.append(task_id)
+        payload = {
+            key: (
+                sorted(value) if isinstance(value, set)
+                else {
+                    "x": value.x,
+                    "y": value.y,
+                    "z": value.z,
+                } if isinstance(value, Position)
+                else value
+            )
+            for key, value in self._safe_route_plan.items()
+        }
+        payload["replanned_task_ids"] = replanned_task_ids
+        self._emit("safe_route_activated", payload)
+        return payload
+
+    def clear_safe_route(self, reason: str) -> Optional[Dict[str, object]]:
+        """Return future tasks to normal routing after risk review closes."""
+
+        if self._safe_route_plan is None:
+            return None
+        payload = {
+            "route_plan_id": self._safe_route_plan.get("route_plan_id"),
+            "reason": str(reason),
+        }
+        self._safe_route_plan = None
+        self._emit("safe_route_deactivated", payload)
+        return payload
 
     def connect(self) -> None:
         self._import_carla()
@@ -455,6 +534,20 @@ class CarlaAdapter(EquipmentAdapter):
             ) > 1.0:
                 points.append(target_point)
 
+        for remaining_target in self._route_remaining_targets.get(
+            target_task_id or "", []
+        ):
+            remaining_point = {
+                "x": float(remaining_target.x),
+                "y": float(remaining_target.y),
+                "z": float(remaining_target.z),
+            }
+            if not points or math.hypot(
+                remaining_point["x"] - points[-1]["x"],
+                remaining_point["y"] - points[-1]["y"],
+            ) > 1.0:
+                points.append(remaining_point)
+
         return points
 
     def resolve_zones(
@@ -520,6 +613,7 @@ class CarlaAdapter(EquipmentAdapter):
                 current_task.status_reason = "preempted_by_higher_priority"
                 self._release_agent(vehicle_id)
                 self._task_ids.pop(vehicle_id, None)
+                self._route_remaining_targets.pop(current_task_id, None)
                 self._task_status[vehicle_id] = "assigned"
                 self._emit(
                     "task_preempted",
@@ -543,6 +637,7 @@ class CarlaAdapter(EquipmentAdapter):
             elif current_task_id:
                 self._release_agent(vehicle_id)
                 self._task_ids.pop(vehicle_id, None)
+                self._route_remaining_targets.pop(current_task_id, None)
                 self._task_status[vehicle_id] = "idle"
             self._start_next_task(vehicle_id)
 
@@ -589,6 +684,33 @@ class CarlaAdapter(EquipmentAdapter):
                         throttle=0.0, brake=1.0, hand_brake=False
                     )
                 )
+                remaining_targets = self._route_remaining_targets.get(
+                    task_id or "", []
+                )
+                if task_id and remaining_targets:
+                    next_target = remaining_targets.pop(0)
+                    self._release_agent(vehicle_id)
+                    self._start_navigation_leg(
+                        vehicle_id, task_id, next_target
+                    )
+                    if task is not None:
+                        task.status_reason = "safe_route_waypoint_reached"
+                    self._emit(
+                        "safe_route_waypoint_reached",
+                        {
+                            "vehicle_id": vehicle_id,
+                            "task_id": task_id,
+                            "route_plan_id": (
+                                self._safe_route_plan or {}
+                            ).get("route_plan_id"),
+                            "next_target": {
+                                "x": next_target.x,
+                                "y": next_target.y,
+                                "z": next_target.z,
+                            },
+                        },
+                    )
+                    continue
                 completed_task_id = self._task_ids.pop(vehicle_id, None)
                 if completed_task_id:
                     completed_task = self._task_objects.get(completed_task_id)
@@ -622,6 +744,9 @@ class CarlaAdapter(EquipmentAdapter):
                         if task_id != completed_task_id
                     ]
                     self._task_targets.pop(completed_task_id, None)
+                    self._route_remaining_targets.pop(
+                        completed_task_id, None
+                    )
                     self._task_started_ticks.pop(completed_task_id, None)
                 self._release_agent(vehicle_id)
                 self._task_status[vehicle_id] = "completed"
@@ -662,6 +787,9 @@ class CarlaAdapter(EquipmentAdapter):
                         if queued_task_id != timed_out_task_id
                     ]
                     self._task_targets.pop(timed_out_task_id, None)
+                    self._route_remaining_targets.pop(
+                        timed_out_task_id, None
+                    )
                     self._task_started_ticks.pop(timed_out_task_id, None)
                 self._release_agent(vehicle_id)
                 self._task_status[vehicle_id] = "timed_out"
@@ -1074,9 +1202,6 @@ class CarlaAdapter(EquipmentAdapter):
                 for item in self.config.vehicles
                 if item.vehicle_id == vehicle_id
             )
-            agent = self._basic_agent_class(
-                actor, target_speed=definition.target_speed_kmh
-            )
             self._parked.discard(vehicle_id)
             actor.apply_control(
                 self.carla.VehicleControl(
@@ -1085,9 +1210,16 @@ class CarlaAdapter(EquipmentAdapter):
                     hand_brake=False,
                 )
             )
-            agent.set_destination(
-                [target_location.x, target_location.y, target_location.z]
-            )
+            navigation_target = target
+            safe_route_applied = False
+            safe_route_plan = self._safe_route_plan or {}
+            safe_task_types = safe_route_plan.get("task_types", set())
+            if task.task_type in safe_task_types:
+                waypoint = safe_route_plan.get("waypoint_position")
+                if isinstance(waypoint, Position):
+                    navigation_target = waypoint
+                    self._route_remaining_targets[task.task_id] = [target]
+                    safe_route_applied = True
             task.status = "executing"
             now = utc_now()
             task.updated_at = now
@@ -1105,11 +1237,13 @@ class CarlaAdapter(EquipmentAdapter):
                 3,
             )
             task.status_reason = "navigation_started"
-            self._task_targets[task.task_id] = target
+            self._task_targets[task.task_id] = navigation_target
             self._task_started_ticks[task.task_id] = self._tick_index
-            self._agents[vehicle_id] = agent
             self._task_ids[vehicle_id] = task.task_id
             self._task_status[vehicle_id] = "executing"
+            self._start_navigation_leg(
+                vehicle_id, task.task_id, navigation_target
+            )
             self._emit(
                 "task_started",
                 {
@@ -1119,16 +1253,41 @@ class CarlaAdapter(EquipmentAdapter):
                     "initial_distance_m": task.last_distance_m,
                     "target_spawn_point_index": target_index,
                     "target_position": {
+                        "x": navigation_target.x,
+                        "y": navigation_target.y,
+                        "z": navigation_target.z,
+                    },
+                    "final_target_position": {
                         "x": target.x,
                         "y": target.y,
                         "z": target.z,
                     },
+                    "safe_route_applied": safe_route_applied,
+                    "safe_route_plan_id": safe_route_plan.get(
+                        "route_plan_id"
+                    ) if safe_route_applied else None,
                 },
             )
             return
         self._task_status[vehicle_id] = "idle"
         self._park_vehicle_off_route(vehicle_id)
         self._stop_vehicle(vehicle_id, hand_brake=True)
+
+    def _start_navigation_leg(
+        self, vehicle_id: str, task_id: str, target: Position
+    ) -> None:
+        actor = self._actors[vehicle_id]
+        definition = next(
+            item
+            for item in self.config.vehicles
+            if item.vehicle_id == vehicle_id
+        )
+        agent = self._basic_agent_class(
+            actor, target_speed=definition.target_speed_kmh
+        )
+        agent.set_destination([target.x, target.y, target.z])
+        self._agents[vehicle_id] = agent
+        self._task_targets[task_id] = target
 
     def _park_vehicle_off_route(self, vehicle_id: str) -> None:
         offset = self.config.demo.idle_pull_over_offset_m
@@ -1138,6 +1297,7 @@ class CarlaAdapter(EquipmentAdapter):
             or actor is None
             or vehicle_id in self._parked
             or vehicle_id not in self._vehicles_with_completed_task
+            or self._all_tasks_terminal()
         ):
             return
         original = actor.get_location()
@@ -1168,6 +1328,19 @@ class CarlaAdapter(EquipmentAdapter):
             },
         )
 
+    def _all_tasks_terminal(self) -> bool:
+        """Return whether parking can no longer unblock another task."""
+
+        terminal_statuses = {
+            "completed",
+            "timed_out",
+            "cancelled",
+        }
+        return bool(self._task_objects) and all(
+            task.status in terminal_statuses
+            for task in self._task_objects.values()
+        )
+
     def _stop_vehicle(
         self, vehicle_id: str, hand_brake: bool
     ) -> None:
@@ -1181,6 +1354,14 @@ class CarlaAdapter(EquipmentAdapter):
                 hand_brake=hand_brake,
             )
         )
+        if hand_brake:
+            zero_velocity = self.carla.Vector3D(
+                x=0.0,
+                y=0.0,
+                z=0.0,
+            )
+            actor.set_target_velocity(zero_velocity)
+            actor.set_target_angular_velocity(zero_velocity)
 
     def _update_spectator_camera(self) -> None:
         if self._spectator is None or self.carla is None:

@@ -98,6 +98,11 @@ class DecisionIntelligenceTest(unittest.TestCase):
             "tasks": [{"task_id": "task-1", "status": "completed"}],
             "vehicle_states": [{"speed_mps": 0.0}],
             "work_orders": [{"status": "closed"}],
+            "monitoring_dispatch_closed_loop": True,
+            "closed_loop_feedback_count": 1,
+            "closed_loop_decision_counts": {
+                "close_work_order": 1
+            },
             "road_restrictions": [{"status": "active"}],
             "route_avoidance_enforced": False,
         }
@@ -107,6 +112,15 @@ class DecisionIntelligenceTest(unittest.TestCase):
         self.assertEqual("PASS", report["overall_status"])
         self.assertEqual(1.0, report["functional_score"])
         self.assertIn("不是矿山工业安全认证", report["scope"])
+
+    def test_acceptance_report_identifies_mine_map_scenario(self):
+        report = build_acceptance_report(
+            {"scenario_id": "openpit-mine-competition-demo-v1"},
+            0,
+            0,
+        )
+
+        self.assertIn("0325_5露天矿仿真地图", report["scope"])
 
     def test_prior_success_builds_bounded_imitation_preference(self):
         with tempfile.TemporaryDirectory() as temp_dir:

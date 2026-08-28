@@ -70,7 +70,7 @@
     "trigger_levels": ["red"],
     "restriction_id_prefix": "road-closure",
     "zone_id": "risk_zone_02",
-    "road_segment_id": "town03_proxy_risk_segment_02",
+    "road_segment_id": "east-slope-haul-road-risk-segment-02",
     "allowed_task_types": [
       "risk_review",
       "road_control",

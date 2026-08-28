@@ -1,0 +1,134 @@
+{
+  "schema_version": "1.0",
+  "layout_id": "openpit-fixed-monitoring-layout-v1",
+  "dataset_label": "SYNTHETIC_DEMO_DATA_NOT_REAL_MINE_MEASUREMENTS",
+  "synthetic_data": true,
+  "sample_ticks": [0, 220, 360, 520],
+  "areas": [
+    {
+      "area_id": "slope_area_01",
+      "display_name": "1号重点边坡监测区",
+      "area_type": "slope",
+      "center_position": {"x": -412.22, "y": 187.23, "z": 13.42}
+    },
+    {
+      "area_id": "slope_area_02",
+      "display_name": "2号常规边坡监测区",
+      "area_type": "slope",
+      "center_position": {"x": 97.34, "y": -383.80, "z": 121.80}
+    },
+    {
+      "area_id": "haul_road_area_01",
+      "display_name": "主运输道路监测区",
+      "area_type": "haul_road",
+      "center_position": {"x": -437.79, "y": -77.41, "z": 4.00}
+    },
+    {
+      "area_id": "dump_weather_area_01",
+      "display_name": "排土场与气象监测区",
+      "area_type": "dump_and_weather",
+      "center_position": {"x": 122.05, "y": 111.14, "z": 68.95}
+    }
+  ],
+  "stations": [
+    {
+      "station_id": "gnss_station_01",
+      "display_name": "GNSS位移监测站01",
+      "area_id": "slope_area_01",
+      "station_type": "gnss_displacement",
+      "position": {"x": -406.22, "y": 183.23, "z": 15.42},
+      "metrics": ["fixed_displacement_mm", "fixed_velocity_mm_h"],
+      "baseline_metrics": {"fixed_displacement_mm": 5.0, "fixed_velocity_mm_h": 0.2},
+      "trend_per_sample": {"fixed_displacement_mm": 0.0, "fixed_velocity_mm_h": 0.0},
+      "risk_source_zone_id": "risk_zone_02",
+      "latency_ms": 80,
+      "online": true
+    },
+    {
+      "station_id": "pore_pressure_station_01",
+      "display_name": "孔压监测站01",
+      "area_id": "slope_area_01",
+      "station_type": "pore_pressure",
+      "position": {"x": -417.22, "y": 192.23, "z": 12.42},
+      "metrics": ["pore_pressure_kpa"],
+      "baseline_metrics": {"pore_pressure_kpa": 35.0},
+      "trend_per_sample": {"pore_pressure_kpa": 0.0},
+      "risk_source_zone_id": "risk_zone_02",
+      "latency_ms": 95,
+      "online": true
+    },
+    {
+      "station_id": "gnss_station_02",
+      "display_name": "GNSS位移监测站02",
+      "area_id": "slope_area_02",
+      "station_type": "gnss_displacement",
+      "position": {"x": 102.34, "y": -379.80, "z": 123.30},
+      "metrics": ["fixed_displacement_mm", "fixed_velocity_mm_h"],
+      "baseline_metrics": {"fixed_displacement_mm": 3.2, "fixed_velocity_mm_h": 0.12},
+      "trend_per_sample": {"fixed_displacement_mm": 0.7, "fixed_velocity_mm_h": 0.04},
+      "latency_ms": 85,
+      "online": true
+    },
+    {
+      "station_id": "crack_station_02",
+      "display_name": "裂缝监测站02",
+      "area_id": "slope_area_02",
+      "station_type": "fixed_crack_gauge",
+      "position": {"x": 91.34, "y": -388.80, "z": 122.80},
+      "metrics": ["fixed_crack_width_mm"],
+      "baseline_metrics": {"fixed_crack_width_mm": 1.5},
+      "trend_per_sample": {"fixed_crack_width_mm": 0.3},
+      "latency_ms": 110,
+      "online": true
+    },
+    {
+      "station_id": "road_settlement_station_01",
+      "display_name": "道路沉降监测站01",
+      "area_id": "haul_road_area_01",
+      "station_type": "road_settlement",
+      "position": {"x": -431.79, "y": -73.41, "z": 4.50},
+      "metrics": ["road_settlement_mm"],
+      "baseline_metrics": {"road_settlement_mm": 2.0},
+      "trend_per_sample": {"road_settlement_mm": 0.5},
+      "latency_ms": 90,
+      "online": true
+    },
+    {
+      "station_id": "road_vibration_station_01",
+      "display_name": "道路振动监测站01",
+      "area_id": "haul_road_area_01",
+      "station_type": "road_vibration",
+      "position": {"x": -443.79, "y": -81.41, "z": 4.50},
+      "metrics": ["vibration_mm_s"],
+      "baseline_metrics": {"vibration_mm_s": 1.8},
+      "trend_per_sample": {"vibration_mm_s": 0.2},
+      "latency_ms": 70,
+      "online": true
+    },
+    {
+      "station_id": "weather_station_01",
+      "display_name": "综合气象站01",
+      "area_id": "dump_weather_area_01",
+      "station_type": "weather",
+      "position": {"x": 128.05, "y": 116.14, "z": 71.95},
+      "metrics": ["rainfall_mm_24h", "wind_speed_mps", "temperature_c"],
+      "baseline_metrics": {"rainfall_mm_24h": 10.0, "wind_speed_mps": 3.0, "temperature_c": 25.0},
+      "trend_per_sample": {"rainfall_mm_24h": 0.0, "wind_speed_mps": 1.4, "temperature_c": 2.5},
+      "risk_source_zone_id": "risk_zone_02",
+      "latency_ms": 60,
+      "online": true
+    },
+    {
+      "station_id": "visibility_station_01",
+      "display_name": "能见度与粉尘监测站01",
+      "area_id": "dump_weather_area_01",
+      "station_type": "visibility_and_dust",
+      "position": {"x": 116.05, "y": 106.14, "z": 70.45},
+      "metrics": ["visibility_m", "dust_intensity_0_1"],
+      "baseline_metrics": {"visibility_m": 1600.0, "dust_intensity_0_1": 0.15},
+      "trend_per_sample": {"visibility_m": -180.0, "dust_intensity_0_1": 0.08},
+      "latency_ms": 75,
+      "online": true
+    }
+  ]
+}

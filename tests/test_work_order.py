@@ -10,6 +10,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from open_pit_agent.risk import (
     RuleBasedRiskEngine,
+    create_post_action_feedback_observation,
     create_risk_review_task,
     load_risk_scenario,
 )
@@ -116,6 +117,78 @@ class WorkOrderLifecycleTest(unittest.TestCase):
         self.assertEqual("escalated", order.status)
         self.assertTrue(manager.all_terminal())
         self.assertEqual(0.0, manager.summary()["work_order_close_rate"])
+
+    def test_safe_feedback_closes_pending_review_order(self):
+        manager = WorkOrderManager()
+        order = manager.create_from_risk(
+            self.assessment, self.task, self.risk.action, tick=80
+        )
+        manager.assign(self.task.task_id, "inspection_vehicle_02", tick=80)
+        manager.process_adapter_events(
+            [
+                {
+                    "event_type": "task_started",
+                    "tick": 90,
+                    "payload": {"task_id": self.task.task_id},
+                },
+                {
+                    "event_type": "task_completed",
+                    "tick": 100,
+                    "payload": {"task_id": self.task.task_id},
+                },
+            ]
+        )
+        feedback = create_post_action_feedback_observation(
+            self.risk,
+            tick=120,
+            feedback_id="feedback-safe",
+        )
+        engine = RuleBasedRiskEngine(self.risk)
+        feedback_assessment = engine.assess(feedback)
+
+        transition = manager.review_with_feedback(
+            self.task.task_id,
+            tick=120,
+            feedback_level=feedback_assessment.level,
+            feedback_id=feedback.sample_id,
+        )
+
+        self.assertEqual("blue", feedback_assessment.level)
+        self.assertEqual("closed", transition.to_status)
+        self.assertEqual("closed", order.status)
+        self.assertIn("feedback_blue", order.review_result)
+
+    def test_unsafe_feedback_escalates_pending_review_order(self):
+        manager = WorkOrderManager()
+        order = manager.create_from_risk(
+            self.assessment, self.task, self.risk.action, tick=80
+        )
+        manager.assign(self.task.task_id, "inspection_vehicle_02", tick=80)
+        manager.process_adapter_events(
+            [
+                {
+                    "event_type": "task_started",
+                    "tick": 90,
+                    "payload": {"task_id": self.task.task_id},
+                },
+                {
+                    "event_type": "task_completed",
+                    "tick": 100,
+                    "payload": {"task_id": self.task.task_id},
+                },
+            ]
+        )
+
+        transition = manager.review_with_feedback(
+            self.task.task_id,
+            tick=120,
+            feedback_level="red",
+            feedback_id="feedback-unsafe",
+        )
+
+        self.assertEqual("escalated", transition.to_status)
+        self.assertEqual("escalated", order.status)
+        self.assertIsNone(order.closed_tick)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,16 @@ class DemoControlTest(unittest.TestCase):
         self.assertIn("--inject-failure", fault)
         self.assertIn("--inject-failure", competition)
         self.assertIn("--risk-config", competition)
+        mine_competition = self.manager.command_for(
+            "mine_competition_demo"
+        )
+        self.assertIn("--monitoring-config", mine_competition)
+        self.assertIn(
+            str(PROJECT_ROOT / "configs" / "monitoring_demo.json"),
+            mine_competition,
+        )
+        ticks_index = competition.index("--ticks")
+        self.assertEqual("6000", competition[ticks_index + 1])
         self.assertIn(
             str(
                 PROJECT_ROOT

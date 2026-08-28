@@ -61,6 +61,38 @@ class ConfigTest(unittest.TestCase):
             config.demo.failure_vehicle_id,
         )
 
+    def test_mine_competition_uses_cooked_mine_map(self):
+        config = load_config(
+            PROJECT_ROOT
+            / "configs"
+            / "mine_competition_demo.json"
+        )
+
+        self.assertEqual("0325_5", config.carla.map_name)
+        self.assertEqual(3, len(config.vehicles))
+        self.assertGreaterEqual(len(config.zones), 5)
+        self.assertEqual(
+            [15, 78, 63],
+            [item.spawn_point_index for item in config.vehicles],
+        )
+        self.assertEqual(12.0, config.demo.arrival_tolerance_m)
+        self.assertEqual(
+            {"vehicle.cat.cat"},
+            {vehicle.blueprint for vehicle in config.vehicles},
+        )
+        self.assertEqual(
+            len(config.vehicles),
+            len({vehicle.display_name for vehicle in config.vehicles}),
+        )
+        safe_route = config.scenario_variables[
+            "emergency_event"
+        ]["safe_route"]
+        self.assertEqual(
+            "east-slope-safe-bypass-route-01",
+            safe_route["route_plan_id"],
+        )
+        self.assertEqual(15, safe_route["waypoint_spawn_point_index"])
+
 
 if __name__ == "__main__":
     unittest.main()

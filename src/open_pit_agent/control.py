@@ -22,6 +22,7 @@ class DemoScenario:
     config_path: Path
     ticks: int
     risk_config_path: Optional[Path] = None
+    monitoring_config_path: Optional[Path] = None
     inject_failure: bool = False
 
     def public_dict(self) -> Dict[str, Any]:
@@ -31,6 +32,9 @@ class DemoScenario:
             "description": self.description,
             "ticks": self.ticks,
             "risk_enabled": self.risk_config_path is not None,
+            "fixed_monitoring_enabled": (
+                self.monitoring_config_path is not None
+            ),
             "failure_enabled": self.inject_failure,
         }
 
@@ -49,7 +53,7 @@ def default_scenarios(project_root: Path) -> List[DemoScenario]:
             / "town03_competition_demo.json",
             risk_config_path=configs
             / "risk_slope_competition_synthetic.json",
-            ticks=4000,
+            ticks=6000,
             inject_failure=True,
         ),
         DemoScenario(
@@ -63,7 +67,9 @@ def default_scenarios(project_root: Path) -> List[DemoScenario]:
             / "mine_competition_demo.json",
             risk_config_path=configs
             / "risk_slope_competition_synthetic.json",
-            ticks=4000,
+            monitoring_config_path=configs
+            / "monitoring_demo.json",
+            ticks=6000,
             inject_failure=True,
         ),
         DemoScenario(
@@ -174,6 +180,13 @@ class DemoControlManager:
                     str(scenario.risk_config_path),
                 ]
             )
+        if scenario.monitoring_config_path is not None:
+            command.extend(
+                [
+                    "--monitoring-config",
+                    str(scenario.monitoring_config_path),
+                ]
+            )
         if scenario.inject_failure:
             command.append("--inject-failure")
         return command
@@ -265,6 +278,8 @@ class DemoControlManager:
         required = [scenario.config_path]
         if scenario.risk_config_path is not None:
             required.append(scenario.risk_config_path)
+        if scenario.monitoring_config_path is not None:
+            required.append(scenario.monitoring_config_path)
         missing = [
             str(path) for path in required if not path.is_file()
         ]

@@ -289,6 +289,26 @@ def observations_at_tick(
     return [item for item in observations if item.tick == tick]
 
 
+def create_post_action_feedback_observation(
+    scenario: RiskScenario,
+    tick: int,
+    feedback_id: str,
+    zone_id: Optional[str] = None,
+) -> RiskObservation:
+    """Create an explicitly synthetic post-action recheck for the demo."""
+
+    baseline = scenario.observations[0]
+    return RiskObservation(
+        sample_id=str(feedback_id),
+        tick=int(tick),
+        zone_id=str(zone_id or scenario.action.zone_id),
+        stage="post_action_recheck",
+        fixed_station=dict(baseline.fixed_station),
+        mobile_equipment=dict(baseline.mobile_equipment),
+        synthetic=True,
+    )
+
+
 def _parse_action(raw: Dict[str, Any]) -> RiskAction:
     return RiskAction(
         trigger_levels=[

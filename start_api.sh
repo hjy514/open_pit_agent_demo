@@ -18,6 +18,22 @@ fi
 
 export PYTHONPATH="${project_dir}/src${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${project_dir}"
+
+echo "[OpenPit API] 项目目录：${project_dir}"
+echo "[OpenPit API] Python：${python_bin}"
+"${python_bin}" -c '
+import open_pit_agent.interfaces.api_server as module
+
+routes = sorted(route.path for route in module.app.routes)
+print("[OpenPit API] 加载模块：{}".format(module.__file__))
+print("[OpenPit API] 接口版本：{}".format(module.app.version))
+print("[OpenPit API] /monitoring：{}".format(
+    "已加载" if "/monitoring" in routes else "缺失"
+))
+if "/monitoring" not in routes:
+    raise SystemExit("ERROR: 当前模块缺少 /monitoring 接口")
+'
+
 exec "${python_bin}" -m uvicorn \
   open_pit_agent.interfaces.api_server:app \
   --host 127.0.0.1 \

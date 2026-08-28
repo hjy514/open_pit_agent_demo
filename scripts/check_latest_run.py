@@ -116,6 +116,32 @@ def main() -> int:
             memory.get("preference_count", 0),
         )
     )
+    if summary.get("monitoring_layout_id"):
+        print(
+            "监测数据：{}个固定站，{}辆移动设备；"
+            "固定观测{}条，移动观测{}条".format(
+                summary.get("fixed_station_count", 0),
+                summary.get("mobile_equipment_count", 0),
+                summary.get("fixed_observation_count", 0),
+                summary.get("mobile_observation_count", 0),
+            )
+        )
+    if summary.get("closed_loop_feedback_count"):
+        print(
+            "闭环反馈：{}条复核结果；决策{}；闭环{}".format(
+                summary.get("closed_loop_feedback_count", 0),
+                json.dumps(
+                    summary.get("closed_loop_decision_counts", {}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                (
+                    "完成"
+                    if summary.get("monitoring_dispatch_closed_loop")
+                    else "未完成"
+                ),
+            )
+        )
     failed = [
         item
         for item in report.get("checks", [])
@@ -137,7 +163,20 @@ def main() -> int:
     else:
         print("所有适用的功能检查均已通过。")
     print("证据目录：{}".format(run_dir))
-    print("说明：该结果是Town03软件闭环验收，不是矿山工业安全认证。")
+    scenario_id = str(
+        report.get("scenario_id") or summary.get("scenario_id") or ""
+    )
+    if scenario_id.startswith("openpit-mine"):
+        scope = (
+            "CARLA 0325_5露天矿仿真地图下的功能闭环验收，"
+            "不是矿山工业安全认证"
+        )
+    else:
+        scope = report.get(
+            "scope",
+            "功能闭环验收，不是矿山工业安全认证",
+        )
+    print("说明：{}。".format(scope))
     return 0 if report.get("overall_status") == "PASS" else 1
 
 

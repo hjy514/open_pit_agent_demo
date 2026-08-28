@@ -510,6 +510,24 @@ def build_acceptance_report(
                     "total": len(work_orders),
                 },
             )
+            add(
+                "monitoring_dispatch_feedback_closed_loop",
+                bool(summary.get("monitoring_dispatch_closed_loop"))
+                and int(
+                    summary.get("closed_loop_feedback_count", 0)
+                ) > 0,
+                {
+                    "feedback_count": summary.get(
+                        "closed_loop_feedback_count", 0
+                    ),
+                    "decisions": summary.get(
+                        "closed_loop_decision_counts", {}
+                    ),
+                    "closed_loop": summary.get(
+                        "monitoring_dispatch_closed_loop", False
+                    ),
+                },
+            )
         if "red" in levels:
             add(
                 "red_risk_restriction_activated",
@@ -567,8 +585,13 @@ def build_acceptance_report(
         "required_checks": len(required),
         "checks": checks,
         "scope": (
-            "Town03普通车辆代理下的软件功能闭环验收，"
+            "CARLA 0325_5露天矿仿真地图下的功能闭环验收，"
             "不是矿山工业安全认证"
+            if str(summary.get("scenario_id", "")).startswith("openpit-mine")
+            else (
+                "Town03普通车辆代理下的软件功能闭环验收，"
+                "不是矿山工业安全认证"
+            )
         ),
         "limitations": [
             "风险数据和阈值为合成演示数据，需用真实矿区数据重新标定。",

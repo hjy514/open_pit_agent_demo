@@ -13,7 +13,7 @@ from open_pit_agent.runtime_state import runtime
 
 app = FastAPI(
     title="OpenPit Agent API",
-    version="4.0",
+    version="5.0-monitoring",
 )
 
 app.add_middleware(
@@ -30,7 +30,8 @@ def root():
         "service": "OpenPit Agent API",
         "status": "running",
         "runtime": True,
-        "version": "4.0",
+        "version": "5.0-monitoring",
+        "monitoring_endpoint": "/monitoring",
     }
 
 
@@ -52,6 +53,11 @@ def dispatch():
 @app.get("/events")
 def events():
     return runtime.events
+
+
+@app.get("/monitoring")
+def monitoring():
+    return runtime.get_monitoring()
 
 
 @app.get("/state")

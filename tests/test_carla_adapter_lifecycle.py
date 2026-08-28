@@ -89,6 +89,8 @@ class FakeActor:
         self.location = FakeLocation()
         self.last_control = None
         self.physics_enabled = True
+        self.target_velocity = None
+        self.target_angular_velocity = None
 
     def get_location(self):
         return self.location
@@ -104,6 +106,12 @@ class FakeActor:
 
     def set_simulate_physics(self, enabled):
         self.physics_enabled = enabled
+
+    def set_target_velocity(self, velocity):
+        self.target_velocity = velocity
+
+    def set_target_angular_velocity(self, velocity):
+        self.target_angular_velocity = velocity
 
 
 class FakeCarla:
@@ -122,6 +130,10 @@ class FakeCarla:
     @staticmethod
     def Transform(location, rotation):
         return FakeTransform(location, rotation)
+
+    @staticmethod
+    def Vector3D(**kwargs):
+        return FakeLocation(**kwargs)
 
 
 class CarlaAdapterLifecycleTest(unittest.TestCase):
@@ -165,6 +177,37 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
             "vehicle_parked_off_route",
             adapter.drain_events()[0]["event_type"],
         )
+
+    def test_last_completed_task_stops_without_lateral_teleport(self):
+        config = load_config(
+            PROJECT_ROOT
+            / "configs"
+            / "town03_competition_demo.json"
+        )
+        adapter = CarlaAdapter(config)
+        adapter.carla = FakeCarla()
+        vehicle_id = "emergency_vehicle_01"
+        actor = FakeActor()
+        completed_task = Task(
+            task_id="last-task",
+            zone_id="routine_zone_01",
+            priority=30,
+            required_capabilities=["inspection"],
+            status="completed",
+            assigned_vehicle_id=vehicle_id,
+        )
+        adapter._actors[vehicle_id] = actor
+        adapter._task_objects[completed_task.task_id] = completed_task
+        adapter._vehicles_with_completed_task.add(vehicle_id)
+
+        adapter._start_next_task(vehicle_id)
+
+        self.assertNotIn(vehicle_id, adapter._parked)
+        self.assertEqual(2.0, actor.location.y)
+        self.assertTrue(actor.last_control["hand_brake"])
+        self.assertEqual(0.0, actor.target_velocity.x)
+        self.assertEqual(0.0, actor.target_angular_velocity.z)
+        self.assertEqual([], adapter.drain_events())
 
     def test_spectator_follows_highest_priority_task(self):
         config = load_config(
@@ -354,6 +397,64 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
         }
         self.assertIn("task_completed", event_types)
         self.assertIn("task_started", event_types)
+
+    def test_safe_route_waypoint_is_a_navigation_leg_not_completion(self):
+        config = load_config(
+            PROJECT_ROOT / "configs" / "mine_competition_demo.json"
+        )
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter.carla = FakeCarla()
+        adapter._basic_agent_class = FakeAgent
+        vehicle_id = "inspection_vehicle_02"
+        actor = FakeActor()
+        adapter._actors[vehicle_id] = actor
+        task = Task(
+            task_id="risk-review-test",
+            zone_id="risk_zone_02",
+            priority=260,
+            required_capabilities=["inspection", "camera", "lidar"],
+            task_type="risk_review",
+            status="assigned",
+            assigned_vehicle_id=vehicle_id,
+        )
+
+        adapter.dispatch([task], config.zones)
+        route = adapter.configure_safe_route(
+            route_plan_id="safe-route-test",
+            waypoint_spawn_point_index=1,
+            task_types=["risk_review"],
+            blocked_road_segment_id="blocked-road-test",
+        )
+        self.assertTrue(
+            adapter._route_remaining_targets[task.task_id]
+        )
+        self.assertEqual("safe-route-test", route["route_plan_id"])
+        self.assertEqual(
+            [task.task_id], route["replanned_task_ids"]
+        )
+
+        adapter.tick()
+
+        self.assertEqual("executing", task.status)
+        self.assertEqual(task.task_id, adapter._task_ids[vehicle_id])
+        self.assertEqual([], adapter._route_remaining_targets[task.task_id])
+        event_types = [
+            event["event_type"] for event in adapter.drain_events()
+        ]
+        self.assertIn("safe_route_activated", event_types)
+        self.assertIn("safe_route_waypoint_reached", event_types)
+        self.assertNotIn("task_completed", event_types)
+
+        adapter.tick()
+        self.assertEqual("completed", task.status)
+        cleared = adapter.clear_safe_route("feedback_safe")
+        self.assertEqual("safe-route-test", cleared["route_plan_id"])
+        self.assertIsNone(adapter._safe_route_plan)
+        self.assertIn(
+            "safe_route_deactivated",
+            [event["event_type"] for event in adapter.drain_events()],
+        )
 
     def test_planner_done_outside_tolerance_does_not_complete_task(self):
         config = load_config(PROJECT_ROOT / "configs" / "town03.json")

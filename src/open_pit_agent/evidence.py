@@ -46,3 +46,17 @@ class EvidenceRecorder:
                     + "\n"
                 )
         return path
+
+    def append_jsonl(
+        self, name: str, items: Iterable[Dict[str, Any]]
+    ) -> Path:
+        path = self.run_dir / name
+        with path.open("a", encoding="utf-8") as handle:
+            for item in items:
+                handle.write(
+                    json.dumps(
+                        item, ensure_ascii=False, sort_keys=True
+                    )
+                    + "\n"
+                )
+        return path
