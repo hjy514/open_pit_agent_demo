@@ -236,7 +236,7 @@
     "failure_tick": 120,
     "random_seed": 202616,
     "arrival_tolerance_m": 12.0,
-    "task_timeout_ticks": 10000,
+    "task_timeout_ticks": 30000,
     "fault_pull_over_offset_m": 12.0,
     "idle_pull_over_offset_m": 0.0
   },
