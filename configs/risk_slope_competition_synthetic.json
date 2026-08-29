@@ -8,6 +8,7 @@
     "yellow": {
       "fixed_displacement_mm": 20.0,
       "fixed_velocity_mm_h": 1.0,
+      "displacement_acceleration_mm_h2": 0.15,
       "rainfall_mm_24h": 50.0,
       "pore_pressure_kpa": 55.0,
       "mobile_crack_width_mm": 8.0,
@@ -16,6 +17,7 @@
     "orange": {
       "fixed_displacement_mm": 40.0,
       "fixed_velocity_mm_h": 3.0,
+      "displacement_acceleration_mm_h2": 0.6,
       "rainfall_mm_24h": 80.0,
       "pore_pressure_kpa": 70.0,
       "mobile_crack_width_mm": 15.0,
@@ -24,6 +26,7 @@
     "red": {
       "fixed_displacement_mm": 80.0,
       "fixed_velocity_mm_h": 8.0,
+      "displacement_acceleration_mm_h2": 1.5,
       "rainfall_mm_24h": 120.0,
       "pore_pressure_kpa": 90.0,
       "mobile_crack_width_mm": 30.0,
@@ -31,8 +34,8 @@
     }
   },
   "action": {
-    "trigger_levels": ["orange", "red"],
-    "zone_id": "risk_zone_02",
+    "trigger_levels": [],
+    "zone_id": "slope_review_safe_point",
     "task_id_prefix": "risk-review",
     "task_priority": 260,
     "required_capabilities": ["inspection", "camera", "lidar"],
@@ -40,52 +43,18 @@
     "work_order_type": "slope_risk_review",
     "auto_review_delay_ticks": 20
   },
-  "additional_actions": [
-    {
-      "trigger_levels": ["red"],
-      "zone_id": "road_control_zone",
-      "task_id_prefix": "road-control",
-      "task_priority": 300,
-      "required_capabilities": ["inspection", "road_control"],
-      "task_type": "road_control",
-      "work_order_type": "red_risk_road_control",
-      "auto_review_delay_ticks": 10
-    },
-    {
-      "trigger_levels": ["red"],
-      "zone_id": "emergency_response_zone",
-      "task_id_prefix": "emergency-response",
-      "task_priority": 280,
-      "required_capabilities": [
-        "inspection",
-        "camera",
-        "emergency_response"
-      ],
-      "task_type": "emergency_response",
-      "work_order_type": "red_risk_emergency_response",
-      "auto_review_delay_ticks": 20
-    }
-  ],
-  "restriction": {
-    "trigger_levels": ["red"],
-    "restriction_id_prefix": "road-closure",
-    "zone_id": "risk_zone_02",
-    "road_segment_id": "east-slope-haul-road-risk-segment-02",
-    "allowed_task_types": [
-      "risk_review",
-      "road_control",
-      "emergency_response"
-    ]
-  },
+  "additional_actions": [],
   "observations": [
     {
       "sample_id": "sample-000",
       "tick": 0,
       "zone_id": "risk_zone_02",
       "stage": "normal",
+      "slope_state": "stable",
       "fixed_station": {
         "fixed_displacement_mm": 5.0,
         "fixed_velocity_mm_h": 0.2,
+        "displacement_acceleration_mm_h2": 0.02,
         "rainfall_mm_24h": 10.0,
         "pore_pressure_kpa": 35.0
       },
@@ -94,14 +63,34 @@
         "mobile_displacement_mm": 4.0
       }
     },
-    {
-      "sample_id": "sample-220",
+        {
+            "sample_id": "sample-120",
+            "tick": 120,
+            "zone_id": "risk_zone_02",
+            "stage": "rainfall_infiltration",
+            "slope_state": "rainfall_infiltration",
+            "fixed_station": {
+                "fixed_displacement_mm": 12.0,
+                "fixed_velocity_mm_h": 0.6,
+                "displacement_acceleration_mm_h2": 0.08,
+                "rainfall_mm_24h": 38.0,
+                "pore_pressure_kpa": 46.0
+            },
+            "mobile_equipment": {
+                "mobile_crack_width_mm": 5.0,
+                "mobile_displacement_mm": 12.0
+            }
+        },
+        {
+            "sample_id": "sample-220",
       "tick": 220,
       "zone_id": "risk_zone_02",
       "stage": "slow_deformation",
+      "slope_state": "progressive_deformation",
       "fixed_station": {
         "fixed_displacement_mm": 22.0,
         "fixed_velocity_mm_h": 1.2,
+        "displacement_acceleration_mm_h2": 0.18,
         "rainfall_mm_24h": 55.0,
         "pore_pressure_kpa": 58.0
       },
@@ -115,9 +104,11 @@
       "tick": 360,
       "zone_id": "risk_zone_02",
       "stage": "accelerating_deformation",
+      "slope_state": "accelerating_deformation",
       "fixed_station": {
         "fixed_displacement_mm": 45.0,
         "fixed_velocity_mm_h": 3.8,
+        "displacement_acceleration_mm_h2": 0.75,
         "rainfall_mm_24h": 86.0,
         "pore_pressure_kpa": 74.0
       },
@@ -131,15 +122,35 @@
       "tick": 520,
       "zone_id": "risk_zone_02",
       "stage": "pre_failure",
+      "slope_state": "pre_failure",
       "fixed_station": {
         "fixed_displacement_mm": 90.0,
         "fixed_velocity_mm_h": 9.0,
+        "displacement_acceleration_mm_h2": 1.8,
         "rainfall_mm_24h": 130.0,
         "pore_pressure_kpa": 95.0
       },
       "mobile_equipment": {
         "mobile_crack_width_mm": 34.0,
         "mobile_displacement_mm": 88.0
+      }
+    },
+    {
+      "sample_id": "sample-650",
+      "tick": 650,
+      "zone_id": "risk_zone_02",
+      "stage": "failure",
+      "slope_state": "failure",
+      "fixed_station": {
+        "fixed_displacement_mm": 118.0,
+        "fixed_velocity_mm_h": 13.0,
+        "displacement_acceleration_mm_h2": 2.6,
+        "rainfall_mm_24h": 145.0,
+        "pore_pressure_kpa": 105.0
+      },
+      "mobile_equipment": {
+        "mobile_crack_width_mm": 48.0,
+        "mobile_displacement_mm": 112.0
       }
     }
   ],

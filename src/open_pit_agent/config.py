@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .models import Position
 
@@ -44,6 +44,7 @@ class ZoneConfig:
     target_spawn_point_index: int
     mock_position: Position
     initial_task: bool = True
+    preferred_vehicle_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,11 @@ def load_config(path: Path) -> ScenarioConfig:
                     item["mock_position"], "zones[{}].mock_position".format(index)
                 ),
                 initial_task=bool(item.get("initial_task", True)),
+                preferred_vehicle_id=(
+                    str(item["preferred_vehicle_id"])
+                    if item.get("preferred_vehicle_id")
+                    else None
+                ),
             )
         )
 
@@ -225,9 +231,17 @@ def _validate(config: ScenarioConfig) -> None:
                 raise ConfigError(
                     "emergency_event.safe_route requires route_plan_id"
                 )
-            if int(safe_route.get("waypoint_spawn_point_index", -1)) < 0:
+            waypoint_indices = safe_route.get(
+                "waypoint_spawn_point_indices",
+                [safe_route.get("waypoint_spawn_point_index", -1)],
+            )
+            if (
+                not isinstance(waypoint_indices, list)
+                or not waypoint_indices
+                or any(int(index) < 0 for index in waypoint_indices)
+            ):
                 raise ConfigError(
-                    "safe route waypoint_spawn_point_index cannot be negative"
+                    "safe route requires non-negative waypoint spawn indices"
                 )
             task_types = safe_route.get("task_types", [])
             if not isinstance(task_types, list) or not task_types:
@@ -241,6 +255,15 @@ def _validate(config: ScenarioConfig) -> None:
         for capability in vehicle.capabilities
     }
     for zone in config.zones:
+        if (
+            zone.preferred_vehicle_id is not None
+            and zone.preferred_vehicle_id not in set(vehicle_ids)
+        ):
+            raise ConfigError(
+                "Zone {} preferred_vehicle_id references an unknown vehicle".format(
+                    zone.zone_id
+                )
+            )
         missing = set(zone.required_capabilities).difference(all_capabilities)
         if missing:
             raise ConfigError(

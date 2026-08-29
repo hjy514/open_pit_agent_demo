@@ -16,9 +16,13 @@ from open_pit_agent.models import Position, Task
 class FakeLocalPlanner:
     def __init__(self):
         self.reset_called = False
+        self.speed = None
 
     def reset_vehicle(self):
         self.reset_called = True
+
+    def set_speed(self, speed):
+        self.speed = speed
 
 
 class FakeAgent:
@@ -26,6 +30,7 @@ class FakeAgent:
         self._local_planner = FakeLocalPlanner()
         self.destination = None
         self._done = done
+        self.target_speed = target_speed
 
     def set_destination(self, destination):
         self.destination = destination
@@ -137,6 +142,167 @@ class FakeCarla:
 
 
 class CarlaAdapterLifecycleTest(unittest.TestCase):
+    def test_hazard_route_progress_is_frozen_ahead_of_affected_truck(self):
+        config = load_config(
+            PROJECT_ROOT / "configs" / "mine_competition_demo.json"
+        )
+        adapter = CarlaAdapter(config)
+        vehicle_id = "inspection_vehicle_01"
+        actor = FakeActor()
+        actor.location = FakeLocation(1.0, 0.0, 0.0)
+        task = Task(
+            task_id="original-haul-task",
+            zone_id="routine_zone_01",
+            priority=100,
+            required_capabilities=["inspection"],
+            status="executing",
+            assigned_vehicle_id=vehicle_id,
+            original_route=[
+                {"x": float(x), "y": 0.0, "z": 0.0}
+                for x in (0, 20, 40, 60, 80)
+            ],
+        )
+        adapter._actors[vehicle_id] = actor
+        adapter._task_objects[task.task_id] = task
+        adapter._task_ids[vehicle_id] = task.task_id
+
+        result = adapter.freeze_hazard_task_route(
+            vehicle_id, clearance_m=50.0
+        )
+
+        self.assertEqual(60.0, result["safe_merge_point"]["x"])
+        self.assertEqual(60.0, task.safe_merge_point["x"])
+        self.assertEqual([60.0, 80.0], [
+            point["x"] for point in task.remaining_route
+        ])
+        self.assertEqual(
+            "hazard_task_route_frozen",
+            adapter.drain_events()[0]["event_type"],
+        )
+
+    def test_takeover_speed_limit_reaches_carla_local_planner(self):
+        config = load_config(
+            PROJECT_ROOT / "configs" / "mine_competition_demo.json"
+        )
+        adapter = CarlaAdapter(config)
+        adapter._basic_agent_class = FakeAgent
+        vehicle_id = "inspection_vehicle_02"
+        task_id = "takeover-task"
+        adapter._actors[vehicle_id] = FakeActor()
+        adapter._task_speed_limits[task_id] = 15.0
+
+        adapter._start_navigation_leg(
+            vehicle_id, task_id, Position(20.0, 0.0, 0.0)
+        )
+
+        agent = adapter._agents[vehicle_id]
+        self.assertEqual(15.0, agent.target_speed)
+        self.assertEqual(15.0, agent._local_planner.speed)
+
+    def test_mine_demo_uses_selected_vehicle_direct_takeover_route(self):
+        config = load_config(
+            PROJECT_ROOT / "configs" / "mine_competition_demo.json"
+        )
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        vehicle_id = "inspection_vehicle_02"
+        adapter._actors[vehicle_id] = FakeActor()
+        task = Task(
+            task_id="configured-takeover-task",
+            zone_id="routine_zone_01",
+            priority=30,
+            required_capabilities=["inspection", "routine_patrol"],
+            handover_reason="released_after_slope_hazard_safe_hold",
+            original_vehicle_id="inspection_vehicle_01",
+        )
+
+        route = adapter._build_takeover_route(task, vehicle_id)
+
+        self.assertEqual(1, len(route))
+        self.assertEqual(1, len(task.remaining_route))
+        event = adapter.drain_events()[0]
+        self.assertEqual(
+            "hazard_task_takeover_route_built", event["event_type"]
+        )
+        self.assertEqual(
+            "nearest_capable_vehicle_direct_to_original_destination",
+            event["payload"]["strategy"],
+        )
+        self.assertFalse(event["payload"]["blocked_segment_is_skipped"])
+
+        emergency_vehicle_id = "emergency_vehicle_01"
+        adapter._actors[emergency_vehicle_id] = FakeActor()
+        emergency_route = adapter._build_takeover_route(
+            task, emergency_vehicle_id
+        )
+        self.assertEqual(1, len(emergency_route))
+
+    def test_manual_takeover_preserves_selected_vehicle_original_task(self):
+        config = load_config(
+            PROJECT_ROOT / "configs" / "mine_competition_demo.json"
+        )
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter.carla = FakeCarla()
+        adapter._basic_agent_class = FakeAgent
+        source_vehicle = "inspection_vehicle_01"
+        selected_vehicle = "inspection_vehicle_02"
+        adapter._actors[source_vehicle] = FakeActor()
+        adapter._actors[selected_vehicle] = FakeActor()
+        own_task = Task(
+            task_id="selected-original-task",
+            zone_id="secondary_patrol_zone_02",
+            priority=50,
+            required_capabilities=["inspection", "lidar"],
+            status="executing",
+            assigned_vehicle_id=selected_vehicle,
+        )
+        takeover_task = Task(
+            task_id="affected-takeover-task",
+            zone_id="routine_zone_01",
+            priority=30,
+            required_capabilities=["inspection", "routine_patrol"],
+            status="pending",
+            original_vehicle_id=source_vehicle,
+            handover_reason="released_after_slope_hazard_safe_hold",
+        )
+        adapter._task_objects = {
+            own_task.task_id: own_task,
+            takeover_task.task_id: takeover_task,
+        }
+        adapter._zones_by_id = {
+            zone.zone_id: zone for zone in config.zones
+        }
+        adapter._task_ids = {
+            source_vehicle: takeover_task.task_id,
+            selected_vehicle: own_task.task_id,
+        }
+        adapter._task_queues = {
+            source_vehicle: [takeover_task.task_id],
+            selected_vehicle: [own_task.task_id],
+        }
+        adapter._agents = {
+            source_vehicle: FakeAgent(),
+            selected_vehicle: FakeAgent(),
+        }
+        adapter._emergency_stopped.add(source_vehicle)
+
+        adapter.reassign_task(takeover_task.task_id, selected_vehicle)
+
+        self.assertNotIn(source_vehicle, adapter._task_ids)
+        self.assertEqual(
+            "emergency_stop", adapter._task_status[source_vehicle]
+        )
+        self.assertEqual("assigned", own_task.status)
+        self.assertEqual(
+            [takeover_task.task_id, own_task.task_id],
+            adapter._task_queues[selected_vehicle],
+        )
+        self.assertEqual(
+            takeover_task.task_id,
+            adapter._task_ids[selected_vehicle],
+        )
+
     def test_initially_idle_vehicle_stays_at_configured_spawn(self):
         config = load_config(
             PROJECT_ROOT
@@ -250,7 +416,7 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
             adapter._spectator.transform
         )
         self.assertEqual(
-            -8.0,
+            -19.0,
             adapter._spectator.transform.location.x,
         )
         event = adapter.drain_events()[0]
@@ -422,7 +588,7 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
         adapter.dispatch([task], config.zones)
         route = adapter.configure_safe_route(
             route_plan_id="safe-route-test",
-            waypoint_spawn_point_index=1,
+            waypoint_spawn_point_indices=[1, 2, 3],
             task_types=["risk_review"],
             blocked_road_segment_id="blocked-road-test",
         )
@@ -438,7 +604,9 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
 
         self.assertEqual("executing", task.status)
         self.assertEqual(task.task_id, adapter._task_ids[vehicle_id])
-        self.assertEqual([], adapter._route_remaining_targets[task.task_id])
+        self.assertEqual(
+            2, len(adapter._route_remaining_targets[task.task_id])
+        )
         event_types = [
             event["event_type"] for event in adapter.drain_events()
         ]
@@ -446,6 +614,10 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
         self.assertIn("safe_route_waypoint_reached", event_types)
         self.assertNotIn("task_completed", event_types)
 
+        adapter.tick()
+        self.assertEqual("executing", task.status)
+        adapter.tick()
+        self.assertEqual("executing", task.status)
         adapter.tick()
         self.assertEqual("completed", task.status)
         cleared = adapter.clear_safe_route("feedback_safe")

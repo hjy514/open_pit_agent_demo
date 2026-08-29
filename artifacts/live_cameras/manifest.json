@@ -1,0 +1,32 @@
+{
+  "status": "online",
+  "width": 640,
+  "height": 360,
+  "sensor_tick_seconds": 0.25,
+  "streams": [
+    {
+      "id": "global",
+      "name": "矿山全局视角",
+      "kind": "overview",
+      "image_url": "/camera/global/frame"
+    },
+    {
+      "id": "inspection_vehicle_01",
+      "name": "矿区巡检矿卡01",
+      "kind": "vehicle",
+      "image_url": "/camera/inspection_vehicle_01/frame"
+    },
+    {
+      "id": "inspection_vehicle_02",
+      "name": "边坡复核矿卡02",
+      "kind": "vehicle",
+      "image_url": "/camera/inspection_vehicle_02/frame"
+    },
+    {
+      "id": "emergency_vehicle_01",
+      "name": "综合巡检矿卡03",
+      "kind": "vehicle",
+      "image_url": "/camera/emergency_vehicle_01/frame"
+    }
+  ]
+}

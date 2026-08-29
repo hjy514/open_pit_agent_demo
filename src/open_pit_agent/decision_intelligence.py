@@ -490,32 +490,53 @@ def build_acceptance_report(
         )
         add(
             "risk_actions_generated",
-            bool(summary.get("risk_task_ids")),
-            {"risk_task_ids": summary.get("risk_task_ids", [])},
+            bool(summary.get("risk_task_ids"))
+            or bool(summary.get("hazard_information_retained")),
+            {
+                "risk_task_ids": summary.get("risk_task_ids", []),
+                "hazard_information_retained": summary.get(
+                    "hazard_information_retained", False
+                ),
+            },
         )
         if mode != "mock":
             work_orders = summary.get("work_orders", [])
-            add(
-                "risk_work_orders_closed",
-                bool(work_orders)
-                and all(
-                    item.get("status") == "closed"
-                    for item in work_orders
-                ),
-                {
-                    "closed": sum(
+            if work_orders or summary.get(
+                "road_restriction_required", True
+            ):
+                add(
+                    "risk_work_orders_closed",
+                    bool(work_orders)
+                    and all(
                         item.get("status") == "closed"
                         for item in work_orders
                     ),
-                    "total": len(work_orders),
-                },
-            )
+                    {
+                        "closed": sum(
+                            item.get("status") == "closed"
+                            for item in work_orders
+                        ),
+                        "total": len(work_orders),
+                    },
+                )
+            else:
+                add(
+                    "dynamic_takeover_task_completed",
+                    bool(summary.get("takeover_completed")),
+                    {
+                        "work_order_required": False,
+                        "takeover_completed": summary.get(
+                            "takeover_completed", False
+                        ),
+                    },
+                )
             add(
                 "monitoring_dispatch_feedback_closed_loop",
                 bool(summary.get("monitoring_dispatch_closed_loop"))
-                and int(
-                    summary.get("closed_loop_feedback_count", 0)
-                ) > 0,
+                and (
+                    int(summary.get("closed_loop_feedback_count", 0)) > 0
+                    or bool(summary.get("takeover_completed"))
+                ),
                 {
                     "feedback_count": summary.get(
                         "closed_loop_feedback_count", 0
@@ -526,21 +547,36 @@ def build_acceptance_report(
                     "closed_loop": summary.get(
                         "monitoring_dispatch_closed_loop", False
                     ),
+                    "takeover_completed": summary.get(
+                        "takeover_completed", False
+                    ),
                 },
             )
         if "red" in levels:
-            add(
-                "red_risk_restriction_activated",
-                bool(summary.get("road_restrictions")),
-                {
-                    "restriction_count": len(
-                        summary.get("road_restrictions", [])
-                    ),
-                    "route_avoidance_enforced": summary.get(
-                        "route_avoidance_enforced", False
-                    ),
-                },
-            )
+            if summary.get("road_restriction_required", True):
+                add(
+                    "red_risk_restriction_activated",
+                    bool(summary.get("road_restrictions")),
+                    {
+                        "restriction_count": len(
+                            summary.get("road_restrictions", [])
+                        ),
+                        "route_avoidance_enforced": summary.get(
+                            "route_avoidance_enforced", False
+                        ),
+                    },
+                )
+            else:
+                add(
+                    "red_risk_information_retained",
+                    bool(summary.get("hazard_information_retained")),
+                    {
+                        "road_closure_required": False,
+                        "takeover_completed": summary.get(
+                            "takeover_completed", False
+                        ),
+                    },
+                )
     add(
         "offline_learning_dataset_exported",
         experience_count == len(tasks) and experience_count > 0,

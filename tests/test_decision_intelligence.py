@@ -47,8 +47,8 @@ class DecisionIntelligenceTest(unittest.TestCase):
         self.assertEqual("red", guidance["risk_level"])
         self.assertTrue(guidance["impacts"])
         self.assertTrue(guidance["prevention_measures"])
-        self.assertEqual(3, len(guidance["planned_actions"]))
-        self.assertTrue(guidance["road_restriction_planned"])
+        self.assertEqual(0, len(guidance["planned_actions"]))
+        self.assertFalse(guidance["road_restriction_planned"])
         self.assertTrue(
             guidance["human_confirmation_required_for_real_mine"]
         )
@@ -121,6 +121,37 @@ class DecisionIntelligenceTest(unittest.TestCase):
         )
 
         self.assertIn("0325_5露天矿仿真地图", report["scope"])
+
+    def test_takeover_scenario_does_not_require_road_closure(self):
+        summary = {
+            "run_id": "run-takeover",
+            "scenario_id": "openpit-mine-competition-demo-v1",
+            "scenario_seed": 7,
+            "mode": "carla-run",
+            "risk_scenario_id": "risk-1",
+            "risk_assessments": [
+                {"assessment_id": "a1", "level": "red"}
+            ],
+            "risk_guidance": [
+                {"assessment_id": "a1", "impacts": ["impact"]}
+            ],
+            "risk_task_ids": [],
+            "hazard_information_retained": True,
+            "road_restriction_required": False,
+            "takeover_completed": True,
+            "tasks": [{"task_id": "task-1", "status": "completed"}],
+            "vehicle_states": [{"speed_mps": 0.0}],
+            "work_orders": [],
+            "monitoring_dispatch_closed_loop": True,
+            "closed_loop_feedback_count": 0,
+        }
+
+        report = build_acceptance_report(summary, 1, 1)
+
+        self.assertEqual("PASS", report["overall_status"])
+        names = {item["check_id"] for item in report["checks"]}
+        self.assertIn("red_risk_information_retained", names)
+        self.assertNotIn("red_risk_restriction_activated", names)
 
     def test_prior_success_builds_bounded_imitation_preference(self):
         with tempfile.TemporaryDirectory() as temp_dir:

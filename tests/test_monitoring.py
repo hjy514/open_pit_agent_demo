@@ -43,7 +43,7 @@ class FixedMonitoringTest(unittest.TestCase):
             self.layout, self.risk.observations
         )
 
-        self.assertEqual(32, len(observations))
+        self.assertEqual(48, len(observations))
         self.assertTrue(
             all(item.source_type == "fixed_station" for item in observations)
         )
@@ -78,7 +78,7 @@ class FixedMonitoringTest(unittest.TestCase):
 
         self.assertEqual(4, summary["monitoring_area_count"])
         self.assertEqual(8, summary["fixed_station_count"])
-        self.assertEqual(32, summary["fixed_observation_count"])
+        self.assertEqual(48, summary["fixed_observation_count"])
         self.assertEqual(
             "monitoring_observations.jsonl",
             summary["monitoring_artifact"],
@@ -117,7 +117,7 @@ class FixedMonitoringTest(unittest.TestCase):
             if item.source_id == "inspection_vehicle_02"
         )
         self.assertEqual(
-            88.0,
+            112.0,
             slope_truck.metrics["mobile_displacement_mm"],
         )
         self.assertEqual(

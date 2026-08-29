@@ -10,6 +10,26 @@ from .models import Task
 
 LEVELS = ("blue", "yellow", "orange", "red")
 LEVEL_RANK = {level: index for index, level in enumerate(LEVELS)}
+SLOPE_STATES = (
+    "stable",
+    "rainfall_infiltration",
+    "progressive_deformation",
+    "accelerating_deformation",
+    "pre_failure",
+    "failure",
+    "post_failure_monitoring",
+)
+SLOPE_STATE_BY_STAGE = {
+    "normal": "stable",
+    "rainfall_infiltration": "rainfall_infiltration",
+    "slow_deformation": "progressive_deformation",
+    "progressive_deformation": "progressive_deformation",
+    "accelerating_deformation": "accelerating_deformation",
+    "pre_failure": "pre_failure",
+    "failure": "failure",
+    "post_action_recheck": "post_failure_monitoring",
+    "post_failure_monitoring": "post_failure_monitoring",
+}
 
 
 class RiskConfigError(ValueError):
@@ -25,6 +45,7 @@ class RiskObservation:
     fixed_station: Dict[str, float]
     mobile_equipment: Dict[str, float]
     synthetic: bool = True
+    slope_state: str = "stable"
 
     def metrics(self) -> Dict[str, float]:
         result = dict(self.fixed_station)
@@ -48,6 +69,7 @@ class RiskAssessment:
     metrics: Dict[str, float]
     model_version: str
     synthetic: bool
+    slope_state: str = "stable"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -138,6 +160,7 @@ class RuleBasedRiskEngine:
             metrics=metrics,
             model_version=self.scenario.model_version,
             synthetic=observation.synthetic,
+            slope_state=observation.slope_state,
         )
 
 
@@ -166,6 +189,8 @@ def create_risk_task(
 def actions_for_assessment(
     scenario: RiskScenario, assessment: RiskAssessment
 ) -> List[RiskAction]:
+    if LEVEL_RANK[assessment.level] <= LEVEL_RANK[assessment.previous_level]:
+        return []
     return [
         action
         for action in [scenario.action] + scenario.additional_actions
@@ -216,6 +241,14 @@ def load_risk_scenario(path: Path) -> RiskScenario:
                     for metric, value in item["mobile_equipment"].items()
                 },
                 synthetic=bool(raw["synthetic_data"]),
+                slope_state=str(
+                    item.get(
+                        "slope_state",
+                        SLOPE_STATE_BY_STAGE.get(
+                            str(item["stage"]), str(item["stage"])
+                        ),
+                    )
+                ),
             )
             for item in raw["observations"]
         ]
@@ -257,6 +290,17 @@ def _validate_risk_scenario(scenario: RiskScenario) -> None:
     if ticks != sorted(ticks) or len(ticks) != len(set(ticks)):
         raise RiskConfigError(
             "Risk observation ticks must be unique and sorted"
+        )
+    unknown_slope_states = {
+        item.slope_state
+        for item in scenario.observations
+        if item.slope_state not in SLOPE_STATES
+    }
+    if unknown_slope_states:
+        raise RiskConfigError(
+            "Unknown slope states: {}".format(
+                ", ".join(sorted(unknown_slope_states))
+            )
         )
     if any(action.task_priority <= 0 for action in actions):
         raise RiskConfigError("Risk task priority must be positive")
@@ -306,6 +350,7 @@ def create_post_action_feedback_observation(
         fixed_station=dict(baseline.fixed_station),
         mobile_equipment=dict(baseline.mobile_equipment),
         synthetic=True,
+        slope_state="post_failure_monitoring",
     )
 
 

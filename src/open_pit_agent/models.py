@@ -71,9 +71,33 @@ class Task:
     status_reason: Optional[str] = None
     task_type: str = "inspection"
     source_event_id: Optional[str] = None
+    original_vehicle_id: Optional[str] = None
+    handover_reason: Optional[str] = None
+    handover_tick: Optional[int] = None
+    recommended_vehicle_id: Optional[str] = None
+    recommendation_reason: Optional[str] = None
+    candidate_evaluations: List[Dict[str, Any]] = field(default_factory=list)
+    preferred_vehicle_id: Optional[str] = None
+    original_route: List[Dict[str, float]] = field(default_factory=list)
+    completed_route: List[Dict[str, float]] = field(default_factory=list)
+    remaining_route: List[Dict[str, float]] = field(default_factory=list)
+    last_completed_waypoint: Optional[Dict[str, float]] = None
+    safe_merge_point: Optional[Dict[str, float]] = None
+    transfer_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        original_route = payload.pop("original_route", [])
+        completed_route = payload.pop("completed_route", [])
+        remaining_route = payload.pop("remaining_route", [])
+        payload.update(
+            {
+                "original_route_checkpoint_count": len(original_route),
+                "completed_route_checkpoint_count": len(completed_route),
+                "remaining_route_checkpoint_count": len(remaining_route),
+            }
+        )
+        return payload
 
 
 @dataclass(frozen=True)

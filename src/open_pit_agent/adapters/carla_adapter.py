@@ -1,7 +1,9 @@
 """CARLA 0.9.10 adapter kept separate from scheduling business logic."""
 
 import glob
+import json
 import math
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +26,8 @@ class CarlaAdapter(EquipmentAdapter):
         self.world = None
         self.carla = None
         self._basic_agent_class = None
+        self._global_route_planner_class = None
+        self._global_route_planner_dao_class = None
         self._actors: Dict[str, object] = {}
         self._agents: Dict[str, object] = {}
         self._task_ids: Dict[str, str] = {}
@@ -33,7 +37,11 @@ class CarlaAdapter(EquipmentAdapter):
         self._zones_by_id: Dict[str, ZoneConfig] = {}
         self._task_targets: Dict[str, Position] = {}
         self._route_remaining_targets: Dict[str, List[Position]] = {}
+        self._takeover_routes: Dict[str, List[Position]] = {}
+        self._task_speed_limits: Dict[str, float] = {}
+        self._takeover_task_ids = set()
         self._safe_route_plan: Optional[Dict[str, object]] = None
+        self._hazard_replanned_task_ids = set()
         self._task_started_ticks: Dict[str, int] = {}
         self._events: List[Dict[str, object]] = []
         self._tick_index = 0
@@ -45,6 +53,14 @@ class CarlaAdapter(EquipmentAdapter):
         self._vehicles_with_completed_task = set()
         self._spectator = None
         self._camera_vehicle_id: Optional[str] = None
+        self._camera_sensors: Dict[str, object] = {}
+        self._camera_display_names: Dict[str, str] = {}
+        self._camera_frame_numbers: Dict[str, int] = {}
+        self._camera_output_dir = (
+            Path(__file__).resolve().parents[3]
+            / "artifacts"
+            / "live_cameras"
+        )
         self._trajectory_points: Dict[str, List[Dict[str, float]]] = {}
         self._road_segments_cache: Optional[List[Dict[str, object]]] = None
         self._map_bounds_cache: Optional[Dict[str, float]] = None
@@ -53,35 +69,45 @@ class CarlaAdapter(EquipmentAdapter):
     def configure_safe_route(
         self,
         route_plan_id: str,
-        waypoint_spawn_point_index: int,
+        waypoint_spawn_point_indices: Sequence[int],
         task_types: Sequence[str],
         blocked_road_segment_id: str,
     ) -> Dict[str, object]:
-        """Make emergency tasks travel through a configured safe waypoint.
+        """Route affected tasks through configured safety waypoints.
 
         CARLA 0.9.10's BasicAgent accepts one destination at a time.  The
-        adapter therefore executes the route as two real navigation legs:
-        current position -> safe waypoint -> emergency destination.
+        adapter therefore executes the route as real navigation legs:
+        current position -> B1 -> ... -> final task destination.
         """
 
         self._require_connected()
         spawn_points = self.world.get_map().get_spawn_points()
         if not spawn_points:
             raise CarlaAdapterError("Current map has no vehicle spawn points")
-        waypoint_index = int(waypoint_spawn_point_index) % len(spawn_points)
-        location = spawn_points[waypoint_index].location
+        waypoint_indices = [
+            int(index) % len(spawn_points)
+            for index in waypoint_spawn_point_indices
+        ]
+        if not waypoint_indices:
+            raise CarlaAdapterError(
+                "Safe route requires at least one waypoint"
+            )
+        waypoint_positions = []
+        for waypoint_index in waypoint_indices:
+            location = spawn_points[waypoint_index].location
+            waypoint_positions.append(
+                Position(location.x, location.y, location.z)
+            )
         self._safe_route_plan = {
             "route_plan_id": str(route_plan_id),
-            "waypoint_spawn_point_index": waypoint_index,
-            "waypoint_position": Position(
-                location.x, location.y, location.z
-            ),
+            "waypoint_spawn_point_indices": waypoint_indices,
+            "waypoint_positions": waypoint_positions,
             "task_types": {str(value) for value in task_types},
             "blocked_road_segment_id": str(blocked_road_segment_id),
             "strategy": "carla_basic_agent_via_safe_waypoint",
         }
         replanned_task_ids = []
-        waypoint = self._safe_route_plan["waypoint_position"]
+        waypoints = self._safe_route_plan["waypoint_positions"]
         safe_task_types = self._safe_route_plan["task_types"]
         for vehicle_id, task_id in list(self._task_ids.items()):
             task = self._task_objects.get(task_id)
@@ -90,28 +116,43 @@ class CarlaAdapter(EquipmentAdapter):
                 task is None
                 or task.task_type not in safe_task_types
                 or original_target is None
-                or not isinstance(waypoint, Position)
+                or not waypoints
             ):
                 continue
-            self._route_remaining_targets[task_id] = [original_target]
+            self._route_remaining_targets[task_id] = list(waypoints[1:]) + [
+                original_target
+            ]
+            self._hazard_replanned_task_ids.add(task_id)
+            self._emit(
+                "hazard_route_replan_started",
+                {
+                    "vehicle_id": vehicle_id,
+                    "task_id": task_id,
+                    "route_plan_id": str(route_plan_id),
+                    "blocked_road_segment_id": str(blocked_road_segment_id),
+                    "waypoint_spawn_point_indices": waypoint_indices,
+                },
+            )
             self._release_agent(vehicle_id)
-            self._start_navigation_leg(vehicle_id, task_id, waypoint)
+            self._start_navigation_leg(vehicle_id, task_id, waypoints[0])
             task.status_reason = "safe_route_replanned_during_execution"
             replanned_task_ids.append(task_id)
+        def _json_value(value):
+            if isinstance(value, set):
+                return sorted(value)
+            if isinstance(value, Position):
+                return {"x": value.x, "y": value.y, "z": value.z}
+            if isinstance(value, (list, tuple)):
+                return [_json_value(item) for item in value]
+            return value
+
         payload = {
-            key: (
-                sorted(value) if isinstance(value, set)
-                else {
-                    "x": value.x,
-                    "y": value.y,
-                    "z": value.z,
-                } if isinstance(value, Position)
-                else value
-            )
+            key: _json_value(value)
             for key, value in self._safe_route_plan.items()
         }
         payload["replanned_task_ids"] = replanned_task_ids
         self._emit("safe_route_activated", payload)
+        self._emit("hazard_route_replanned", payload)
         return payload
 
     def clear_safe_route(self, reason: str) -> Optional[Dict[str, object]]:
@@ -214,6 +255,7 @@ class CarlaAdapter(EquipmentAdapter):
                     "Vehicles spawned, but CARLA did not produce a stabilization "
                     "tick: {}".format(exc)
                 ) from exc
+        self._ensure_camera_streams()
 
     def list_states(self) -> Sequence[VehicleState]:
         self._require_connected()
@@ -478,16 +520,20 @@ class CarlaAdapter(EquipmentAdapter):
             return []
 
         get_plan = getattr(local_planner, "get_plan", None)
-        if not callable(get_plan):
-            return []
-
         try:
-            plan = list(get_plan())
+            if callable(get_plan):
+                plan = list(get_plan())
+            else:
+                # CARLA 0.9.10 does not expose get_plan(), but keeps the
+                # remaining global plan in this deque.
+                plan = list(
+                    getattr(local_planner, "_waypoints_queue", [])
+                )
         except Exception:
             return []
 
         points: List[Dict[str, float]] = []
-        for index, plan_item in enumerate(plan[:600]):
+        for index, plan_item in enumerate(plan):
             if index % 2 != 0 and index != len(plan) - 1:
                 continue
 
@@ -664,9 +710,14 @@ class CarlaAdapter(EquipmentAdapter):
                 ).distance_to(target)
                 if task is not None:
                     task.last_distance_m = round(distance, 3)
+            arrival_tolerance = self.config.demo.arrival_tolerance_m
+            if task_id in self._takeover_task_ids and self._route_remaining_targets.get(
+                task_id or ""
+            ):
+                arrival_tolerance = min(arrival_tolerance, 6.0)
             arrived = (
                 distance is not None
-                and distance <= self.config.demo.arrival_tolerance_m
+                and distance <= arrival_tolerance
             )
             started_tick = (
                 self._task_started_ticks.get(task_id, self._tick_index)
@@ -693,23 +744,32 @@ class CarlaAdapter(EquipmentAdapter):
                     self._start_navigation_leg(
                         vehicle_id, task_id, next_target
                     )
+                    self._task_targets[task_id] = next_target
                     if task is not None:
-                        task.status_reason = "safe_route_waypoint_reached"
-                    self._emit(
-                        "safe_route_waypoint_reached",
-                        {
-                            "vehicle_id": vehicle_id,
-                            "task_id": task_id,
-                            "route_plan_id": (
-                                self._safe_route_plan or {}
-                            ).get("route_plan_id"),
-                            "next_target": {
-                                "x": next_target.x,
-                                "y": next_target.y,
-                                "z": next_target.z,
-                            },
+                        task.status_reason = (
+                            "takeover_route_checkpoint_reached"
+                            if task_id in self._takeover_task_ids
+                            else "safe_route_waypoint_reached"
+                        )
+                    waypoint_event = {
+                        "vehicle_id": vehicle_id,
+                        "task_id": task_id,
+                        "route_plan_id": (
+                            self._safe_route_plan or {}
+                        ).get("route_plan_id"),
+                        "next_target": {
+                            "x": next_target.x,
+                            "y": next_target.y,
+                            "z": next_target.z,
                         },
-                    )
+                    }
+                    self._emit("safe_route_waypoint_reached", waypoint_event)
+                    self._emit("hazard_route_waypoint_reached", waypoint_event)
+                    if task_id in self._takeover_task_ids:
+                        self._emit(
+                            "hazard_task_takeover_checkpoint_reached",
+                            waypoint_event,
+                        )
                     continue
                 completed_task_id = self._task_ids.pop(vehicle_id, None)
                 if completed_task_id:
@@ -737,6 +797,20 @@ class CarlaAdapter(EquipmentAdapter):
                             ),
                         },
                     )
+                    if completed_task_id in self._hazard_replanned_task_ids:
+                        self._emit(
+                            "hazard_route_replan_completed",
+                            {
+                                "vehicle_id": vehicle_id,
+                                "task_id": completed_task_id,
+                                "route_plan_id": self._safe_route_plan.get(
+                                    "route_plan_id"
+                                ),
+                            },
+                        )
+                        self._hazard_replanned_task_ids.discard(
+                            completed_task_id
+                        )
                     queue = self._task_queues.get(vehicle_id, [])
                     self._task_queues[vehicle_id] = [
                         task_id
@@ -747,6 +821,9 @@ class CarlaAdapter(EquipmentAdapter):
                     self._route_remaining_targets.pop(
                         completed_task_id, None
                     )
+                    self._takeover_routes.pop(completed_task_id, None)
+                    self._task_speed_limits.pop(completed_task_id, None)
+                    self._takeover_task_ids.discard(completed_task_id)
                     self._task_started_ticks.pop(completed_task_id, None)
                 self._release_agent(vehicle_id)
                 self._task_status[vehicle_id] = "completed"
@@ -978,6 +1055,86 @@ class CarlaAdapter(EquipmentAdapter):
             "task_id": self._task_ids.get(vehicle_id),
         }
 
+    def freeze_hazard_task_route(
+        self, vehicle_id: str, clearance_m: float = 50.0
+    ) -> Optional[Dict[str, object]]:
+        """Freeze the affected truck's progress before releasing its task."""
+
+        task_id = self._task_ids.get(vehicle_id)
+        task = self._task_objects.get(task_id) if task_id else None
+        actor = self._actors.get(vehicle_id)
+        if task is None or actor is None:
+            return None
+
+        route = list(task.original_route)
+        if not route:
+            route = self._extract_route_points(vehicle_id)
+            task.original_route = list(route)
+        if not route:
+            return None
+
+        location = actor.get_location()
+        closest_index = min(
+            range(len(route)),
+            key=lambda index: math.sqrt(
+                (float(route[index]["x"]) - location.x) ** 2
+                + (float(route[index]["y"]) - location.y) ** 2
+                + (float(route[index].get("z", 0.0)) - location.z) ** 2
+            ),
+        )
+        merge_index = closest_index
+        travelled = 0.0
+        for index in range(closest_index + 1, len(route)):
+            previous = route[index - 1]
+            current = route[index]
+            travelled += math.sqrt(
+                (float(current["x"]) - float(previous["x"])) ** 2
+                + (float(current["y"]) - float(previous["y"])) ** 2
+                + (
+                    float(current.get("z", 0.0))
+                    - float(previous.get("z", 0.0))
+                ) ** 2
+            )
+            merge_index = index
+            if travelled >= float(clearance_m):
+                break
+
+        task.completed_route = list(route[:closest_index])
+        task.last_completed_waypoint = (
+            dict(route[closest_index]) if route else None
+        )
+        task.safe_merge_point = dict(route[merge_index])
+        task.remaining_route = list(route[merge_index:])
+        configured = self._configured_takeover_route()
+        if configured is not None:
+            plan, handover_position, continuation = configured
+            task.safe_merge_point = {
+                "x": handover_position.x,
+                "y": handover_position.y,
+                "z": handover_position.z,
+            }
+            task.remaining_route = [
+                {"x": point.x, "y": point.y, "z": point.z}
+                for point in continuation
+            ]
+        task.status_reason = "hazard_route_progress_frozen"
+        payload = {
+            "vehicle_id": vehicle_id,
+            "task_id": task.task_id,
+            "closest_route_index": closest_index,
+            "safe_merge_route_index": merge_index,
+            "clearance_m": round(travelled, 3),
+            "remaining_checkpoint_count": len(task.remaining_route),
+            "safe_merge_point": dict(task.safe_merge_point),
+            "takeover_strategy": (
+                configured[0].get("strategy")
+                if configured is not None
+                else "dynamic_original_route_merge"
+            ),
+        }
+        self._emit("hazard_task_route_frozen", payload)
+        return payload
+
     def reassign_task(
         self,
         task_id: str,
@@ -1009,6 +1166,31 @@ class CarlaAdapter(EquipmentAdapter):
             )
 
         old_vehicle_id = task.assigned_vehicle_id
+
+        # The domain task is released before a human confirms takeover, so
+        # assigned_vehicle_id is intentionally empty here. Detach the task
+        # from its original hazard-stopped truck to avoid two vehicles
+        # appearing to own the same work after reassignment.
+        original_vehicle_id = task.original_vehicle_id
+        if (
+            original_vehicle_id
+            and original_vehicle_id != vehicle_id
+            and self._task_ids.get(original_vehicle_id) == task_id
+        ):
+            self._release_agent(original_vehicle_id)
+            self._task_ids.pop(original_vehicle_id, None)
+            self._task_queues[original_vehicle_id] = [
+                queued_task_id
+                for queued_task_id in self._task_queues.get(
+                    original_vehicle_id, []
+                )
+                if queued_task_id != task_id
+            ]
+            self._task_status[original_vehicle_id] = (
+                "emergency_stop"
+                if original_vehicle_id in self._emergency_stopped
+                else "idle"
+            )
 
         for queued_vehicle_id, queue in self._task_queues.items():
             self._task_queues[queued_vehicle_id] = [
@@ -1052,17 +1234,20 @@ class CarlaAdapter(EquipmentAdapter):
         task.started_tick = None
         task.completed_tick = None
         task.status_reason = "assigned_by_human_operator"
+        if speed_limit_kmh is not None:
+            self._task_speed_limits[task_id] = float(speed_limit_kmh)
+
+        takeover_route = self._build_takeover_route(task, vehicle_id)
+        if takeover_route:
+            self._takeover_routes[task_id] = takeover_route
+            self._takeover_task_ids.add(task_id)
+            task.transfer_count += 1
+            task.status_reason = "takeover_route_ready_after_human_approval"
 
         target_queue = self._task_queues.setdefault(vehicle_id, [])
         target_queue.insert(0, task_id)
         self._task_status[vehicle_id] = "assigned"
         self._start_next_task(vehicle_id)
-
-        agent = self._agents.get(vehicle_id)
-        if speed_limit_kmh is not None and agent is not None:
-            setter = getattr(agent, "set_target_speed", None)
-            if callable(setter):
-                setter(float(speed_limit_kmh))
 
         if old_vehicle_id and old_vehicle_id != vehicle_id:
             self._start_next_task(old_vehicle_id)
@@ -1074,6 +1259,8 @@ class CarlaAdapter(EquipmentAdapter):
                 "old_vehicle_id": old_vehicle_id,
                 "new_vehicle_id": vehicle_id,
                 "speed_limit_kmh": speed_limit_kmh,
+                "takeover_route_checkpoint_count": len(takeover_route),
+                "resumes_original_route": bool(takeover_route),
             },
         )
         return {
@@ -1083,7 +1270,215 @@ class CarlaAdapter(EquipmentAdapter):
             "status": self._task_status.get(vehicle_id, "assigned"),
         }
 
+    def _build_takeover_route(
+        self, task: Task, vehicle_id: str
+    ) -> List[Position]:
+        """Build access checkpoints, then append the frozen original route."""
+
+        actor = self._actors.get(vehicle_id)
+        configured = self._configured_takeover_route(vehicle_id)
+        if actor is not None and configured is not None:
+            plan, handover_position, continuation = configured
+            task.safe_merge_point = {
+                "x": handover_position.x,
+                "y": handover_position.y,
+                "z": handover_position.z,
+            }
+            task.remaining_route = [
+                {"x": point.x, "y": point.y, "z": point.z}
+                for point in continuation
+            ]
+            self._emit(
+                "hazard_task_takeover_route_built",
+                {
+                    "task_id": task.task_id,
+                    "original_vehicle_id": task.original_vehicle_id,
+                    "takeover_vehicle_id": vehicle_id,
+                    "access_checkpoint_count": 0,
+                    "total_checkpoint_count": len(continuation),
+                    "safe_merge_point": dict(task.safe_merge_point),
+                    "strategy": plan.get("strategy"),
+                    "blocked_segment_is_skipped": bool(
+                        plan.get("blocked_segment_is_skipped", False)
+                    ),
+                },
+            )
+            return list(continuation)
+        merge = task.safe_merge_point
+        if actor is None or not merge or not task.remaining_route:
+            return []
+
+        merge_position = Position(
+            float(merge["x"]),
+            float(merge["y"]),
+            float(merge.get("z", 0.0)),
+        )
+        access_route = self._trace_route_positions(
+            actor.get_location(), merge_position, sampling_resolution=4.0
+        )
+        if not access_route:
+            access_route = [merge_position]
+        original_remaining = [
+            Position(
+                float(point["x"]),
+                float(point["y"]),
+                float(point.get("z", 0.0)),
+            )
+            for point in task.remaining_route
+        ]
+        checkpoints = self._sample_route_positions(
+            access_route, spacing_m=18.0
+        )
+        checkpoints.extend(
+            self._sample_route_positions(
+                original_remaining, spacing_m=18.0
+            )
+        )
+
+        deduplicated: List[Position] = []
+        current = actor.get_location()
+        current_position = Position(current.x, current.y, current.z)
+        for point in checkpoints:
+            if point.distance_to(current_position) < 8.0:
+                continue
+            if deduplicated and point.distance_to(deduplicated[-1]) < 4.0:
+                continue
+            deduplicated.append(point)
+        self._emit(
+            "hazard_task_takeover_route_built",
+            {
+                "task_id": task.task_id,
+                "original_vehicle_id": task.original_vehicle_id,
+                "takeover_vehicle_id": vehicle_id,
+                "access_checkpoint_count": len(
+                    self._sample_route_positions(
+                        access_route, spacing_m=18.0
+                    )
+                ),
+                "total_checkpoint_count": len(deduplicated),
+                "safe_merge_point": dict(merge),
+                "planner_sampling_resolution_m": 4.0,
+            },
+        )
+        return deduplicated
+
+    def _configured_takeover_route(
+        self, vehicle_id: Optional[str] = None
+    ) -> Optional[Tuple[Dict[str, object], Position, List[Position]]]:
+        slope_event = self.config.scenario_variables.get("slope_event", {})
+        if not isinstance(slope_event, dict):
+            return None
+        plan = slope_event.get("takeover_plan", {})
+        if not isinstance(plan, dict):
+            return None
+        configured_vehicle_id = str(
+            plan.get("takeover_vehicle_id", "")
+        ).strip()
+        eligible_vehicle_ids = plan.get("eligible_vehicle_ids", [])
+        if isinstance(eligible_vehicle_ids, list) and eligible_vehicle_ids:
+            eligible_vehicle_ids = {
+                str(item) for item in eligible_vehicle_ids
+            }
+            if (
+                vehicle_id is not None
+                and vehicle_id not in eligible_vehicle_ids
+            ):
+                return None
+        elif (
+            vehicle_id is not None
+            and configured_vehicle_id
+            and configured_vehicle_id != vehicle_id
+        ):
+            return None
+        handover_index = plan.get("handover_spawn_point_index")
+        waypoint_indices = plan.get(
+            "continuation_waypoint_spawn_point_indices", []
+        )
+        if (
+            self.world is None
+            or not isinstance(waypoint_indices, list)
+            or not waypoint_indices
+        ):
+            return None
+        spawn_points = self.world.get_map().get_spawn_points()
+        if not spawn_points:
+            return None
+
+        def position_for(index: int) -> Position:
+            location = spawn_points[int(index) % len(spawn_points)].location
+            return Position(location.x, location.y, location.z)
+
+        continuation = [
+            position_for(int(index)) for index in waypoint_indices
+        ]
+        actor = self._actors.get(vehicle_id) if vehicle_id else None
+        if actor is not None:
+            location = actor.get_location()
+            handover_position = Position(
+                location.x, location.y, location.z
+            )
+        elif handover_index is not None:
+            handover_position = position_for(int(handover_index))
+        else:
+            handover_position = continuation[0]
+        return plan, handover_position, continuation
+
+    def _trace_route_positions(
+        self, start_location, target: Position, sampling_resolution: float
+    ) -> List[Position]:
+        if (
+            self.world is None
+            or self.carla is None
+            or self._global_route_planner_class is None
+            or self._global_route_planner_dao_class is None
+        ):
+            return []
+        try:
+            dao = self._global_route_planner_dao_class(
+                self.world.get_map(), float(sampling_resolution)
+            )
+            planner = self._global_route_planner_class(dao)
+            planner.setup()
+            route = planner.trace_route(
+                start_location,
+                self.carla.Location(
+                    x=target.x, y=target.y, z=target.z
+                ),
+            )
+        except Exception as exc:
+            self._emit(
+                "takeover_access_route_fallback",
+                {"reason": str(exc), "strategy": "direct_safe_merge"},
+            )
+            return []
+        positions = []
+        for item in route:
+            waypoint = item[0] if isinstance(item, (tuple, list)) else item
+            location = waypoint.transform.location
+            positions.append(Position(location.x, location.y, location.z))
+        return positions
+
+    @staticmethod
+    def _sample_route_positions(
+        route: Sequence[Position], spacing_m: float
+    ) -> List[Position]:
+        if not route:
+            return []
+        sampled = [route[0]]
+        travelled = 0.0
+        previous = route[0]
+        for point in route[1:]:
+            travelled += point.distance_to(previous)
+            previous = point
+            if travelled >= spacing_m:
+                sampled.append(point)
+                travelled = 0.0
+        if sampled[-1].distance_to(route[-1]) > 1.0:
+            sampled.append(route[-1])
+        return sampled
+
     def close(self) -> None:
+        self._destroy_camera_streams()
         for vehicle_id in list(self._agents):
             self._stop_vehicle(
                 vehicle_id, hand_brake=True
@@ -1093,9 +1488,15 @@ class CarlaAdapter(EquipmentAdapter):
         self._task_objects.clear()
         self._zones_by_id.clear()
         self._task_targets.clear()
+        self._route_remaining_targets.clear()
+        self._takeover_routes.clear()
+        self._task_speed_limits.clear()
+        self._takeover_task_ids.clear()
         self._task_started_ticks.clear()
         self._spectator = None
         self._camera_vehicle_id = None
+        self._camera_frame_numbers.clear()
+        self._camera_display_names.clear()
         self._trajectory_points.clear()
         self._paused.clear()
         self._emergency_stopped.clear()
@@ -1106,6 +1507,237 @@ class CarlaAdapter(EquipmentAdapter):
         self._vehicles_with_completed_task.clear()
         self.client = None
         self.world = None
+
+    def _camera_wall_options(self) -> Dict[str, object]:
+        options = self.config.scenario_variables.get("camera_wall", {})
+        return options if isinstance(options, dict) else {}
+
+    def _ensure_camera_streams(self) -> None:
+        """Create one overview camera and one chase camera per mine truck.
+
+        The simulator and API run in separate processes, so callbacks publish
+        only the latest PNG for each stream to an atomic shared-file handoff.
+        Camera failures remain presentation-only and never stop dispatching.
+        """
+
+        options = self._camera_wall_options()
+        if not bool(options.get("enabled", False)):
+            return
+        if self._camera_sensors or self.world is None or self.carla is None:
+            return
+        if not self._actors:
+            return
+
+        try:
+            self._camera_output_dir.mkdir(parents=True, exist_ok=True)
+            blueprint = self.world.get_blueprint_library().find(
+                "sensor.camera.rgb"
+            )
+            width = max(320, int(options.get("image_width", 640)))
+            height = max(180, int(options.get("image_height", 360)))
+            sensor_tick = max(
+                0.1, float(options.get("sensor_tick_seconds", 0.25))
+            )
+            blueprint.set_attribute("image_size_x", str(width))
+            blueprint.set_attribute("image_size_y", str(height))
+            blueprint.set_attribute("fov", str(options.get("fov", 90)))
+            blueprint.set_attribute("sensor_tick", str(sensor_tick))
+
+            overview = self.world.spawn_actor(
+                blueprint,
+                self._overview_camera_transform(options),
+            )
+            self._register_camera_sensor(
+                "global", "矿山全局视角", overview
+            )
+
+            definitions = {
+                item.vehicle_id: item for item in self.config.vehicles
+            }
+            requested_ids = options.get("vehicle_ids")
+            if not isinstance(requested_ids, list):
+                requested_ids = sorted(self._actors)
+            for vehicle_id in requested_ids:
+                vehicle_id = str(vehicle_id)
+                actor = self._actors.get(vehicle_id)
+                if actor is None:
+                    continue
+                sensor = self.world.spawn_actor(
+                    blueprint,
+                    self._chase_camera_transform(actor, options),
+                    attach_to=actor,
+                )
+                definition = definitions.get(vehicle_id)
+                display_name = (
+                    definition.display_name if definition else vehicle_id
+                )
+                self._register_camera_sensor(
+                    vehicle_id, display_name, sensor
+                )
+            self._write_camera_manifest(
+                width=width,
+                height=height,
+                sensor_tick=sensor_tick,
+            )
+            self._emit(
+                "camera_wall_started",
+                {
+                    "stream_ids": sorted(self._camera_sensors),
+                    "image_width": width,
+                    "image_height": height,
+                    "sensor_tick_seconds": sensor_tick,
+                },
+            )
+        except (AttributeError, RuntimeError, OSError, TypeError, ValueError) as exc:
+            self._destroy_camera_streams()
+            print(
+                "WARNING: 多车视频监控启动失败，不影响车辆调度：{}".format(
+                    exc
+                )
+            )
+
+    def _overview_camera_transform(self, options: Dict[str, object]):
+        spawn_points = self.world.get_map().get_spawn_points()
+        locations = [item.location for item in spawn_points]
+        if locations:
+            min_x = min(item.x for item in locations)
+            max_x = max(item.x for item in locations)
+            min_y = min(item.y for item in locations)
+            max_y = max(item.y for item in locations)
+            max_z = max(item.z for item in locations)
+            center_x = (min_x + max_x) / 2.0
+            center_y = (min_y + max_y) / 2.0
+            span = max(max_x - min_x, max_y - min_y)
+        else:
+            center_x = center_y = max_z = 0.0
+            span = 300.0
+        camera_height = float(
+            options.get(
+                "overview_height_m",
+                max(160.0, min(600.0, span * 0.65)),
+            )
+        )
+        return self.carla.Transform(
+            self.carla.Location(
+                x=center_x,
+                y=center_y,
+                z=max_z + camera_height,
+            ),
+            self.carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0),
+        )
+
+    def _chase_camera_transform(
+        self, actor, options: Dict[str, object]
+    ):
+        bounding_box = getattr(actor, "bounding_box", None)
+        extent = getattr(bounding_box, "extent", None)
+        half_length = float(getattr(extent, "x", 0.0))
+        half_height = float(getattr(extent, "z", 0.0))
+        follow_distance = float(
+            options.get(
+                "follow_distance_m",
+                max(20.0, half_length * 2.0 + 8.0),
+            )
+        )
+        camera_height = float(
+            options.get(
+                "follow_height_m",
+                max(10.0, half_height + 7.0),
+            )
+        )
+        return self.carla.Transform(
+            self.carla.Location(
+                x=-follow_distance,
+                y=0.0,
+                z=camera_height,
+            ),
+            self.carla.Rotation(pitch=-16.0, yaw=0.0, roll=0.0),
+        )
+
+    def _register_camera_sensor(
+        self, stream_id: str, display_name: str, sensor
+    ) -> None:
+        self._camera_sensors[stream_id] = sensor
+        self._camera_display_names[stream_id] = display_name
+        self.spawned_actor_ids.append(sensor.id)
+        sensor.listen(
+            lambda image, camera_id=stream_id: self._save_camera_frame(
+                camera_id, image
+            )
+        )
+
+    def _save_camera_frame(self, stream_id: str, image) -> None:
+        if stream_id not in self._camera_sensors:
+            return
+        frame_number = int(getattr(image, "frame", 0))
+        if self._camera_frame_numbers.get(stream_id) == frame_number:
+            return
+        staging_path = self._camera_output_dir / (
+            "{}.next.png".format(stream_id)
+        )
+        target_path = self._camera_output_dir / (
+            "{}.png".format(stream_id)
+        )
+        try:
+            image.save_to_disk(str(staging_path))
+            os.replace(str(staging_path), str(target_path))
+            self._camera_frame_numbers[stream_id] = frame_number
+        except (RuntimeError, OSError):
+            return
+
+    def _write_camera_manifest(
+        self, width: int, height: int, sensor_tick: float
+    ) -> None:
+        streams = []
+        for stream_id, sensor in self._camera_sensors.items():
+            streams.append(
+                {
+                    "id": stream_id,
+                    "name": getattr(
+                        sensor,
+                        "_openpit_display_name",
+                        self._camera_display_names.get(stream_id, stream_id),
+                    ),
+                    "kind": (
+                        "overview" if stream_id == "global" else "vehicle"
+                    ),
+                    "image_url": "/camera/{}/frame".format(stream_id),
+                }
+            )
+        payload = {
+            "status": "online",
+            "width": width,
+            "height": height,
+            "sensor_tick_seconds": sensor_tick,
+            "streams": streams,
+        }
+        staging_path = self._camera_output_dir / "manifest.next.json"
+        target_path = self._camera_output_dir / "manifest.json"
+        staging_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(str(staging_path), str(target_path))
+
+    def _destroy_camera_streams(self) -> None:
+        sensors = list(self._camera_sensors.values())
+        self._camera_sensors.clear()
+        self._camera_display_names.clear()
+        for sensor in sensors:
+            try:
+                sensor.stop()
+            except (AttributeError, RuntimeError):
+                pass
+            try:
+                sensor.destroy()
+            except (AttributeError, RuntimeError):
+                pass
+        manifest_path = self._camera_output_dir / "manifest.json"
+        try:
+            if manifest_path.exists():
+                manifest_path.unlink()
+        except OSError:
+            pass
 
     def drain_events(self) -> List[Dict[str, object]]:
         events = list(self._events)
@@ -1128,12 +1760,20 @@ class CarlaAdapter(EquipmentAdapter):
         try:
             import carla
             from agents.navigation.basic_agent import BasicAgent
+            from agents.navigation.global_route_planner import (
+                GlobalRoutePlanner,
+            )
+            from agents.navigation.global_route_planner_dao import (
+                GlobalRoutePlannerDAO,
+            )
         except ImportError as exc:
             raise CarlaAdapterError(
                 "Failed to import CARLA API/BasicAgent: {}".format(exc)
             ) from exc
         self.carla = carla
         self._basic_agent_class = BasicAgent
+        self._global_route_planner_class = GlobalRoutePlanner
+        self._global_route_planner_dao_class = GlobalRoutePlannerDAO
 
     def _discover_configured_vehicles(self) -> None:
         role_to_id = {
@@ -1212,13 +1852,26 @@ class CarlaAdapter(EquipmentAdapter):
             )
             navigation_target = target
             safe_route_applied = False
+            takeover_route_applied = False
             safe_route_plan = self._safe_route_plan or {}
             safe_task_types = safe_route_plan.get("task_types", set())
-            if task.task_type in safe_task_types:
-                waypoint = safe_route_plan.get("waypoint_position")
-                if isinstance(waypoint, Position):
-                    navigation_target = waypoint
-                    self._route_remaining_targets[task.task_id] = [target]
+            takeover_route = self._takeover_routes.get(task.task_id, [])
+            if takeover_route:
+                navigation_target = takeover_route[0]
+                self._route_remaining_targets[task.task_id] = list(
+                    takeover_route[1:]
+                )
+                takeover_route_applied = True
+            elif task.task_type in safe_task_types:
+                waypoints = safe_route_plan.get("waypoint_positions", [])
+                if waypoints and all(
+                    isinstance(item, Position) for item in waypoints
+                ):
+                    navigation_target = waypoints[0]
+                    self._route_remaining_targets[task.task_id] = list(
+                        waypoints[1:]
+                    ) + [target]
+                    self._hazard_replanned_task_ids.add(task.task_id)
                     safe_route_applied = True
             task.status = "executing"
             now = utc_now()
@@ -1236,7 +1889,11 @@ class CarlaAdapter(EquipmentAdapter):
                 ).distance_to(target),
                 3,
             )
-            task.status_reason = "navigation_started"
+            task.status_reason = (
+                "takeover_navigation_started"
+                if takeover_route_applied
+                else "navigation_started"
+            )
             self._task_targets[task.task_id] = navigation_target
             self._task_started_ticks[task.task_id] = self._tick_index
             self._task_ids[vehicle_id] = task.task_id
@@ -1244,6 +1901,8 @@ class CarlaAdapter(EquipmentAdapter):
             self._start_navigation_leg(
                 vehicle_id, task.task_id, navigation_target
             )
+            if not task.original_route and not takeover_route_applied:
+                task.original_route = self._extract_route_points(vehicle_id)
             self._emit(
                 "task_started",
                 {
@@ -1263,6 +1922,8 @@ class CarlaAdapter(EquipmentAdapter):
                         "z": target.z,
                     },
                     "safe_route_applied": safe_route_applied,
+                    "takeover_route_applied": takeover_route_applied,
+                    "takeover_route_checkpoint_count": len(takeover_route),
                     "safe_route_plan_id": safe_route_plan.get(
                         "route_plan_id"
                     ) if safe_route_applied else None,
@@ -1282,10 +1943,23 @@ class CarlaAdapter(EquipmentAdapter):
             for item in self.config.vehicles
             if item.vehicle_id == vehicle_id
         )
-        agent = self._basic_agent_class(
-            actor, target_speed=definition.target_speed_kmh
+        target_speed = self._task_speed_limits.get(
+            task_id, definition.target_speed_kmh
         )
+        agent = self._basic_agent_class(actor, target_speed=target_speed)
         agent.set_destination([target.x, target.y, target.z])
+        local_planner = None
+        getter = getattr(agent, "get_local_planner", None)
+        if callable(getter):
+            try:
+                local_planner = getter()
+            except Exception:
+                local_planner = None
+        if local_planner is None:
+            local_planner = getattr(agent, "_local_planner", None)
+        speed_setter = getattr(local_planner, "set_speed", None)
+        if callable(speed_setter):
+            speed_setter(float(target_speed))
         self._agents[vehicle_id] = agent
         self._task_targets[task_id] = target
 
@@ -1366,32 +2040,70 @@ class CarlaAdapter(EquipmentAdapter):
     def _update_spectator_camera(self) -> None:
         if self._spectator is None or self.carla is None:
             return
-        candidates = []
-        for vehicle_id, task_id in self._task_ids.items():
-            task = self._task_objects.get(task_id)
-            actor = self._actors.get(vehicle_id)
-            if task is None or actor is None:
-                continue
-            candidates.append(
-                (task.priority, vehicle_id, actor, task)
-            )
-        if not candidates:
-            return
-        _, vehicle_id, actor, task = max(
-            candidates,
-            key=lambda item: (item[0], item[1]),
+        camera_director = self.config.scenario_variables.get(
+            "camera_director", {}
         )
+        preferred_vehicle_id = (
+            str(camera_director.get("follow_vehicle_id", "")).strip()
+            if isinstance(camera_director, dict)
+            and camera_director.get("mode") == "fixed_vehicle_chase"
+            else ""
+        )
+        preferred_actor = self._actors.get(preferred_vehicle_id)
+        if preferred_actor is not None:
+            vehicle_id = preferred_vehicle_id
+            actor = preferred_actor
+            task_id = self._task_ids.get(vehicle_id)
+            task = self._task_objects.get(task_id) if task_id else None
+            camera_mode = "fixed_vehicle_chase"
+        else:
+            vehicle_id = None
+            actor = None
+            task_id = None
+            task = None
+            camera_mode = "priority_vehicle_chase"
+        candidates = []
+        if actor is None:
+            for candidate_vehicle_id, candidate_task_id in self._task_ids.items():
+                candidate_task = self._task_objects.get(candidate_task_id)
+                candidate_actor = self._actors.get(candidate_vehicle_id)
+                if candidate_task is None or candidate_actor is None:
+                    continue
+                candidates.append(
+                    (
+                        candidate_task.priority,
+                        candidate_vehicle_id,
+                        candidate_actor,
+                        candidate_task,
+                    )
+                )
+            if not candidates:
+                return
+            _, vehicle_id, actor, task = max(
+                candidates,
+                key=lambda item: (item[0], item[1]),
+            )
+            task_id = task.task_id
         actor_transform = actor.get_transform()
         forward = actor_transform.get_forward_vector()
         actor_location = actor_transform.location
+        bounding_box = getattr(actor, "bounding_box", None)
+        extent = getattr(bounding_box, "extent", None)
+        # Mine-truck bodies are substantially larger than CARLA passenger
+        # cars.  Derive a camera offset from the real actor bounds so the
+        # spectator stays outside the chassis rather than under the axle.
+        body_half_length = float(getattr(extent, "x", 0.0))
+        body_half_height = float(getattr(extent, "z", 0.0))
+        follow_distance = max(20.0, body_half_length * 2.0 + 8.0)
+        camera_height = max(10.0, body_half_height + 7.0)
         camera_location = self.carla.Location(
-            x=actor_location.x - forward.x * 9.0,
-            y=actor_location.y - forward.y * 9.0,
-            z=actor_location.z + 5.0,
+            x=actor_location.x - forward.x * follow_distance,
+            y=actor_location.y - forward.y * follow_distance,
+            z=actor_location.z + camera_height,
         )
         actor_rotation = actor_transform.rotation
         camera_rotation = self.carla.Rotation(
-            pitch=-18.0,
+            pitch=-16.0,
             yaw=actor_rotation.yaw,
             roll=0.0,
         )
@@ -1406,10 +2118,8 @@ class CarlaAdapter(EquipmentAdapter):
                 "spectator_camera_target_changed",
                 {
                     "vehicle_id": vehicle_id,
-                    "task_id": task.task_id,
-                    "camera_mode": (
-                        "priority_vehicle_chase"
-                    ),
+                    "task_id": task_id,
+                    "camera_mode": camera_mode,
                 },
             )
 

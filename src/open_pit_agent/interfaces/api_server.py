@@ -5,15 +5,24 @@ API服务持有唯一RuntimeState。run_demo.py通过/runtime/sync推送状态�
 UI通过/commands写入控制命令，CARLA运行进程读取并回执。
 """
 
+import json
+import time
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from open_pit_agent.runtime_state import runtime
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+CAMERA_ROOT = PROJECT_ROOT / "artifacts" / "live_cameras"
+
+
 app = FastAPI(
     title="OpenPit Agent API",
-    version="5.0-monitoring",
+    version="5.1-camera-wall",
 )
 
 app.add_middleware(
@@ -30,8 +39,9 @@ def root():
         "service": "OpenPit Agent API",
         "status": "running",
         "runtime": True,
-        "version": "5.0-monitoring",
+        "version": "5.1-camera-wall",
         "monitoring_endpoint": "/monitoring",
+        "camera_endpoint": "/camera/streams",
     }
 
 
@@ -68,6 +78,57 @@ def state():
 @app.get("/map_state")
 def map_state():
     return runtime.get_map_state()
+
+
+@app.get("/camera/streams")
+def camera_streams():
+    manifest_path = CAMERA_ROOT / "manifest.json"
+    if not manifest_path.exists():
+        return {"status": "offline", "streams": []}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="camera_manifest_unavailable: {}".format(exc),
+        )
+    streams = payload.get("streams", [])
+    newest_mtime = 0.0
+    for stream in streams:
+        stream_id = str(stream.get("id", ""))
+        frame_path = CAMERA_ROOT / "{}.png".format(stream_id)
+        available = frame_path.exists()
+        stream["frame_available"] = available
+        if available:
+            try:
+                newest_mtime = max(
+                    newest_mtime, frame_path.stat().st_mtime
+                )
+            except FileNotFoundError:
+                stream["frame_available"] = False
+    payload["status"] = (
+        "online"
+        if newest_mtime and time.time() - newest_mtime < 3.0
+        else "stale"
+    )
+    return payload
+
+
+@app.get("/camera/{stream_id}/frame")
+def camera_frame(stream_id: str):
+    if not stream_id or any(
+        character not in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+        for character in stream_id.lower()
+    ):
+        raise HTTPException(status_code=400, detail="invalid_camera_id")
+    frame_path = CAMERA_ROOT / "{}.png".format(stream_id)
+    if not frame_path.exists():
+        raise HTTPException(status_code=404, detail="camera_frame_not_ready")
+    return FileResponse(
+        str(frame_path),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.post("/runtime/sync")

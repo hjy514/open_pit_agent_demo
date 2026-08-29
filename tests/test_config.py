@@ -72,7 +72,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(3, len(config.vehicles))
         self.assertGreaterEqual(len(config.zones), 5)
         self.assertEqual(
-            [15, 78, 63],
+            [78, 28, 63],
             [item.spawn_point_index for item in config.vehicles],
         )
         self.assertEqual(12.0, config.demo.arrival_tolerance_m)
@@ -84,14 +84,38 @@ class ConfigTest(unittest.TestCase):
             len(config.vehicles),
             len({vehicle.display_name for vehicle in config.vehicles}),
         )
-        safe_route = config.scenario_variables[
-            "emergency_event"
-        ]["safe_route"]
         self.assertEqual(
-            "east-slope-safe-bypass-route-01",
-            safe_route["route_plan_id"],
+            3,
+            sum(zone.initial_task for zone in config.zones),
         )
-        self.assertEqual(15, safe_route["waypoint_spawn_point_index"])
+        spatial = config.scenario_variables["slope_event"][
+            "spatial_objects"
+        ]
+        self.assertEqual(
+            [12, 49],
+            spatial["hazard_zone"]["spawn_point_indices"],
+        )
+        takeover = config.scenario_variables["slope_event"][
+            "takeover_plan"
+        ]
+        self.assertEqual(
+            {"inspection_vehicle_02", "emergency_vehicle_01"},
+            set(takeover["eligible_vehicle_ids"]),
+        )
+        self.assertEqual(
+            [48], takeover["continuation_waypoint_spawn_point_indices"]
+        )
+        camera_wall = config.scenario_variables["camera_wall"]
+        self.assertTrue(camera_wall["enabled"])
+        self.assertEqual(
+            {
+                "inspection_vehicle_01",
+                "inspection_vehicle_02",
+                "emergency_vehicle_01",
+            },
+            set(camera_wall["vehicle_ids"]),
+        )
+        self.assertGreaterEqual(camera_wall["sensor_tick_seconds"], 0.1)
 
 
 if __name__ == "__main__":

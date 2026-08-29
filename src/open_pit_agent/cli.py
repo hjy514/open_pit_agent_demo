@@ -46,6 +46,7 @@ from .scheduler import (
     BaselineScheduler,
     SchedulingError,
     release_failed_vehicle_tasks,
+    release_hazard_affected_tasks,
     tasks_from_zones,
 )
 RUNTIME_API_URL = os.environ.get(
@@ -55,6 +56,16 @@ RUNTIME_API_URL = os.environ.get(
 RUNTIME_API_BASE_URL = RUNTIME_API_URL.rsplit(
     "/runtime/sync", 1
 )[0]
+
+SLOPE_STATE_LABELS = {
+    "stable": "稳定",
+    "rainfall_infiltration": "降雨入渗",
+    "progressive_deformation": "渐进变形",
+    "accelerating_deformation": "加速变形",
+    "pre_failure": "临滑预警",
+    "failure": "局部失稳",
+    "post_failure_monitoring": "滑后监测",
+}
 
 from .work_order import (
     WorkOrderError,
@@ -573,6 +584,7 @@ def _runtime_monitoring_payload(
     phase_index: int,
     work_orders: WorkOrderManager,
     restrictions: RestrictionRegistry,
+    tasks=(),
     feedback_count: int = 0,
     assessment=None,
     latest_event: str = "",
@@ -588,6 +600,21 @@ def _runtime_monitoring_payload(
         restriction_summary.get("active_road_restriction_count", 0)
     )
     all_closed = work_orders.all_closed()
+    handover_tasks = [
+        item for item in (tasks or [])
+        if getattr(item, "handover_reason", None)
+    ]
+    takeover_task = handover_tasks[0] if handover_tasks else None
+    takeover_status = "未触发"
+    if takeover_task is not None:
+        if takeover_task.status == "completed":
+            takeover_status = "接管任务已完成"
+        elif takeover_task.status == "executing":
+            takeover_status = "接管车辆执行中"
+        elif takeover_task.recommended_vehicle_id:
+            takeover_status = "等待调度员确认"
+        else:
+            takeover_status = "AI正在评估候选车辆"
     if active_restrictions:
         road_control_status = "风险区准入管控中"
         route_safety_status = (
@@ -598,6 +625,14 @@ def _runtime_monitoring_payload(
     elif all_closed and feedback_count:
         road_control_status = "已解除"
         route_safety_status = "复核安全，CARLA导航路线已恢复"
+    elif str(risk_payload.get("level", "")).lower() in {
+        "orange",
+        "red",
+    }:
+        road_control_status = "无需区域封锁，边坡异常持续标记"
+        route_safety_status = (
+            "候选车辆从安全侧接管，后续车辆持续接收风险提示"
+        )
     else:
         road_control_status = "未启动"
         route_safety_status = "CARLA导航路线已生成"
@@ -624,6 +659,10 @@ def _runtime_monitoring_payload(
         ),
         "risk_trend": risk_payload.get("trend", "stable"),
         "risk_zone": risk_payload.get("zone_id", "-"),
+        "slope_state": risk_payload.get("slope_state", "stable"),
+        "slope_state_label": SLOPE_STATE_LABELS.get(
+            risk_payload.get("slope_state", "stable"), "未知"
+        ),
         "work_order_count": int(
             work_order_summary.get("work_order_count", 0)
         ),
@@ -632,19 +671,86 @@ def _runtime_monitoring_payload(
             for item in work_order_summary.get("work_orders", [])
         ),
         "feedback_count": int(feedback_count),
+        "takeover_status": takeover_status,
+        "takeover_task_count": len(handover_tasks),
+        "takeover_recommended_vehicle_id": (
+            takeover_task.recommended_vehicle_id
+            if takeover_task is not None
+            else None
+        ),
+        "takeover_selected_vehicle_id": (
+            takeover_task.assigned_vehicle_id
+            if takeover_task is not None
+            else None
+        ),
+        "takeover_candidate_count": (
+            len(takeover_task.candidate_evaluations)
+            if takeover_task is not None
+            else 0
+        ),
         "road_control_status": road_control_status,
         "route_safety_status": route_safety_status,
         "route_avoidance_enforced": bool(
             restriction_summary.get("route_avoidance_enforced", False)
         ),
+        "hazard_information_active": str(
+            risk_payload.get("level", "")
+        ).lower() in {"orange", "red"},
         "closed_loop_complete": bool(
-            feedback_count and all_closed
+            (feedback_count and all_closed)
+            or phase == "闭环完成"
         ),
         "latest_event": latest_event,
         "data_label": monitoring_data.get(
             "monitoring_dataset_label", ""
         ),
     }
+
+
+def _record_slope_state_transition(
+    recorder: EvidenceRecorder,
+    assessment,
+    previous_slope_state: Optional[str],
+) -> str:
+    """Emit an auditable physical-slope state transition."""
+
+    current = str(getattr(assessment, "slope_state", "stable"))
+    if current != previous_slope_state:
+        recorder.record(
+            "slope_state_changed",
+            {
+                "tick": int(assessment.tick),
+                "risk_level": assessment.level,
+                "previous_slope_state": previous_slope_state,
+                "slope_state": current,
+                "slope_state_label": SLOPE_STATE_LABELS.get(
+                    current, "未知"
+                ),
+                "zone_id": assessment.zone_id,
+                "reason": "synthetic_slope_event_stage_transition",
+            },
+        )
+    return current
+
+
+def _record_risk_level_transition(
+    recorder: EvidenceRecorder, assessment
+) -> None:
+    """Record level changes separately from every raw risk assessment."""
+
+    if assessment.level == assessment.previous_level:
+        return
+    recorder.record(
+        "risk_level_changed",
+        {
+            "tick": int(assessment.tick),
+            "previous_level": assessment.previous_level,
+            "risk_level": assessment.level,
+            "slope_state": getattr(assessment, "slope_state", "stable"),
+            "zone_id": assessment.zone_id,
+            "reasons": list(getattr(assessment, "reasons", [])),
+        },
+    )
 
 
 def _activate_configured_safe_route(
@@ -671,14 +777,43 @@ def _activate_configured_safe_route(
         return None
     route_plan_id = str(safe_route.get("route_plan_id", "")).strip()
     task_types = safe_route.get("task_types", [])
-    waypoint_index = safe_route.get("waypoint_spawn_point_index")
+    waypoint_indices = safe_route.get(
+        "waypoint_spawn_point_indices",
+        [safe_route.get("waypoint_spawn_point_index")],
+    )
     if not route_plan_id or not isinstance(task_types, list):
         return None
-    if waypoint_index is None:
+    if (
+        not isinstance(waypoint_indices, list)
+        or not waypoint_indices
+        or any(index is None for index in waypoint_indices)
+    ):
         return None
+    strategy = str(
+        safe_route.get(
+            "strategy", "carla_basic_agent_via_safe_waypoint"
+        )
+    )
+    if safe_route.get("execution_mode") == "logical_plan_only":
+        payload = {
+            "route_plan_id": route_plan_id,
+            "waypoint_spawn_point_indices": [
+                int(index) for index in waypoint_indices
+            ],
+            "task_types": [str(value) for value in task_types],
+            "blocked_road_segment_id": restriction.road_segment_id,
+            "strategy": strategy,
+            "execution_mode": "logical_plan_only",
+            "replanned_task_ids": [],
+        }
+        restrictions.mark_route_avoidance_enforced(route_plan_id, strategy)
+        recorder.record("hazard_route_replanned", {"tick": tick, **payload})
+        return payload
     payload = configure(
         route_plan_id=route_plan_id,
-        waypoint_spawn_point_index=int(waypoint_index),
+        waypoint_spawn_point_indices=[
+            int(index) for index in waypoint_indices
+        ],
         task_types=[str(value) for value in task_types],
         blocked_road_segment_id=restriction.road_segment_id,
     )
@@ -702,6 +837,46 @@ def _activate_configured_safe_route(
     return event_payload
 
 
+def _place_affected_vehicle_in_safe_hold(
+    adapter,
+    config: ScenarioConfig,
+    assessment,
+    recorder: EvidenceRecorder,
+    tick: int,
+) -> Optional[Dict[str, object]]:
+    """Apply and record the affected truck's immediate protective action."""
+
+    slope_event = config.scenario_variables.get("slope_event", {})
+    if not isinstance(slope_event, dict):
+        return None
+    vehicle_id = str(slope_event.get("affected_vehicle_id", "")).strip()
+    stop_vehicle = getattr(adapter, "emergency_stop_vehicle", None)
+    if not vehicle_id or not callable(stop_vehicle):
+        return None
+    recorder.record(
+        "affected_vehicle_detected",
+        {
+            "tick": int(tick),
+            "vehicle_id": vehicle_id,
+            "risk_level": assessment.level,
+            "slope_state": getattr(assessment, "slope_state", "failure"),
+            "action": "protective_safe_hold_before_evacuation",
+        },
+    )
+    result = stop_vehicle(vehicle_id)
+    recorder.record(
+        "hazard_vehicle_safe_hold",
+        {
+            "tick": int(tick),
+            "vehicle_id": vehicle_id,
+            "status": result.get("status", "emergency_stop"),
+            "task_id": result.get("task_id"),
+            "reason": "east_slope_haul_road_r1_red_risk",
+        },
+    )
+    return result
+
+
 def _process_closed_loop_feedback(
     work_orders: WorkOrderManager,
     risk_engine: RuleBasedRiskEngine,
@@ -711,6 +886,12 @@ def _process_closed_loop_feedback(
 ):
     transitions = []
     records = []
+    # Feedback is an independent post-action recheck.  It must not mutate the
+    # live engine's per-zone history, otherwise a later persistent red sample
+    # is incorrectly treated as a brand-new escalation.
+    feedback_engine = RuleBasedRiskEngine(risk_scenario)
+    for baseline_observation in risk_scenario.observations:
+        feedback_engine.assess(baseline_observation)
     for order in work_orders.ready_for_feedback(tick):
         feedback_id = "feedback-{}-{:06d}".format(
             order.work_order_id, tick
@@ -719,9 +900,11 @@ def _process_closed_loop_feedback(
             risk_scenario,
             tick=tick,
             feedback_id=feedback_id,
-            zone_id=risk_scenario.action.zone_id,
+            # The recheck must be evaluated against the original hazard
+            # zone; the response task itself may be dispatched to H1.
+            zone_id=risk_scenario.observations[-1].zone_id,
         )
-        assessment = risk_engine.assess(observation)
+        assessment = feedback_engine.assess(observation)
         transition = work_orders.review_with_feedback(
             order.task_id,
             tick=tick,
@@ -848,6 +1031,7 @@ def run_mock(
 
         risk_assessments = []
         risk_task_ids = []
+        previous_slope_state = None
         if risk_scenario is not None:
             engine = RuleBasedRiskEngine(risk_scenario)
             recorder.record(
@@ -878,6 +1062,10 @@ def run_mock(
                 assessment = engine.assess(observation)
                 risk_assessments.append(assessment)
                 recorder.record("risk_assessed", assessment.to_dict())
+                previous_slope_state = _record_slope_state_transition(
+                    recorder, assessment, previous_slope_state
+                )
+                _record_risk_level_transition(recorder, assessment)
                 guidance = build_risk_guidance(
                     assessment, risk_scenario, resolved_scenario
                 )
@@ -890,6 +1078,7 @@ def run_mock(
                     restriction_action is not None
                     and assessment.level
                     in restriction_action.trigger_levels
+                    and assessment.level != assessment.previous_level
                 ):
                     restriction = restrictions.activate(
                         assessment,
@@ -1181,6 +1370,8 @@ def run_carla(
     )
     risk_assessments = []
     risk_task_ids = []
+    hazard_takeover_triggered = False
+    previous_slope_state = None
     risk_guidance = []
     decision_records = []
     closed_loop_feedback_records = []
@@ -1314,6 +1505,7 @@ def run_carla(
                 phase_index=0,
                 work_orders=work_orders,
                 restrictions=restrictions,
+                tasks=tasks,
                 latest_event="固定站与移动装备开始协同采集",
             ),
         )
@@ -1386,7 +1578,10 @@ def run_carla(
                         if closed_loop_feedback_records
                         else (
                             "装备执行"
-                            if risk_task_ids
+                            if (
+                                risk_task_ids
+                                or hazard_takeover_triggered
+                            )
                             else (
                                 "风险分析"
                                 if risk_assessments
@@ -1403,7 +1598,10 @@ def run_carla(
                         if closed_loop_feedback_records
                         else (
                             3
-                            if risk_task_ids
+                            if (
+                                risk_task_ids
+                                or hazard_takeover_triggered
+                            )
                             else (1 if risk_assessments else 0)
                         )
                     )
@@ -1419,6 +1617,7 @@ def run_carla(
                         phase_index=runtime_phase_index,
                         work_orders=work_orders,
                         restrictions=restrictions,
+                        tasks=tasks,
                         feedback_count=len(
                             closed_loop_feedback_records
                         ),
@@ -1467,6 +1666,10 @@ def run_carla(
                     recorder.record(
                         "risk_assessed", assessment.to_dict()
                     )
+                    previous_slope_state = _record_slope_state_transition(
+                        recorder, assessment, previous_slope_state
+                    )
+                    _record_risk_level_transition(recorder, assessment)
                     guidance = build_risk_guidance(
                         assessment,
                         risk_scenario,
@@ -1476,11 +1679,87 @@ def run_carla(
                     recorder.record(
                         "risk_guidance_generated", guidance
                     )
+                    released_hazard_task_ids = []
+                    emergency_event = config.scenario_variables.get(
+                        "emergency_event", {}
+                    )
+                    configured_trigger_level = str(
+                        (
+                            emergency_event
+                            if isinstance(emergency_event, dict)
+                            else {}
+                        ).get("trigger_level", "red")
+                    ).lower()
+                    if (
+                        not hazard_takeover_triggered
+                        and assessment.level == configured_trigger_level
+                        and assessment.level != assessment.previous_level
+                    ):
+                        hazard_takeover_triggered = True
+                        affected_vehicle_id = str(
+                            (config.scenario_variables.get(
+                                "slope_event", {}
+                            ) or {}).get("affected_vehicle_id", "")
+                        )
+                        freeze_route = getattr(
+                            adapter, "freeze_hazard_task_route", None
+                        )
+                        frozen_route_payload = (
+                            freeze_route(affected_vehicle_id)
+                            if affected_vehicle_id
+                            and callable(freeze_route)
+                            else None
+                        )
+                        if frozen_route_payload:
+                            recorder.record(
+                                "hazard_task_route_frozen",
+                                {
+                                    "tick": tick_index,
+                                    **frozen_route_payload,
+                                },
+                            )
+                        safe_hold_payload = (
+                            _place_affected_vehicle_in_safe_hold(
+                                adapter,
+                                config,
+                                assessment,
+                                recorder,
+                                tick_index,
+                            )
+                        )
+                        released_hazard_task_ids = (
+                            release_hazard_affected_tasks(
+                                tasks,
+                                affected_vehicle_id,
+                                tick_index,
+                            )
+                            if safe_hold_payload is not None
+                            else []
+                        )
+                        recorder.record(
+                            "hazard_information_activated",
+                            {
+                                "tick": tick_index,
+                                "risk_level": assessment.level,
+                                "affected_vehicle_safe_hold": (
+                                    safe_hold_payload
+                                ),
+                                "released_hazard_task_ids": (
+                                    released_hazard_task_ids
+                                ),
+                                "road_closure_required": False,
+                                "operating_rule": (
+                                    "retain_slope_hazard_information_and_"
+                                    "avoid_known_risk_area"
+                                ),
+                            },
+                        )
                     restriction_action = risk_scenario.restriction
                     if (
                         restriction_action is not None
                         and assessment.level
                         in restriction_action.trigger_levels
+                        and assessment.level != assessment.previous_level
                     ):
                         restriction = restrictions.activate(
                             assessment,
@@ -1511,6 +1790,9 @@ def run_carla(
                                     cancelled_task_ids
                                 ),
                                 "safe_route": safe_route_payload,
+                                "released_hazard_task_ids": (
+                                    released_hazard_task_ids
+                                ),
                             },
                         )
                     created = []
@@ -1532,11 +1814,108 @@ def run_carla(
                         )
                         tasks.append(task)
                         created.append((task, action))
-                    if not created:
-                        continue
                     states = list(adapter.list_states())
+                    affected_vehicle_id = str(
+                        (config.scenario_variables.get(
+                            "slope_event", {}
+                        ) or {}).get("affected_vehicle_id", "")
+                    )
+                    handover_tasks = [
+                        task for task in tasks
+                        if task.handover_reason
+                        and task.assigned_vehicle_id is None
+                    ]
+                    for handover_task in handover_tasks:
+                        ranked_candidates = scheduler.rank_candidates(
+                            handover_task,
+                            states,
+                            runtime_zones,
+                            active_tasks=tasks,
+                            excluded_vehicle_ids={affected_vehicle_id},
+                        )
+                        if not ranked_candidates:
+                            raise SchedulingError(
+                                "No eligible takeover vehicle for task {}"
+                                .format(handover_task.task_id)
+                            )
+                        proposal = ranked_candidates[0]
+                        handover_task.recommended_vehicle_id = (
+                            proposal.vehicle_id
+                        )
+                        handover_task.recommendation_reason = (
+                            proposal.reason
+                        )
+                        handover_task.candidate_evaluations = [
+                            item.to_dict() for item in ranked_candidates
+                        ]
+                        handover_task.status = "pending"
+                        handover_task.status_reason = (
+                            "awaiting_human_approval_for_ai_takeover"
+                        )
+                        recorder.record(
+                            "hazard_task_takeover_proposed",
+                            {
+                                "tick": tick_index,
+                                "task_id": handover_task.task_id,
+                                "original_vehicle_id": (
+                                    handover_task.original_vehicle_id
+                                ),
+                                "recommended_vehicle_id": (
+                                    proposal.vehicle_id
+                                ),
+                                "ai_recommendation": proposal.to_dict(),
+                                "candidate_evaluations": [
+                                    item.to_dict()
+                                    for item in ranked_candidates
+                                ],
+                                "requires_human_approval": True,
+                            },
+                        )
+                    if not created:
+                        if handover_tasks:
+                            sync_runtime_state(
+                                states,
+                                tasks,
+                                event={
+                                    "type": "hazard_takeover_decision",
+                                    "message": (
+                                        "边坡异常已记录；矿车1安全停车，"
+                                        "AI已完成候选矿车择优，等待人工确认"
+                                    ),
+                                },
+                                run_id=recorder.run_id,
+                                risk=assessment.to_dict(),
+                                monitoring=_runtime_monitoring_payload(
+                                    monitoring_data,
+                                    mobile_observation_count,
+                                    phase="任务调度",
+                                    phase_index=2,
+                                    work_orders=work_orders,
+                                    restrictions=restrictions,
+                                    tasks=tasks,
+                                    feedback_count=len(
+                                        closed_loop_feedback_records
+                                    ),
+                                    assessment=assessment,
+                                    latest_event=(
+                                        "边坡异常持续标记；等待确认AI任务接管方案"
+                                    ),
+                                ),
+                            )
+                        continue
+                    schedulable_tasks = [
+                        task for task in tasks
+                        if task not in handover_tasks
+                    ]
                     risk_assignments = scheduler.assign(
-                        tasks, states, runtime_zones
+                        schedulable_tasks,
+                        states,
+                        runtime_zones,
+                        excluded_vehicle_ids=(
+                            {affected_vehicle_id}
+                            if affected_vehicle_id
+                            else set()
+                        ),
                     )
                     sync_runtime_state(
                         states,
@@ -1555,6 +1934,7 @@ def run_carla(
                             phase_index=2,
                             work_orders=work_orders,
                             restrictions=restrictions,
+                            tasks=tasks,
                             feedback_count=len(
                                 closed_loop_feedback_records
                             ),
@@ -1765,6 +2145,7 @@ def run_carla(
                             ),
                             work_orders=work_orders,
                             restrictions=restrictions,
+                            tasks=tasks,
                             feedback_count=len(
                                 closed_loop_feedback_records
                             ),
@@ -1800,7 +2181,10 @@ def run_carla(
                 or (
                     last_risk_tick is not None
                     and tick_index >= last_risk_tick
-                    and bool(risk_task_ids)
+                    and (
+                        bool(risk_task_ids)
+                        or hazard_takeover_triggered
+                    )
                 )
             )
             if (
@@ -1810,6 +2194,10 @@ def run_carla(
                 and (
                     risk_scenario is None
                     or work_orders.all_terminal()
+                    or (
+                        hazard_takeover_triggered
+                        and risk_scenario.restriction is None
+                    )
                 )
             ):
                 recorder.record(
@@ -1824,7 +2212,10 @@ def run_carla(
             or (
                 last_risk_tick is not None
                 and ticks > last_risk_tick
-                and bool(risk_task_ids)
+                and (
+                    bool(risk_task_ids)
+                    or hazard_takeover_triggered
+                )
             )
         )
         if not risk_schedule_complete and result["status"] == "PASS":
@@ -1832,6 +2223,10 @@ def run_carla(
         if (
             risk_scenario is not None
             and not work_orders.all_terminal()
+            and not (
+                hazard_takeover_triggered
+                and risk_scenario.restriction is None
+            )
             and result["status"] == "PASS"
         ):
             result["status"] = "PARTIAL"
@@ -1903,6 +2298,12 @@ def run_carla(
                 for item in closed_loop_feedback_records
             )
         )
+        takeover_tasks = [
+            task for task in tasks if task.handover_reason
+        ]
+        takeover_completed = bool(takeover_tasks) and all(
+            task.status == "completed" for task in takeover_tasks
+        )
         summary = {
             "mode": mode,
             "scenario_id": config.scenario_id,
@@ -1931,8 +2332,16 @@ def run_carla(
             ],
             "risk_guidance": risk_guidance,
             "risk_task_ids": risk_task_ids,
-            "risk_triggered": bool(risk_task_ids),
+            "risk_triggered": bool(risk_assessments),
             "risk_schedule_complete": risk_schedule_complete,
+            "hazard_information_retained": (
+                hazard_takeover_triggered
+            ),
+            "road_restriction_required": bool(
+                risk_scenario is not None
+                and risk_scenario.restriction is not None
+            ),
+            "takeover_completed": takeover_completed,
             "risk_response_metrics": risk_response_metrics,
             "closed_loop_feedback_count": len(
                 closed_loop_feedback_records
@@ -1944,8 +2353,11 @@ def run_carla(
                 closed_loop_decision_counts
             ),
             "monitoring_dispatch_closed_loop": (
-                bool(closed_loop_feedback_records)
-                and work_orders.all_terminal()
+                takeover_completed
+                or (
+                    bool(closed_loop_feedback_records)
+                    and work_orders.all_terminal()
+                )
             ),
             "feedback_artifact": "feedback_observations.jsonl",
             "tasks": _tasks_payload(tasks),
@@ -1986,6 +2398,7 @@ def run_carla(
                 ),
                 work_orders=work_orders,
                 restrictions=restrictions,
+                tasks=tasks,
                 feedback_count=len(closed_loop_feedback_records),
                 assessment=(
                     closed_loop_feedback_records[-1]["assessment"]

@@ -3,7 +3,7 @@
   "layout_id": "openpit-fixed-monitoring-layout-v1",
   "dataset_label": "SYNTHETIC_DEMO_DATA_NOT_REAL_MINE_MEASUREMENTS",
   "synthetic_data": true,
-  "sample_ticks": [0, 220, 360, 520],
+  "sample_ticks": [0, 120, 220, 360, 520, 650],
   "areas": [
     {
       "area_id": "slope_area_01",

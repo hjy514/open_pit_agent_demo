@@ -70,7 +70,7 @@ def default_scenarios(project_root: Path) -> List[DemoScenario]:
             monitoring_config_path=configs
             / "monitoring_demo.json",
             ticks=6000,
-            inject_failure=True,
+            inject_failure=False,
         ),
         DemoScenario(
             scenario_id="normal_inspection",
