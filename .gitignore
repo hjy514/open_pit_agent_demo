@@ -28,3 +28,4 @@ artifacts/control/
 
 # 本地覆盖配置可能包含机器路径。
 configs/local.json
+artifacts/live_cameras/
