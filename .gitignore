@@ -36,3 +36,7 @@ data/logs/
 data/runs/
 data/datasets/
 data/models/
+# 调度桌面端运行快照与本地环境。
+open_pit_dispatch_app/data/*.json
+open_pit_dispatch_app/.venv/
+open_pit_dispatch_app/__pycache__/

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 
 def _utc_now() -> str:
@@ -279,6 +279,32 @@ class MapResourceStore:
                 FOREIGN KEY(point_id) REFERENCES map_points(point_id)
             );
 
+            CREATE TABLE IF NOT EXISTS junctions (
+                junction_id TEXT PRIMARY KEY,
+                map_id TEXT NOT NULL,
+                resource_version TEXT NOT NULL,
+                junction_type TEXT NOT NULL,
+                name TEXT,
+                validation_status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                notes TEXT,
+                FOREIGN KEY(map_id) REFERENCES maps(map_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS junction_connections (
+                junction_id TEXT NOT NULL,
+                resource_version TEXT NOT NULL,
+                connection_id TEXT,
+                incoming_road TEXT,
+                connecting_road TEXT,
+                contact_point TEXT,
+                from_lane_id INTEGER,
+                to_lane_id INTEGER,
+                source TEXT NOT NULL,
+                PRIMARY KEY(junction_id, resource_version, connection_id, from_lane_id, to_lane_id),
+                FOREIGN KEY(junction_id) REFERENCES junctions(junction_id)
+            );
+
             CREATE TABLE IF NOT EXISTS hazard_zones (
                 hazard_zone_id TEXT PRIMARY KEY,
                 map_id TEXT NOT NULL,
@@ -340,6 +366,49 @@ class MapResourceStore:
         )
         self.connection.commit()
 
+    def import_xodr(self, map_id: str, resource_version: str, xodr_path: Path, spacing_m: float = 10.0) -> Dict[str, object]:
+        """Import static OpenDRIVE facts without requiring a CARLA runtime."""
+        from .xodr import import_xodr
+        return import_xodr(self, map_id, resource_version, xodr_path, spacing_m)
+
+
+    def upsert_route_candidates(self, records: Iterable[Dict[str, object]]) -> int:
+        """Idempotently write static route candidates into the map library.
+
+        This stores planner output only. It does not mark a route as CARLA-
+        verified or safe for heavy trucks.
+        """
+        rows = []
+        for item in records:
+            if not isinstance(item, dict):
+                raise ValueError("route candidate must be an object")
+            required = ("route_candidate_id", "map_id", "resource_version", "from_point_id", "to_point_id")
+            missing = [name for name in required if not item.get(name)]
+            if missing:
+                raise ValueError("route candidate missing: {}".format(", ".join(missing)))
+            sequence = item.get("road_lane_sequence_json", item.get("road_lane_sequence", []))
+            if not isinstance(sequence, str):
+                import json
+                sequence = json.dumps(sequence, ensure_ascii=False, sort_keys=True)
+            rows.append((
+                str(item["route_candidate_id"]), str(item["map_id"]), str(item["resource_version"]),
+                str(item["from_point_id"]), str(item["to_point_id"]), int(item.get("candidate_rank", 1)),
+                str(item.get("planner_version", "unknown")), str(item.get("route_hash", item["route_candidate_id"])),
+                item.get("route_length_m"), item.get("junction_count"), sequence,
+                item.get("waypoint_artifact_path"), str(item.get("validation_status", "CANDIDATE")),
+                str(item.get("source", "ROUTE_IMPORT")), item.get("notes"),
+            ))
+        self.connection.executemany(
+            """
+            INSERT OR REPLACE INTO route_candidates(
+                route_candidate_id, map_id, resource_version, from_point_id, to_point_id,
+                candidate_rank, planner_version, route_hash, route_length_m, junction_count,
+                road_lane_sequence_json, waypoint_artifact_path, validation_status, source, notes
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, rows
+        )
+        self.connection.commit()
+        return len(rows)
     def table_names(self) -> Iterable[str]:
         rows = self.connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
@@ -352,7 +421,7 @@ class MapResourceStore:
             "calibration_runs", "map_points", "point_roles",
             "point_conflicts", "road_nodes", "road_edges", "road_clusters",
             "reachable_pairs", "route_candidates", "task_points",
-            "safe_wait_points", "hazard_zones",
+            "safe_wait_points", "hazard_zones", "junctions", "junction_connections",
         }
         present = set(self.table_names())
         foreign_keys_enabled = self.connection.execute(

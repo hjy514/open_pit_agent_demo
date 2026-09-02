@@ -80,6 +80,16 @@ class DemoOptions:
     idle_pull_over_offset_m: float
 
 
+
+@dataclass(frozen=True)
+class MapResourceConfig:
+    """Optional map-resource database binding for a scenario."""
+
+    database_path: Optional[Path]
+    map_id: Optional[str]
+    resource_version: Optional[str]
+    closed_edge_id: str
+    route_endpoints: Dict[str, Any]
 @dataclass(frozen=True)
 class ScenarioConfig:
     schema_version: str
@@ -92,6 +102,7 @@ class ScenarioConfig:
     zones: List[ZoneConfig]
     demo: DemoOptions
     scenario_variables: Dict[str, Any]
+    map_resource: Optional[MapResourceConfig] = None
 
 
 def _position(value: Dict[str, Any], label: str) -> Position:
@@ -223,6 +234,27 @@ def load_config(path: Path) -> ScenarioConfig:
             )
         )
 
+    map_resource_raw = raw.get("map_resource")
+    map_resource = None
+    if map_resource_raw is not None:
+        if not isinstance(map_resource_raw, dict):
+            raise ConfigError("map_resource must be an object")
+        database_value = map_resource_raw.get("database_path")
+        database_path = None
+        if database_value:
+            database_path = Path(str(database_value)).expanduser()
+            if not database_path.is_absolute():
+                database_path = (config_path.parent / database_path).resolve()
+        endpoints = map_resource_raw.get("route_endpoints", {})
+        if not isinstance(endpoints, dict):
+            raise ConfigError("map_resource.route_endpoints must be an object")
+        map_resource = MapResourceConfig(
+            database_path=database_path,
+            map_id=(str(map_resource_raw["map_id"]) if map_resource_raw.get("map_id") else None),
+            resource_version=(str(map_resource_raw["resource_version"]) if map_resource_raw.get("resource_version") else None),
+            closed_edge_id=str(map_resource_raw.get("closed_edge_id", "R1")),
+            route_endpoints=dict(endpoints),
+        )
     demo_raw = raw["demo"]
     result = ScenarioConfig(
         schema_version=str(raw["schema_version"]),
@@ -248,6 +280,7 @@ def load_config(path: Path) -> ScenarioConfig:
             ),
         ),
         scenario_variables=dict(raw.get("scenario_variables", {})),
+        map_resource=map_resource,
     )
     _validate(result)
     return result

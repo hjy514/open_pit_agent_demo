@@ -1,0 +1,271 @@
+{
+  "schema_version": "2.0-scenario",
+  "scenario_id": "s07-road-closure-6v",
+  "scenario_name": "S07 道路关闭与选择性重规划（6车离线基线）",
+  "instruction": "关闭一条道路，仅对受影响任务执行重规划，其余车辆继续执行。",
+  "carla": {
+    "root": "/opt/carla/CARLA_0.9.10",
+    "host": "127.0.0.1",
+    "port": 2000,
+    "timeout_seconds": 10,
+    "map_name": "0325_5"
+  },
+  "vehicles": [
+    {
+      "vehicle_id": "haul_vehicle_01",
+      "display_name": "运输车01",
+      "equipment_type": "haul_truck",
+      "role_name": "haul_01",
+      "blueprint": "vehicle.cat.cat",
+      "spawn_point_index": 0,
+      "mock_position": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "target_speed_kmh": 25,
+      "capabilities": [
+        "haul",
+        "inspection"
+      ]
+    },
+    {
+      "vehicle_id": "haul_vehicle_02",
+      "display_name": "运输车02",
+      "equipment_type": "haul_truck",
+      "role_name": "haul_02",
+      "blueprint": "vehicle.cat.cat",
+      "spawn_point_index": 1,
+      "mock_position": {
+        "x": 30,
+        "y": 0,
+        "z": 0
+      },
+      "target_speed_kmh": 25,
+      "capabilities": [
+        "haul",
+        "inspection"
+      ]
+    },
+    {
+      "vehicle_id": "haul_vehicle_03",
+      "display_name": "运输车03",
+      "equipment_type": "haul_truck",
+      "role_name": "haul_03",
+      "blueprint": "vehicle.cat.cat",
+      "spawn_point_index": 2,
+      "mock_position": {
+        "x": 60,
+        "y": 0,
+        "z": 0
+      },
+      "target_speed_kmh": 25,
+      "capabilities": [
+        "haul",
+        "inspection"
+      ]
+    },
+    {
+      "vehicle_id": "inspection_vehicle_01",
+      "display_name": "巡检车01",
+      "equipment_type": "inspection_vehicle",
+      "role_name": "inspection_01",
+      "blueprint": "vehicle.cat.cat",
+      "spawn_point_index": 3,
+      "mock_position": {
+        "x": 0,
+        "y": 40,
+        "z": 0
+      },
+      "target_speed_kmh": 20,
+      "capabilities": [
+        "inspection",
+        "slope_monitoring"
+      ]
+    },
+    {
+      "vehicle_id": "inspection_vehicle_02",
+      "display_name": "巡检车02",
+      "equipment_type": "inspection_vehicle",
+      "role_name": "inspection_02",
+      "blueprint": "vehicle.cat.cat",
+      "spawn_point_index": 4,
+      "mock_position": {
+        "x": 30,
+        "y": 40,
+        "z": 0
+      },
+      "target_speed_kmh": 20,
+      "capabilities": [
+        "inspection",
+        "slope_monitoring"
+      ]
+    },
+    {
+      "vehicle_id": "support_vehicle_01",
+      "display_name": "保障车01",
+      "equipment_type": "support_vehicle",
+      "role_name": "support_01",
+      "blueprint": "vehicle.cat.cat",
+      "spawn_point_index": 5,
+      "mock_position": {
+        "x": 60,
+        "y": 40,
+        "z": 0
+      },
+      "target_speed_kmh": 18,
+      "capabilities": [
+        "inspection",
+        "emergency_support"
+      ]
+    }
+  ],
+  "fleet": {
+    "total_vehicles": 6,
+    "available_vehicles": 6,
+    "active_vehicles": 6,
+    "traffic_vehicles": 2,
+    "role_policy": "randomized",
+    "task_load": "medium",
+    "traffic_density": "low",
+    "role_counts": {
+      "haul": 3,
+      "inspection": 2,
+      "support": 1
+    }
+  },
+  "zones": [
+    {
+      "zone_id": "S01-A",
+      "display_name": "北部装载区",
+      "priority": 60,
+      "required_capabilities": [
+        "haul"
+      ],
+      "target_spawn_point_index": 10,
+      "mock_position": {
+        "x": 90,
+        "y": 0,
+        "z": 0
+      }
+    },
+    {
+      "zone_id": "S01-B",
+      "display_name": "东侧卸载区",
+      "priority": 55,
+      "required_capabilities": [
+        "haul"
+      ],
+      "target_spawn_point_index": 11,
+      "mock_position": {
+        "x": 120,
+        "y": 10,
+        "z": 0
+      }
+    },
+    {
+      "zone_id": "S01-C",
+      "display_name": "南部运输区",
+      "priority": 50,
+      "required_capabilities": [
+        "haul"
+      ],
+      "target_spawn_point_index": 12,
+      "mock_position": {
+        "x": 90,
+        "y": 50,
+        "z": 0
+      }
+    },
+    {
+      "zone_id": "S01-D",
+      "display_name": "边坡巡检区",
+      "priority": 45,
+      "required_capabilities": [
+        "inspection",
+        "slope_monitoring"
+      ],
+      "target_spawn_point_index": 13,
+      "mock_position": {
+        "x": 10,
+        "y": 90,
+        "z": 0
+      }
+    },
+    {
+      "zone_id": "S01-E",
+      "display_name": "道路巡检区",
+      "priority": 40,
+      "required_capabilities": [
+        "inspection"
+      ],
+      "target_spawn_point_index": 14,
+      "mock_position": {
+        "x": 60,
+        "y": 90,
+        "z": 0
+      }
+    },
+    {
+      "zone_id": "S01-F",
+      "display_name": "设备保障区",
+      "priority": 35,
+      "required_capabilities": [
+        "emergency_support"
+      ],
+      "target_spawn_point_index": 15,
+      "mock_position": {
+        "x": 120,
+        "y": 80,
+        "z": 0
+      }
+    }
+  ],
+  "demo": {
+    "failure_enabled": false,
+    "failure_vehicle_id": "",
+    "failure_tick": 0,
+    "random_seed": 202607,
+    "arrival_tolerance_m": 3.0,
+    "task_timeout_ticks": 1000,
+    "fault_pull_over_offset_m": 0,
+    "idle_pull_over_offset_m": 0
+  },
+  "map_resource": {
+    "database_path": "../data/database/map_resources.db",
+    "map_id": "0325_5",
+    "resource_version": "1.0-draft",
+    "closed_edge_id": "R1",
+    "route_endpoints": {}
+  },
+  "scenario_variables": {
+    "profile_version": "s07-v1",
+    "environment": {
+      "weather": "clear",
+      "visibility": "good",
+      "road_surface": "dry"
+    },
+    "disaster": {
+      "enabled": false
+    },
+    "mission": {
+      "task_generation": "configured-six-zone-road-closure-baseline"
+    },
+    "randomization": {
+      "mode": "fixed",
+      "seed": 202607,
+      "events": [
+        {
+          "event_id": "s07-road-closure",
+          "event_type": "road_closed",
+          "enabled": true,
+          "probability": 1.0,
+          "parameters": {
+            "road_id": "R1",
+            "trigger_tick": 30
+          }
+        }
+      ]
+    }
+  }
+}

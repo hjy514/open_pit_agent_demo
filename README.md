@@ -2,11 +2,37 @@
 
 本仓库用于 `CS-202616` 赛题的第三方调度平台与 CARLA 可行性验证。
 
+## 统一仓库结构（后端 + 调度桌面端）
+
+当前仓库同时包含后端与 PyQt6 调度桌面端：
+
+```text
+open_pit_agent_demo/
+├── src/                         # Agent、调度、CARLA 适配与 API
+├── configs/                     # 场景与地图资源配置
+├── tests/                       # 后端与结构化 Mock 测试
+└── open_pit_dispatch_app/      # PyQt6 调度中心
+```
+
+桌面端启动：
+
+```bash
+cd open_pit_dispatch_app
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+./start_app.sh
+```
+
+后端 API 仍从仓库根目录启动：
+
+```bash
+./start_api.sh
+```
 ## 新电脑快速配置
 
-本项目可与 `open_pit_dispatch_app` 分别克隆到任意位置。默认情况下，
-运行结果会导出到 `~/open_pit_dispatch_app/data`；如果调度应用不在该位置，
-可通过 `OPENPIT_DISPATCH_DATA_DIR` 指定数据目录。
+本项目已将 open_pit_dispatch_app 纳入同一仓库。默认情况下，
+运行结果会导出到仓库内的 open_pit_dispatch_app/data；如需自定义，可通过 OPENPIT_DISPATCH_DATA_DIR 指定数据目录。
 
 CARLA 0.9.10 使用 Python 3.7 API。在新电脑上安装或激活对应环境后执行：
 

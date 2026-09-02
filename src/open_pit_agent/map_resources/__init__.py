@@ -1,10 +1,6 @@
-"""Persistent, map-scoped spatial resources for open-pit scenarios.
-
-This package intentionally contains no scheduling, CARLA control, or risk
-decision logic.  It is the long-lived spatial fact layer from which a later
-scenario generator can select verified points and routes.
-"""
-
+"""Persistent, map-scoped spatial resources for open-pit scenarios."""
 from .store import MapResourceStore
+from .xodr import SOURCE_XODR, parse_xodr, import_xodr, import_static_xodr, parse_open_drive
+from .road_graph import GraphEdge, RoadGraph, identify_affected_routes, route_plans_from_store
 
-__all__ = ["MapResourceStore"]
+__all__ = ["MapResourceStore", "SOURCE_XODR", "parse_xodr", "parse_open_drive", "import_xodr", "import_static_xodr", "GraphEdge", "RoadGraph", "identify_affected_routes", "route_plans_from_store"]

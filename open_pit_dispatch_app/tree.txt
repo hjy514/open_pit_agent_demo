@@ -1,0 +1,27 @@
+.
+├── assets
+│   └── icons
+├── data
+│   ├── __init__.py
+│   └── state_model.py
+├── main.py
+├── tree.txt
+├── ui
+│   ├── __init__.py
+│   ├── main_window.py
+│   └── __pycache__
+│       ├── __init__.cpython-310.pyc
+│       └── main_window.cpython-310.pyc
+└── widgets
+    ├── agent_panel.py
+    ├── event_panel.py
+    ├── __init__.py
+    ├── map_widget.py
+    ├── __pycache__
+    │   ├── __init__.cpython-310.pyc
+    │   ├── map_widget.cpython-310.pyc
+    │   └── vehicle_panel.cpython-310.pyc
+    ├── vehicle_panel_backup.py
+    └── vehicle_panel.py
+
+7 directories, 17 files

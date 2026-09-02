@@ -63,6 +63,11 @@ class ConcreteEpisode:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    def to_fleet_snapshot(self):
+        """Return the explicit fleet model without changing legacy serialization."""
+        from .fleet import snapshot_from_episode
+        return snapshot_from_episode(self)
+
 
 def _choose_ids(
     randomizer: Random, vehicle_ids: List[str], count: int

@@ -17,7 +17,7 @@ from datetime import datetime
 DEFAULT_TARGET = Path(
     os.environ.get(
         "OPENPIT_DISPATCH_DATA_DIR",
-        str(Path.home() / "open_pit_dispatch_app" / "data"),
+        str(Path(__file__).resolve().parents[2] / "open_pit_dispatch_app" / "data"),
     )
 ).expanduser()
 
