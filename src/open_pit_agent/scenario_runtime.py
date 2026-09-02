@@ -33,7 +33,7 @@ class ResolvedScenario:
 
     def failure_plan(
         self, config: ScenarioConfig
-    ) -> Tuple[str, int]:
+    ) -> Optional[Tuple[str, int]]:
         for event in self.realized_events:
             if (
                 event.get("event_type") == "vehicle_failure"
@@ -43,10 +43,9 @@ class ResolvedScenario:
                     str(event["vehicle_id"]),
                     int(event["tick"]),
                 )
-        return (
-            config.demo.failure_vehicle_id,
-            config.demo.failure_tick,
-        )
+        if not config.demo.failure_enabled:
+            return None
+        return (config.demo.failure_vehicle_id, config.demo.failure_tick)
 
 
 def resolve_scenario(
@@ -117,9 +116,13 @@ def resolve_scenario(
         if event_type == "vehicle_failure":
             candidates = [
                 str(value)
-                for value in item.get(
-                    "candidate_vehicle_ids",
-                    [config.demo.failure_vehicle_id],
+                for value in (
+                    item.get("candidate_vehicle_ids")
+                    or (
+                        [config.demo.failure_vehicle_id]
+                        if config.demo.failure_enabled
+                        else []
+                    )
                 )
             ]
             if not candidates or not set(candidates).issubset(

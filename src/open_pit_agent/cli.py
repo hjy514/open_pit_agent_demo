@@ -42,6 +42,7 @@ from .risk import (
 )
 from .restrictions import RestrictionRegistry
 from .scenario_runtime import ResolvedScenario, resolve_scenario
+from .scenario import build_episode
 from .scheduler import (
     BaselineScheduler,
     SchedulingError,
@@ -1188,9 +1189,10 @@ def run_mock(
         released = []
         reassigned = []
         if inject:
-            failed, failure_tick = (
-                resolved_scenario.failure_plan(config)
-            )
+            failure_plan = resolved_scenario.failure_plan(config)
+            if failure_plan is None:
+                raise ConfigError("failure injection requested without a failure plan")
+            failed, failure_tick = failure_plan
             adapter.inject_fault(failed)
             released = release_failed_vehicle_tasks(tasks, failed)
             states = list(adapter.list_states())
@@ -1375,9 +1377,8 @@ def run_carla(
     risk_guidance = []
     decision_records = []
     closed_loop_feedback_records = []
-    failure_vehicle_id, failure_tick = (
-        resolved_scenario.failure_plan(config)
-    )
+    failure_plan = resolved_scenario.failure_plan(config)
+    failure_vehicle_id, failure_tick = failure_plan or (None, None)
     last_risk_tick = (
         max(item.tick for item in risk_scenario.observations)
         if risk_scenario is not None
@@ -2425,6 +2426,7 @@ def run_carla(
 
 def main() -> None:
     args = build_parser().parse_args()
+    recorder = None
     try:
         config = load_config(args.config)
         risk_scenario = (
@@ -2446,6 +2448,10 @@ def main() -> None:
             seed_override=args.seed,
             randomize=args.randomize,
         )
+        if args.inject_failure and not config.demo.failure_enabled:
+            raise ConfigError(
+                "--inject-failure cannot be used when demo.failure_enabled is false"
+            )
         if risk_scenario is not None:
             zone_ids = {zone.zone_id for zone in config.zones}
             referenced_zone_ids = {
@@ -2474,6 +2480,16 @@ def main() -> None:
         snapshot = resolved_scenario.to_dict()
         recorder.write_json("scenario_snapshot.json", snapshot)
         recorder.record("scenario_snapshot_created", snapshot)
+        failure_plan = resolved_scenario.failure_plan(config)
+        episode = build_episode(
+            config,
+            run_id=recorder.run_id,
+            seed=resolved_scenario.seed,
+            realized_events=resolved_scenario.realized_events,
+            failure_plan=failure_plan,
+        )
+        recorder.write_json("episode.json", episode.to_dict())
+        recorder.record_episode(episode, config_path=args.config)
         if args.mode == "mock":
             run_mock(
                 config,
@@ -2507,6 +2523,9 @@ def main() -> None:
         OSError,
     ) as exc:
         raise SystemExit("ERROR: {}".format(exc))
+    finally:
+        if recorder is not None:
+            recorder.close()
 
 
 if __name__ == "__main__":

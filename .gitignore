@@ -29,3 +29,10 @@ artifacts/control/
 # 本地覆盖配置可能包含机器路径。
 configs/local.json
 artifacts/live_cameras/
+
+# 本地运行数据：SQLite 索引、批量运行与后续训练数据不提交。
+data/database/
+data/logs/
+data/runs/
+data/datasets/
+data/models/

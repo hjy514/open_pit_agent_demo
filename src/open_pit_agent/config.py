@@ -36,6 +36,27 @@ class VehicleConfig:
 
 
 @dataclass(frozen=True)
+class FleetConfig:
+    """Static fleet envelope for one scenario configuration.
+
+    This is deliberately descriptive in V1: it records the intended size and
+    initial availability of a configured fleet.  It does not generate actors
+    or randomly change roles yet; that belongs to the future concrete-episode
+    resolver.  When the optional ``fleet`` block is absent, a legacy config is
+    represented as a fixed fleet derived from ``vehicles``.
+    """
+
+    total_vehicles: int
+    available_vehicles: int
+    active_vehicles: int
+    traffic_vehicles: int
+    role_policy: str
+    task_load: str
+    traffic_density: str
+    role_counts: Dict[str, int]
+
+
+@dataclass(frozen=True)
 class ZoneConfig:
     zone_id: str
     display_name: str
@@ -49,6 +70,7 @@ class ZoneConfig:
 
 @dataclass(frozen=True)
 class DemoOptions:
+    failure_enabled: bool
     failure_vehicle_id: str
     failure_tick: int
     random_seed: int
@@ -66,6 +88,7 @@ class ScenarioConfig:
     instruction: str
     carla: CarlaConfig
     vehicles: List[VehicleConfig]
+    fleet: FleetConfig
     zones: List[ZoneConfig]
     demo: DemoOptions
     scenario_variables: Dict[str, Any]
@@ -80,6 +103,45 @@ def _position(value: Dict[str, Any], label: str) -> Position:
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ConfigError("{} must contain numeric x/y/z values".format(label)) from exc
+
+
+def _fleet(raw: Any, vehicle_count: int) -> FleetConfig:
+    """Load an optional fleet block without changing legacy scenario behavior."""
+
+    legacy = {
+        "total_vehicles": vehicle_count,
+        "available_vehicles": vehicle_count,
+        "active_vehicles": vehicle_count,
+        "traffic_vehicles": vehicle_count,
+        "role_policy": "fixed",
+        "task_load": "legacy",
+        "traffic_density": "legacy",
+        "role_counts": {},
+    }
+    if raw is None:
+        return FleetConfig(**legacy)
+    if not isinstance(raw, dict):
+        raise ConfigError("fleet must be an object")
+
+    values = dict(legacy)
+    values.update(raw)
+    try:
+        role_counts = {
+            str(role): int(count)
+            for role, count in dict(values["role_counts"]).items()
+        }
+        return FleetConfig(
+            total_vehicles=int(values["total_vehicles"]),
+            available_vehicles=int(values["available_vehicles"]),
+            active_vehicles=int(values["active_vehicles"]),
+            traffic_vehicles=int(values["traffic_vehicles"]),
+            role_policy=str(values["role_policy"]),
+            task_load=str(values["task_load"]),
+            traffic_density=str(values["traffic_density"]),
+            role_counts=role_counts,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("fleet contains invalid values") from exc
 
 
 def load_config(path: Path) -> ScenarioConfig:
@@ -136,6 +198,8 @@ def load_config(path: Path) -> ScenarioConfig:
             )
         )
 
+    fleet = _fleet(raw.get("fleet"), len(vehicles))
+
     zones = []
     for index, item in enumerate(raw["zones"]):
         zones.append(
@@ -167,10 +231,12 @@ def load_config(path: Path) -> ScenarioConfig:
         instruction=str(raw["instruction"]),
         carla=carla,
         vehicles=vehicles,
+        fleet=fleet,
         zones=zones,
         demo=DemoOptions(
-            failure_vehicle_id=str(demo_raw["failure_vehicle_id"]),
-            failure_tick=int(demo_raw["failure_tick"]),
+            failure_enabled=bool(demo_raw.get("failure_enabled", True)),
+            failure_vehicle_id=str(demo_raw.get("failure_vehicle_id", "")),
+            failure_tick=int(demo_raw.get("failure_tick", 0)),
             random_seed=int(demo_raw["random_seed"]),
             arrival_tolerance_m=float(demo_raw["arrival_tolerance_m"]),
             task_timeout_ticks=int(demo_raw["task_timeout_ticks"]),
@@ -202,8 +268,43 @@ def _validate(config: ScenarioConfig) -> None:
         raise ConfigError("role_name values must be unique")
     if len(zone_ids) != len(set(zone_ids)):
         raise ConfigError("zone_id values must be unique")
-    if config.demo.failure_vehicle_id not in set(vehicle_ids):
-        raise ConfigError("failure_vehicle_id must reference a configured vehicle")
+    if config.fleet.total_vehicles != len(config.vehicles):
+        raise ConfigError(
+            "fleet.total_vehicles must match the configured vehicles count "
+            "until concrete episode generation is enabled"
+        )
+    if config.fleet.available_vehicles < 0:
+        raise ConfigError("fleet.available_vehicles cannot be negative")
+    if config.fleet.active_vehicles < 0:
+        raise ConfigError("fleet.active_vehicles cannot be negative")
+    if config.fleet.traffic_vehicles < 0:
+        raise ConfigError("fleet.traffic_vehicles cannot be negative")
+    if config.fleet.available_vehicles > config.fleet.total_vehicles:
+        raise ConfigError("fleet.available_vehicles cannot exceed total_vehicles")
+    if config.fleet.active_vehicles > config.fleet.available_vehicles:
+        raise ConfigError("fleet.active_vehicles cannot exceed available_vehicles")
+    if config.fleet.traffic_vehicles > config.fleet.active_vehicles:
+        raise ConfigError("fleet.traffic_vehicles cannot exceed active_vehicles")
+    if config.fleet.role_policy not in {"fixed", "randomized"}:
+        raise ConfigError("fleet.role_policy must be fixed or randomized")
+    if config.fleet.task_load not in {"legacy", "low", "medium", "high"}:
+        raise ConfigError("fleet.task_load must be legacy, low, medium or high")
+    if config.fleet.traffic_density not in {"legacy", "low", "medium", "high"}:
+        raise ConfigError(
+            "fleet.traffic_density must be legacy, low, medium or high"
+        )
+    if any(value < 0 for value in config.fleet.role_counts.values()):
+        raise ConfigError("fleet.role_counts cannot contain negative values")
+    if sum(config.fleet.role_counts.values()) > config.fleet.total_vehicles:
+        raise ConfigError("fleet.role_counts cannot exceed total_vehicles")
+    if config.demo.failure_enabled:
+        if config.demo.failure_vehicle_id not in set(vehicle_ids):
+            raise ConfigError(
+                "failure_vehicle_id must reference a configured vehicle "
+                "when failure_enabled is true"
+            )
+        if config.demo.failure_tick < 0:
+            raise ConfigError("failure_tick cannot be negative")
     if config.demo.arrival_tolerance_m <= 0:
         raise ConfigError("arrival_tolerance_m must be greater than zero")
     if config.demo.task_timeout_ticks <= 0:

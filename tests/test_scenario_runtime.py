@@ -1,6 +1,8 @@
 import sys
 import unittest
+import json
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +47,17 @@ class ScenarioRuntimeTest(unittest.TestCase):
         self.assertIn(
             "temperature_c", resolved.to_dict()["environment"]
         )
+
+    def test_disabled_failure_has_no_fallback_plan(self):
+        source_path = PROJECT_ROOT / "configs" / "town03.json"
+        raw = json.loads(source_path.read_text(encoding="utf-8"))
+        raw["demo"].pop("failure_vehicle_id")
+        raw["demo"].pop("failure_tick")
+        raw["demo"]["failure_enabled"] = False
+        with patch("pathlib.Path.read_text", return_value=json.dumps(raw)):
+            config = load_config(source_path)
+
+        self.assertIsNone(resolve_scenario(config).failure_plan(config))
 
 
 if __name__ == "__main__":

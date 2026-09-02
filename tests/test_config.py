@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -41,6 +42,53 @@ class ConfigTest(unittest.TestCase):
                 if item.vehicle_id == "emergency_vehicle_01"
             ).capabilities,
         )
+        self.assertEqual(3, config.fleet.total_vehicles)
+        self.assertEqual(3, config.fleet.available_vehicles)
+        self.assertEqual("fixed", config.fleet.role_policy)
+
+    def test_fleet_block_describes_a_configured_six_vehicle_scenario(self):
+        config_path = PROJECT_ROOT / "configs" / "town03.json"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        template_vehicle = dict(raw["vehicles"][0])
+        while len(raw["vehicles"]) < 6:
+            index = len(raw["vehicles"]) + 1
+            vehicle = dict(template_vehicle)
+            vehicle["vehicle_id"] = "fleet_test_{:02d}".format(index)
+            vehicle["role_name"] = "fleet_test_role_{:02d}".format(index)
+            vehicle["display_name"] = "测试车辆{:02d}".format(index)
+            vehicle["spawn_point_index"] = 20 + index
+            raw["vehicles"].append(vehicle)
+        raw["demo"]["failure_vehicle_id"] = "fleet_test_04"
+        raw["fleet"] = {
+            "total_vehicles": 6,
+            "available_vehicles": 5,
+            "active_vehicles": 4,
+            "traffic_vehicles": 3,
+            "role_policy": "randomized",
+            "task_load": "medium",
+            "traffic_density": "medium",
+            "role_counts": {"production": 4, "inspection": 2},
+        }
+
+        with patch("pathlib.Path.read_text", return_value=json.dumps(raw)):
+            config = load_config(config_path)
+
+        self.assertEqual(6, config.fleet.total_vehicles)
+        self.assertEqual(5, config.fleet.available_vehicles)
+        self.assertEqual({"production": 4, "inspection": 2}, config.fleet.role_counts)
+
+    def test_normal_scenario_can_explicitly_disable_failure(self):
+        config_path = PROJECT_ROOT / "configs" / "town03.json"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw["demo"].pop("failure_vehicle_id")
+        raw["demo"].pop("failure_tick")
+        raw["demo"]["failure_enabled"] = False
+
+        with patch("pathlib.Path.read_text", return_value=json.dumps(raw)):
+            config = load_config(config_path)
+
+        self.assertFalse(config.demo.failure_enabled)
+        self.assertEqual("", config.demo.failure_vehicle_id)
 
     def test_competition_config_has_v2_mission_and_failure(self):
         config = load_config(
