@@ -1,0 +1,61 @@
+{
+  "profile_id": "slope-demo-critical-routes-v1",
+  "map_id": "0325_5",
+  "description": "当前边坡失稳三车演示的原任务、候选接管与风险区道路关系参考。仅为CARLA规划器可达性验证，不等同于实际矿卡通行、净空或碰撞安全验证。",
+  "routes": [
+    {
+      "route_id": "vehicle01_original_patrol",
+      "from_spawn_point_index": 78,
+      "to_spawn_point_index": 48,
+      "purpose": "矿区巡检矿卡01原任务"
+    },
+    {
+      "route_id": "vehicle02_original_patrol",
+      "from_spawn_point_index": 28,
+      "to_spawn_point_index": 63,
+      "purpose": "边坡复核矿卡02原任务"
+    },
+    {
+      "route_id": "vehicle03_original_patrol",
+      "from_spawn_point_index": 63,
+      "to_spawn_point_index": 70,
+      "purpose": "综合巡检矿卡03原任务"
+    },
+    {
+      "route_id": "vehicle02_takeover_vehicle01_task",
+      "from_spawn_point_index": 28,
+      "to_spawn_point_index": 48,
+      "purpose": "矿卡02接管矿卡01原任务"
+    },
+    {
+      "route_id": "vehicle03_takeover_vehicle01_task",
+      "from_spawn_point_index": 63,
+      "to_spawn_point_index": 48,
+      "purpose": "矿卡03接管矿卡01原任务"
+    },
+    {
+      "route_id": "vehicle02_risk_review_reference",
+      "from_spawn_point_index": 28,
+      "to_spawn_point_index": 12,
+      "purpose": "矿卡02至边坡风险区附近的复核参考"
+    },
+    {
+      "route_id": "vehicle03_risk_review_reference",
+      "from_spawn_point_index": 63,
+      "to_spawn_point_index": 12,
+      "purpose": "矿卡03至边坡风险区附近的复核参考"
+    },
+    {
+      "route_id": "hazard_zone_to_runout_reference",
+      "from_spawn_point_index": 12,
+      "to_spawn_point_index": 49,
+      "purpose": "风险区至影响范围道路关系参考"
+    },
+    {
+      "route_id": "runout_to_hazard_zone_reference",
+      "from_spawn_point_index": 49,
+      "to_spawn_point_index": 12,
+      "purpose": "影响范围至风险区道路关系参考"
+    }
+  ]
+}

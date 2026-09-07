@@ -7,12 +7,12 @@ CARLA control, scheduling, or safety decisions.
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 
 def _utc_now() -> str:
@@ -255,6 +255,33 @@ class SqliteRunStore:
                 PRIMARY KEY(run_id, route_plan_id),
                 FOREIGN KEY(run_id) REFERENCES scenario_runs(run_id)
             );
+
+            CREATE TABLE IF NOT EXISTS closed_loop_cycles (
+                run_id TEXT NOT NULL,
+                cycle_id TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                scenario_key TEXT,
+                status TEXT NOT NULL,
+                revision_before INTEGER,
+                revision_after INTEGER,
+                physical_execution INTEGER NOT NULL DEFAULT 0,
+                measurement_status TEXT,
+                state_before_json TEXT NOT NULL,
+                risk_json TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                scheduling_json TEXT NOT NULL,
+                route_json TEXT NOT NULL,
+                safety_json TEXT NOT NULL,
+                command_json TEXT NOT NULL,
+                feedback_json TEXT NOT NULL,
+                next_state_json TEXT NOT NULL,
+                trace_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(run_id, cycle_id),
+                FOREIGN KEY(run_id) REFERENCES scenario_runs(run_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_closed_loop_cycles_run_revision
+                ON closed_loop_cycles(run_id, revision_before, revision_after);
             """
         )
         self._ensure_v2_columns()
@@ -302,6 +329,125 @@ class SqliteRunStore:
             (run_id, scenario_id, _utc_now(), "running"),
         )
         self.connection.commit()
+
+    def finalize_unfinished_run(
+        self, run_id: str,
+        status: str = "INCOMPLETE",
+    ) -> bool:
+        """Close only a still-running/planned run without overwriting results."""
+        cursor = self.connection.execute(
+            "UPDATE scenario_runs SET status=?, ended_at=? "
+            "WHERE run_id=? AND status IN ('running','planned')",
+            (str(status), _utc_now(), str(run_id)),
+        )
+        self.connection.commit()
+        return bool(cursor.rowcount)
+
+    def mark_stale_runs_incomplete(
+        self, stale_after_hours: float = 24.0
+    ) -> List[str]:
+        """Explicitly close old interrupted runs; never delete their evidence."""
+        hours = float(stale_after_hours)
+        if hours <= 0:
+            raise ValueError("stale_after_hours must be positive")
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        run_ids = [
+            str(row[0]) for row in self.connection.execute(
+                "SELECT run_id FROM scenario_runs "
+                "WHERE status IN ('running','planned') AND started_at<? "
+                "ORDER BY started_at", (cutoff,),
+            ).fetchall()
+        ]
+        if run_ids:
+            self.connection.execute(
+                "UPDATE scenario_runs SET status='INCOMPLETE', ended_at=? "
+                "WHERE status IN ('running','planned') AND started_at<?",
+                (_utc_now(), cutoff),
+            )
+            self.connection.commit()
+        return run_ids
+
+    def database_health_report(
+        self, stale_after_hours: float = 24.0
+    ) -> Dict[str, Any]:
+        """Return read-only lifecycle, volume and closed-loop coverage facts."""
+        hours = float(stale_after_hours)
+        if hours <= 0:
+            raise ValueError("stale_after_hours must be positive")
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        tables = [
+            str(row[0]) for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        row_counts = {}
+        for table in tables:
+            row_counts[table] = int(self.connection.execute(
+                'SELECT count(*) FROM "{}"'.format(table.replace('"', '""'))
+            ).fetchone()[0])
+        run_status_counts = {
+            str(row[0] if row[0] is not None else "NULL"): int(row[1])
+            for row in self.connection.execute(
+                "SELECT status,count(*) FROM scenario_runs GROUP BY status"
+            ).fetchall()
+        }
+        cycle_scenarios = {
+            str(row[0] if row[0] is not None else "unknown"): int(row[1])
+            for row in self.connection.execute(
+                "SELECT scenario_key,count(*) FROM closed_loop_cycles "
+                "GROUP BY scenario_key"
+            ).fetchall()
+        }
+        event_types = [{"event_type": str(row[0]), "count": int(row[1])}
+                       for row in self.connection.execute(
+            "SELECT event_type,count(*) AS total FROM events "
+            "GROUP BY event_type ORDER BY total DESC LIMIT 10"
+        ).fetchall()]
+        high_volume_runs = [{"run_id": str(row[0]), "event_count": int(row[1])}
+                            for row in self.connection.execute(
+            "SELECT run_id,count(*) AS total FROM events GROUP BY run_id "
+            "HAVING total>=1000 ORDER BY total DESC LIMIT 20"
+        ).fetchall()]
+        stale_count = int(self.connection.execute(
+            "SELECT count(*) FROM scenario_runs "
+            "WHERE status IN ('running','planned') AND started_at<?",
+            (cutoff,),
+        ).fetchone()[0])
+        cycle_count = row_counts.get("closed_loop_cycles", 0)
+        physical_cycles = int(self.connection.execute(
+            "SELECT count(*) FROM closed_loop_cycles WHERE physical_execution=1"
+        ).fetchone()[0])
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "database_path": str(self.database_path),
+            "database_size_bytes": self.database_path.stat().st_size,
+            "table_count": len(tables),
+            "row_counts": row_counts,
+            "run_status_counts": dict(sorted(run_status_counts.items())),
+            "stale_after_hours": hours,
+            "stale_unfinished_run_count": stale_count,
+            "closed_loop": {
+                "cycle_count": cycle_count,
+                "physical_cycle_count": physical_cycles,
+                "structural_cycle_count": cycle_count - physical_cycles,
+                "scenario_counts": dict(sorted(cycle_scenarios.items())),
+            },
+            "event_volume": {
+                "event_count": row_counts.get("events", 0),
+                "average_events_per_run": round(
+                    row_counts.get("events", 0)
+                    / float(max(1, row_counts.get("scenario_runs", 0))), 3
+                ),
+                "top_event_types": event_types,
+                "runs_with_at_least_1000_events": high_volume_runs,
+            },
+            "actions": {
+                "automatic_deletion_performed": False,
+                "stale_repair_available": True,
+                "event_retention_change_applied": False,
+            },
+        }
 
     def record_episode(
         self,
@@ -599,6 +745,148 @@ class SqliteRunStore:
         )
         self.connection.commit()
 
+    def record_closed_loop_cycle(
+        self, run_id: str, scenario_key: str, cycle: Dict[str, Any]
+    ) -> None:
+        """Persist one low-frequency state/action/feedback transition."""
+
+        if cycle.get("schema_version") != "openpit.closed-loop-cycle.v1":
+            raise ValueError("unsupported closed-loop cycle schema")
+        cycle_id = str(cycle.get("cycle_id") or "").strip()
+        if not cycle_id:
+            raise ValueError("closed-loop cycle_id is required")
+        stage_results = cycle.get("stage_results", {})
+        if not isinstance(stage_results, dict):
+            raise ValueError("closed-loop stage_results must be an object")
+        feedback = cycle.get("execution_feedback", [])
+        if not isinstance(feedback, list):
+            raise ValueError("closed-loop execution_feedback must be a list")
+        physical_execution = any(
+            bool(item.get("physical_execution"))
+            for item in feedback if isinstance(item, dict)
+        )
+        measurement_values = sorted({
+            str(item.get("measurement_status"))
+            for item in feedback
+            if isinstance(item, dict) and item.get("measurement_status")
+        })
+        scheduling = stage_results.get("scheduling", {})
+        command = (
+            scheduling.get("command", {})
+            if isinstance(scheduling, dict) else {}
+        )
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO closed_loop_cycles(
+                run_id, cycle_id, schema_version, scenario_key, status,
+                revision_before, revision_after, physical_execution,
+                measurement_status, state_before_json, risk_json,
+                decision_json, scheduling_json, route_json, safety_json,
+                command_json, feedback_json, next_state_json, trace_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id, cycle_id, cycle["schema_version"], scenario_key,
+                cycle.get("status"), cycle.get("revision_before"),
+                cycle.get("revision_after"), int(physical_execution),
+                ",".join(measurement_values) if measurement_values else None,
+                _json(cycle.get("state_before", {})),
+                _json(stage_results.get("risk", {})),
+                _json(stage_results.get("decision", {})),
+                _json(scheduling if isinstance(scheduling, dict) else {}),
+                _json(stage_results.get("planning", {})),
+                _json(stage_results.get("safety", {})),
+                _json(command), _json(feedback),
+                _json(cycle.get("next_state", {})),
+                _json(cycle.get("trace", [])), _utc_now(),
+            ),
+        )
+        self.connection.commit()
+
+    def load_closed_loop_cycles(
+        self, scenario_keys: Optional[Sequence[str]] = None,
+        run_ids: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read complete V3 decision cycles for dataset/export consumers.
+
+        This is deliberately a low-frequency business-data query.  It does
+        not reconstruct missing cycles from events and it never treats the
+        map-resource database as runtime state.
+        """
+
+        fields = (
+            "state_before", "risk", "decision", "scheduling", "route",
+            "safety", "command", "feedback", "next_state", "trace",
+        )
+        sql = """
+            SELECT c.run_id, c.cycle_id, c.schema_version, c.scenario_key,
+                   c.status, c.revision_before, c.revision_after,
+                   c.physical_execution, c.measurement_status,
+                   c.state_before_json, c.risk_json, c.decision_json,
+                   c.scheduling_json, c.route_json, c.safety_json,
+                   c.command_json, c.feedback_json, c.next_state_json,
+                   c.trace_json, c.created_at,
+                   r.scenario_id, r.scenario_seed, r.scenario_mode,
+                   r.simulator_mode, r.status, r.summary_json
+            FROM closed_loop_cycles AS c
+            JOIN scenario_runs AS r ON r.run_id = c.run_id
+        """
+        parameters = []
+        normalized_keys = sorted(set(
+            str(item).strip() for item in (scenario_keys or ())
+            if str(item).strip()
+        ))
+        normalized_run_ids = sorted(set(
+            str(item).strip() for item in (run_ids or ())
+            if str(item).strip()
+        ))
+        conditions = []
+        if normalized_keys:
+            conditions.append("c.scenario_key IN ({})".format(
+                ",".join("?" for _ in normalized_keys)
+            ))
+            parameters.extend(normalized_keys)
+        if normalized_run_ids:
+            conditions.append("c.run_id IN ({})".format(
+                ",".join("?" for _ in normalized_run_ids)
+            ))
+            parameters.extend(normalized_run_ids)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY c.created_at, c.run_id, c.cycle_id"
+        rows = self.connection.execute(sql, parameters).fetchall()
+        output = []
+        for row in rows:
+            item = {
+                "run_id": row[0], "cycle_id": row[1],
+                "schema_version": row[2], "scenario_key": row[3],
+                "status": row[4], "revision_before": row[5],
+                "revision_after": row[6],
+                "physical_execution": bool(row[7]),
+                "measurement_status": row[8], "created_at": row[19],
+                "scenario_id": row[20], "scenario_seed": row[21],
+                "scenario_mode": row[22], "simulator_mode": row[23],
+                "run_status": row[24],
+            }
+            load_errors = []
+            for index, name in enumerate(fields, 9):
+                try:
+                    item[name] = json.loads(row[index])
+                except (TypeError, ValueError) as exc:
+                    item[name] = None
+                    load_errors.append("{}: {}".format(name, exc))
+            try:
+                item["run_summary"] = (
+                    json.loads(row[25]) if row[25] else {}
+                )
+            except (TypeError, ValueError) as exc:
+                item["run_summary"] = {}
+                load_errors.append("run_summary: {}".format(exc))
+            item["load_errors"] = load_errors
+            output.append(item)
+        return output
+
     def record_artifact(
         self,
         run_id: str,
@@ -638,7 +926,10 @@ class SqliteRunStore:
             """
             UPDATE scenario_runs
             SET scenario_seed = ?, scenario_mode = ?, simulator_mode = ?,
-                status = ?, ended_at = ?, summary_json = ?
+                status = ?, ended_at = ?, summary_json = ?,
+                policy_version = COALESCE(?, policy_version),
+                route_planner_version = COALESCE(?, route_planner_version),
+                risk_model_version = COALESCE(?, risk_model_version)
             WHERE run_id = ?
             """,
             (
@@ -648,6 +939,9 @@ class SqliteRunStore:
                 summary.get("status"),
                 _utc_now(),
                 _json(summary),
+                summary.get("policy_version"),
+                summary.get("route_planner_version"),
+                summary.get("risk_model_version"),
                 run_id,
             ),
         )
@@ -689,6 +983,233 @@ class SqliteRunStore:
             )
         self._store_metrics(run_id, summary)
         self.connection.commit()
+
+    def validate_closed_loop_evidence(
+        self, run_id: str, scenario_key: str, expected: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Validate persisted business evidence and store the binary metric."""
+        checks = []
+
+        def check(name, passed, detail):
+            checks.append({"check": name, "passed": bool(passed), "detail": detail})
+
+        run = self.connection.execute(
+            "SELECT status FROM scenario_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        check("db_run_pass", bool(run) and run[0] == "PASS", run[0] if run else None)
+        task_count, completed_count = self.connection.execute(
+            "SELECT count(*),sum(CASE WHEN status='completed' THEN 1 ELSE 0 END) "
+            "FROM tasks WHERE run_id=?", (run_id,)
+        ).fetchone()
+        expected_tasks = int(expected.get("task_count") or 0)
+        check("db_task_count", task_count == expected_tasks,
+              "{} expected {}".format(task_count, expected_tasks))
+        check("db_all_tasks_completed", expected_tasks > 0 and completed_count == expected_tasks,
+              "{}/{}".format(completed_count or 0, expected_tasks))
+        event_rows = self.connection.execute(
+            "SELECT event_type FROM events WHERE run_id=? ORDER BY event_id", (run_id,)
+        ).fetchall()
+        event_types = [str(row[0]) for row in event_rows]
+        if isinstance(expected.get("closed_loop_cycle"), dict):
+            cycle_rows = self.connection.execute(
+                "SELECT schema_version,status,revision_before,revision_after "
+                "FROM closed_loop_cycles WHERE run_id=?", (run_id,)
+            ).fetchall()
+            check(
+                "db_closed_loop_cycle_present",
+                len(cycle_rows) == 1
+                and cycle_rows[0][0] == "openpit.closed-loop-cycle.v1"
+                and cycle_rows[0][1] == expected["closed_loop_cycle"].get("status")
+                and cycle_rows[0][2] == expected["closed_loop_cycle"].get(
+                    "revision_before"
+                )
+                and cycle_rows[0][3] == expected["closed_loop_cycle"].get(
+                    "revision_after"
+                ),
+                cycle_rows,
+            )
+
+        def ordered(required):
+            cursor = -1
+            for event_type in required:
+                try:
+                    cursor = event_types.index(event_type, cursor + 1)
+                except ValueError:
+                    return False
+            return True
+
+        scenario_key = str(scenario_key)
+        if scenario_key == "s01":
+            decisions = self.connection.execute(
+                "SELECT count(*) FROM decisions WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s01_decisions_present", decisions >= expected_tasks,
+                  decisions)
+        elif scenario_key == "s02":
+            check("db_s02_event_order", ordered([
+                "vehicle_fault", "task_released", "task_reassigned",
+                "task_completed", "run_completed",
+            ]), event_types)
+            check("db_s02_reassignment_count", event_types.count("task_reassigned") == int(
+                expected.get("reassignment_count") or 0
+            ), event_types.count("task_reassigned"))
+        elif scenario_key == "s03":
+            check("db_s03_event_order", ordered([
+                "equipment_fault", "task_paused", "agent_decision",
+                "task_work_point_switched", "task_completed",
+                "equipment_recovered", "run_completed",
+            ]), event_types)
+            affected = int(expected.get("affected_task_count") or 0)
+            decisions = self.connection.execute(
+                "SELECT count(*) FROM decisions WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s03_decision_count", decisions == affected,
+                  "{} expected {}".format(decisions, affected))
+            check("db_s03_pause_count", event_types.count("task_paused") == affected,
+                  event_types.count("task_paused"))
+            check("db_s03_switch_count", event_types.count(
+                "task_work_point_switched") == affected,
+                event_types.count("task_work_point_switched"))
+            route_count = self.connection.execute(
+                "SELECT count(*) FROM route_plans WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s03_route_plan_count", route_count == expected_tasks + affected,
+                  "{} expected {}".format(route_count, expected_tasks + affected))
+        elif scenario_key == "s04":
+            check("db_s04_event_order", ordered([
+                "blast_announced", "blast_control_activated", "agent_decision",
+                "task_completed", "blast_area_cleared", "road_reopened",
+                "run_completed",
+            ]), event_types)
+            affected = int(expected.get("affected_task_count") or 0)
+            decisions = self.connection.execute(
+                "SELECT count(*) FROM decisions WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s04_decision_count", decisions == affected,
+                  "{} expected {}".format(decisions, affected))
+            response_count = (
+                event_types.count("blast_safe_route_planned")
+                + event_types.count("vehicle_held_for_blast")
+            )
+            check("db_s04_response_count", response_count == affected,
+                  "{} expected {}".format(response_count, affected))
+            route_count = self.connection.execute(
+                "SELECT count(*) FROM route_plans WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s04_route_plan_count", route_count == expected_tasks + affected,
+                  "{} expected {}".format(route_count, expected_tasks + affected))
+        elif scenario_key == "s05":
+            check("db_s05_event_order", ordered([
+                "weather_started", "road_restricted", "agent_decision",
+                "task_completed", "road_restored", "weather_recovered",
+                "run_completed",
+            ]), event_types)
+            affected = int(expected.get("affected_task_count") or 0)
+            decisions = self.connection.execute(
+                "SELECT count(*) FROM decisions WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s05_decision_count", decisions == affected,
+                  "{} expected {}".format(decisions, affected))
+            response_count = (
+                event_types.count("weather_route_replanned")
+                + event_types.count("weather_speed_restricted")
+            )
+            check("db_s05_response_count", response_count == affected,
+                  "{} expected {}".format(response_count, affected))
+            route_count = self.connection.execute(
+                "SELECT count(*) FROM route_plans WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s05_route_plan_count", route_count == expected_tasks + affected,
+                  "{} expected {}".format(route_count, expected_tasks + affected))
+        elif scenario_key == "s06":
+            check("db_s06_event_order", ordered([
+                "congestion_detected", "traffic_control_activated",
+                "agent_decision", "task_completed", "congestion_cleared",
+                "traffic_control_released", "run_completed",
+            ]), event_types)
+            affected = int(expected.get("affected_task_count") or 0)
+            decisions = self.connection.execute(
+                "SELECT count(*) FROM decisions WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s06_decision_count", decisions == affected,
+                  "{} expected {}".format(decisions, affected))
+            response_count = (
+                event_types.count("vehicle_held")
+                + event_types.count("bottleneck_entry_authorized")
+            )
+            check("db_s06_response_count", response_count == affected,
+                  "{} expected {}".format(response_count, affected))
+            route_count = self.connection.execute(
+                "SELECT count(*) FROM route_plans WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s06_route_plan_count", route_count == expected_tasks,
+                  "{} expected {}".format(route_count, expected_tasks))
+        elif scenario_key == "s07":
+            check("db_s07_event_order", ordered([
+                "road_closed", "agent_decision", "route_replanned",
+                "task_completed", "road_reopened", "run_completed",
+            ]), event_types)
+            affected = int(expected.get("affected_task_count") or 0)
+            route_count = self.connection.execute(
+                "SELECT count(*) FROM route_plans WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s07_route_plan_count", route_count == expected_tasks + affected,
+                  "{} expected {}".format(route_count, expected_tasks + affected))
+            check("db_s07_replan_event_count", event_types.count("route_replanned") == affected,
+                  event_types.count("route_replanned"))
+            check("db_s07_takeover_event_count", event_types.count("task_reassigned") == int(
+                expected.get("takeover_count") or 0
+            ), event_types.count("task_reassigned"))
+        elif scenario_key == "s09":
+            check("db_s09_event_order", ordered([
+                "road_closed", "agent_decision", "route_replanned",
+                "vehicle_fault", "task_released", "agent_decision",
+                "task_reassigned", "task_completed", "road_reopened",
+                "run_completed",
+            ]), event_types)
+            road_affected = int(expected.get("road_affected_task_count") or 0)
+            expected_decisions = road_affected + int(
+                expected.get("reassignment_count") or 0
+            )
+            decisions = self.connection.execute(
+                "SELECT count(*) FROM decisions WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            check("db_s09_decision_count", decisions == expected_decisions,
+                  "{} expected {}".format(decisions, expected_decisions))
+            check("db_s09_replan_count", event_types.count(
+                "route_replanned") == road_affected,
+                event_types.count("route_replanned"))
+            check("db_s09_release_reassignment_count",
+                  event_types.count("task_released") == 1
+                  and event_types.count("task_reassigned") == 1,
+                  "release={} reassign={}".format(
+                      event_types.count("task_released"),
+                      event_types.count("task_reassigned")))
+            route_count = self.connection.execute(
+                "SELECT count(*) FROM route_plans WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            expected_routes = expected_tasks + road_affected + 1
+            check("db_s09_route_plan_count", route_count == expected_routes,
+                  "{} expected {}".format(route_count, expected_routes))
+
+        failed = [item["check"] for item in checks if not item["passed"]]
+        result = {
+            "status": "EVIDENCE_PASS" if not failed else "EVIDENCE_FAIL",
+            "run_id": run_id,
+            "scenario_key": scenario_key,
+            "check_count": len(checks),
+            "passed_check_count": len(checks) - len(failed),
+            "failed_checks": failed,
+            "checks": checks,
+        }
+        self.connection.execute(
+            "INSERT OR REPLACE INTO metrics(run_id,metric_name,metric_value,unit,source) "
+            "VALUES(?,?,?,?,?)",
+            (run_id, "closed_loop_evidence_pass", 1.0 if not failed else 0.0,
+             "boolean", "automatic_closed_loop_validation"),
+        )
+        self.connection.commit()
+        return result
 
     def _store_metrics(self, run_id: str, summary: Dict[str, Any]) -> None:
         candidates = {}

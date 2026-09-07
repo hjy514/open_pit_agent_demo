@@ -1,0 +1,42 @@
+{
+  "schema_version": "2.0-scenario",
+  "scenario_id": "s04-blasting-control-6v",
+  "scenario_name": "S04 爆破作业与临时危险区管控（6车结构化场景）",
+  "instruction": "在真实地图拓扑约束下生成六车任务，发布参数化爆破时间窗，对相关道路实施临时管控；可安全绕行的原车绕行，不可绕行的原车等待管控解除。",
+  "carla": {"root": "/opt/carla/CARLA_0.9.10", "host": "127.0.0.1", "port": 2000, "timeout_seconds": 10, "map_name": "0325_5"},
+  "vehicles": [
+    {"vehicle_id": "haul_vehicle_01", "display_name": "运输车01", "equipment_type": "haul_truck", "role_name": "haul_01", "blueprint": "vehicle.cat.cat", "spawn_point_index": 0, "mock_position": {"x": 0, "y": 0, "z": 0}, "target_speed_kmh": 25, "capabilities": ["haul", "inspection"]},
+    {"vehicle_id": "haul_vehicle_02", "display_name": "运输车02", "equipment_type": "haul_truck", "role_name": "haul_02", "blueprint": "vehicle.cat.cat", "spawn_point_index": 1, "mock_position": {"x": 30, "y": 0, "z": 0}, "target_speed_kmh": 25, "capabilities": ["haul", "inspection"]},
+    {"vehicle_id": "haul_vehicle_03", "display_name": "运输车03", "equipment_type": "haul_truck", "role_name": "haul_03", "blueprint": "vehicle.cat.cat", "spawn_point_index": 2, "mock_position": {"x": 60, "y": 0, "z": 0}, "target_speed_kmh": 25, "capabilities": ["haul", "inspection"]},
+    {"vehicle_id": "inspection_vehicle_01", "display_name": "巡检车01", "equipment_type": "inspection_vehicle", "role_name": "inspection_01", "blueprint": "vehicle.cat.cat", "spawn_point_index": 3, "mock_position": {"x": 0, "y": 40, "z": 0}, "target_speed_kmh": 20, "capabilities": ["inspection", "slope_monitoring"]},
+    {"vehicle_id": "inspection_vehicle_02", "display_name": "巡检车02", "equipment_type": "inspection_vehicle", "role_name": "inspection_02", "blueprint": "vehicle.cat.cat", "spawn_point_index": 4, "mock_position": {"x": 30, "y": 40, "z": 0}, "target_speed_kmh": 20, "capabilities": ["inspection", "slope_monitoring"]},
+    {"vehicle_id": "support_vehicle_01", "display_name": "保障车01", "equipment_type": "support_vehicle", "role_name": "support_01", "blueprint": "vehicle.cat.cat", "spawn_point_index": 5, "mock_position": {"x": 60, "y": 40, "z": 0}, "target_speed_kmh": 18, "capabilities": ["inspection", "emergency_support"]}
+  ],
+  "fleet": {"total_vehicles": 6, "available_vehicles": 6, "active_vehicles": 6, "traffic_vehicles": 0, "role_policy": "fixed", "task_load": "medium", "traffic_density": "low", "role_counts": {"haul": 3, "inspection": 2, "support": 1}},
+  "zones": [
+    {"zone_id": "S04-A", "display_name": "北部运输区", "priority": 60, "required_capabilities": ["haul"], "target_spawn_point_index": 10, "mock_position": {"x": 90, "y": 0, "z": 0}},
+    {"zone_id": "S04-B", "display_name": "东部运输区", "priority": 55, "required_capabilities": ["haul"], "target_spawn_point_index": 11, "mock_position": {"x": 120, "y": 10, "z": 0}},
+    {"zone_id": "S04-C", "display_name": "南部运输区", "priority": 50, "required_capabilities": ["haul"], "target_spawn_point_index": 12, "mock_position": {"x": 90, "y": 50, "z": 0}},
+    {"zone_id": "S04-D", "display_name": "爆破警戒巡检区", "priority": 45, "required_capabilities": ["inspection", "slope_monitoring"], "target_spawn_point_index": 13, "mock_position": {"x": 10, "y": 90, "z": 0}},
+    {"zone_id": "S04-E", "display_name": "道路巡检区", "priority": 40, "required_capabilities": ["inspection"], "target_spawn_point_index": 14, "mock_position": {"x": 60, "y": 90, "z": 0}},
+    {"zone_id": "S04-F", "display_name": "爆破保障区", "priority": 35, "required_capabilities": ["emergency_support"], "target_spawn_point_index": 15, "mock_position": {"x": 120, "y": 80, "z": 0}}
+  ],
+  "demo": {"failure_enabled": false, "failure_vehicle_id": "", "failure_tick": 0, "random_seed": 202604, "arrival_tolerance_m": 3.0, "task_timeout_ticks": 1000, "fault_pull_over_offset_m": 0, "idle_pull_over_offset_m": 0},
+  "map_resource": {"database_path": "../data/database/map_resources.db", "map_id": "0325_5", "resource_version": "1.0-draft", "route_endpoints": {}},
+  "scenario_variables": {
+    "profile_version": "s04-v1",
+    "environment": {"weather": "clear", "visibility": "normal", "road_surface": "dry"},
+    "disaster": {"enabled": false},
+    "mission": {"task_generation": "seeded-map-resource-six-or-eight-vehicle"},
+    "randomization": {
+      "mode": "seeded_parameterized",
+      "seed": 202604,
+      "events": [{
+        "event_type": "planned_blasting_temporary_control",
+        "parameters": {"notice_tick": 20, "blast_start_tick": 40, "clearance_tick": 60}
+      }]
+    },
+    "resource_admission": {"execution_mode": "structural_mock", "spawn_policy": "VERIFIED_SPAWN_EXCLUDING_RECORDED_DUAL_SPAWN_BLOCKED", "route_policy": "TOPOLOGY_DERIVED_UNVERIFIED_ONLY"},
+    "data_boundary": "The blast window and control event are parameterized synthetic inputs. The exclusion scope is a topology-edge anchor, not a real blast-radius or physical-effects model."
+  }
+}

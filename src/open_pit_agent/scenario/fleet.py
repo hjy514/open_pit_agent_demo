@@ -119,3 +119,16 @@ def snapshot_from_episode(episode: Any) -> FleetSnapshot:
         traffic=int(snapshot.get("traffic_vehicles", sum(item.in_traffic for item in records))),
         vehicles=tuple(records),
     )
+
+
+def vehicle_state_snapshot(states: Sequence[Any]) -> List[Dict[str, Any]]:
+    """Compact runtime state view for structural-run results.
+
+    Unlike ``snapshot_from_episode``, this is taken from the adapter at the
+    requested instant and therefore can show a fault or task reassignment.
+    """
+    return [{
+        "vehicle_id": state.vehicle_id, "role_name": state.role_name,
+        "health": state.health, "available": state.available,
+        "task_status": state.task_status, "current_task_id": state.current_task_id,
+    } for state in sorted(states, key=lambda item: item.vehicle_id)]

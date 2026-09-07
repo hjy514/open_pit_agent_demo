@@ -68,10 +68,23 @@ class MockAdapter(EquipmentAdapter):
         state.task_status = "fault"
         state.timestamp = utc_now()
 
+    def complete_tasks(self, tasks: Sequence[Task]) -> None:
+        """Reflect structural task completion in the mock runtime state only."""
+        self._require_connected()
+        completed_by_vehicle = {
+            task.assigned_vehicle_id for task in tasks
+            if task.assigned_vehicle_id and task.status == "completed"
+        }
+        for vehicle_id in completed_by_vehicle:
+            state = self._states[vehicle_id]
+            if state.available:
+                state.current_task_id = None
+                state.task_status = "completed"
+                state.timestamp = utc_now()
+
     def close(self) -> None:
         self.connected = False
 
     def _require_connected(self) -> None:
         if not self.connected:
             raise RuntimeError("MockAdapter is not connected")
-

@@ -24,7 +24,7 @@ class ConcreteEpisodeTest(unittest.TestCase):
         self.assertEqual("run-regression-001", episode.run_id)
         self.assertEqual(3, len(episode.vehicles))
         self.assertEqual(3, episode.fleet_snapshot["total_vehicles"])
-        self.assertEqual(3, len(episode.tasks))
+        self.assertEqual(2, len(episode.tasks))
         self.assertEqual("inspection_vehicle_01", episode.events[0].target_vehicle_id)
         self.assertEqual(
             "inspection_vehicle_02",

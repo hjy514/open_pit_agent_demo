@@ -7,13 +7,14 @@ the map/version metadata.  It does not infer that any point is safe.
 """
 
 import hashlib
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "4"
 
 
 def _utc_now() -> str:
@@ -158,6 +159,24 @@ class MapResourceStore:
                 FOREIGN KEY(point_id) REFERENCES map_points(point_id)
             );
 
+            CREATE TABLE IF NOT EXISTS operating_areas (
+                area_id TEXT PRIMARY KEY,
+                map_id TEXT NOT NULL,
+                resource_version TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                area_type TEXT NOT NULL,
+                selection_mode TEXT NOT NULL,
+                capacity INTEGER,
+                allowed_roles_json TEXT NOT NULL,
+                point_ids_json TEXT NOT NULL,
+                validation_status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                notes TEXT,
+                FOREIGN KEY(map_id) REFERENCES maps(map_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_operating_areas_map_status
+                ON operating_areas(map_id, resource_version, validation_status);
+
             CREATE TABLE IF NOT EXISTS point_conflicts (
                 map_id TEXT NOT NULL,
                 resource_version TEXT NOT NULL,
@@ -234,6 +253,35 @@ class MapResourceStore:
                 FOREIGN KEY(from_point_id) REFERENCES map_points(point_id),
                 FOREIGN KEY(to_point_id) REFERENCES map_points(point_id)
             );
+
+            CREATE TABLE IF NOT EXISTS route_execution_validations (
+                validation_id TEXT PRIMARY KEY,
+                calibration_run_id TEXT NOT NULL,
+                map_id TEXT NOT NULL,
+                resource_version TEXT NOT NULL,
+                route_profile_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                from_point_id TEXT NOT NULL,
+                to_point_id TEXT NOT NULL,
+                vehicle_blueprint TEXT NOT NULL,
+                target_speed_kmh REAL NOT NULL,
+                arrival_tolerance_m REAL NOT NULL,
+                validation_status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                duration_seconds REAL,
+                tick_count INTEGER,
+                initial_distance_m REAL,
+                final_distance_m REAL,
+                distance_travelled_m REAL,
+                notes TEXT,
+                FOREIGN KEY(calibration_run_id) REFERENCES calibration_runs(calibration_run_id),
+                FOREIGN KEY(map_id) REFERENCES maps(map_id),
+                FOREIGN KEY(from_point_id) REFERENCES map_points(point_id),
+                FOREIGN KEY(to_point_id) REFERENCES map_points(point_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_route_execution_validations_route
+                ON route_execution_validations(resource_version, from_point_id, to_point_id, validation_status);
 
             CREATE TABLE IF NOT EXISTS route_candidates (
                 route_candidate_id TEXT PRIMARY KEY,
@@ -371,6 +419,425 @@ class MapResourceStore:
         from .xodr import import_xodr
         return import_xodr(self, map_id, resource_version, xodr_path, spacing_m)
 
+    def has_map_resource_version(self, map_id: str, resource_version: str) -> bool:
+        """Return whether the requested pre-created resource version exists."""
+        row = self.connection.execute(
+            "SELECT 1 FROM map_resource_versions WHERE map_id = ? AND resource_version = ?",
+            (map_id, resource_version),
+        ).fetchone()
+        return row is not None
+
+    def start_calibration_run(
+        self,
+        calibration_run_id: str,
+        map_id: str,
+        resource_version: str,
+        calibration_type: str,
+        tool_version: str,
+        source: str,
+        notes: Optional[str] = None,
+    ) -> None:
+        """Persist a pending calibration run; map metadata must exist first."""
+        if not self.has_map_resource_version(map_id, resource_version):
+            raise ValueError(
+                "map resource version does not exist: {}/{}".format(map_id, resource_version)
+            )
+        self.connection.execute(
+            """
+            INSERT INTO calibration_runs(
+                calibration_run_id, map_id, resource_version, calibration_type,
+                tool_version, started_at, status, source, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (calibration_run_id, map_id, resource_version, calibration_type,
+             tool_version, _utc_now(), "RUNNING", source, notes),
+        )
+        self.connection.commit()
+
+    def finish_calibration_run(
+        self, calibration_run_id: str, status: str, summary: Dict[str, object]
+    ) -> None:
+        """Finish a run with a JSON-safe factual summary."""
+        self.connection.execute(
+            """
+            UPDATE calibration_runs
+            SET ended_at = ?, status = ?, summary_json = ?
+            WHERE calibration_run_id = ?
+            """,
+            (_utc_now(), status, json.dumps(summary, ensure_ascii=False, sort_keys=True), calibration_run_id),
+        )
+        self.connection.commit()
+
+    def upsert_spawn_calibration_points(self, map_id: str, records: Iterable[Dict[str, object]]) -> int:
+        """Write CARLA spawn-point calibration facts without inferring route safety.
+
+        Records are keyed by map and CARLA spawn-point index, so a later run
+        updates the latest factual result for that point while calibration_runs
+        retains the history of each scan.
+        """
+        rows = []
+        for item in records:
+            required = ("spawn_point_index", "x", "y", "z", "validation_status")
+            missing = [name for name in required if item.get(name) is None]
+            if missing:
+                raise ValueError("spawn calibration record missing: {}".format(", ".join(missing)))
+            index = int(item["spawn_point_index"])
+            rows.append((
+                "carla-spawn:{}".format(index), map_id, index,
+                float(item["x"]), float(item["y"]), float(item["z"]), item.get("yaw"),
+                item.get("road_id"), item.get("lane_id"), item.get("s"), item.get("lane_type"),
+                item.get("travel_direction"), item.get("heavy_truck_allowed"),
+                item.get("nearest_point_distance_m"),
+                str(item["validation_status"]), str(item.get("source", "CARLA_SPAWN_CALIBRATION")),
+                item.get("notes"),
+            ))
+        self.connection.executemany(
+            """
+            INSERT INTO map_points(
+                point_id, map_id, carla_spawn_point_index, x, y, z, yaw,
+                road_id, lane_id, s, lane_type, travel_direction,
+                heavy_truck_allowed, nearest_point_distance_m, validation_status, source, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(map_id, carla_spawn_point_index) DO UPDATE SET
+                x = excluded.x, y = excluded.y, z = excluded.z, yaw = excluded.yaw,
+                road_id = excluded.road_id, lane_id = excluded.lane_id, s = excluded.s,
+                lane_type = excluded.lane_type,
+                heavy_truck_allowed = excluded.heavy_truck_allowed,
+                nearest_point_distance_m = excluded.nearest_point_distance_m,
+                validation_status = excluded.validation_status, source = excluded.source,
+                notes = excluded.notes
+            """,
+            rows,
+        )
+        self.connection.commit()
+        return len(rows)
+
+    def verified_spawn_points(self, map_id: str) -> Iterable[Dict[str, object]]:
+        """Return P3-verified spawn facts, not route or multi-vehicle facts."""
+        rows = self.connection.execute(
+            """
+            SELECT point_id, carla_spawn_point_index, x, y, z, yaw
+            FROM map_points
+            WHERE map_id = ? AND validation_status = 'VERIFIED_SPAWN'
+            ORDER BY point_id
+            """,
+            (map_id,),
+        ).fetchall()
+        return [
+            {"point_id": row[0], "spawn_point_index": row[1], "x": row[2],
+             "y": row[3], "z": row[4], "yaw": row[5]}
+            for row in rows
+        ]
+
+    def blocked_dual_spawn_pairs(
+        self, map_id: str, resource_version: str
+    ) -> Iterable[tuple]:
+        """Return only observed dual-spawn failures, never static inferences.
+
+        The absence of a pair from this result is not multi-vehicle clearance
+        evidence.  It only means that this resource selector has no recorded
+        ``DUAL_SPAWN_BLOCKED`` result for that pair.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT point_a_id, point_b_id
+            FROM point_conflicts
+            WHERE map_id = ? AND resource_version = ?
+              AND validation_status = 'DUAL_SPAWN_BLOCKED'
+            """,
+            (map_id, resource_version),
+        ).fetchall()
+        return {(str(row[0]), str(row[1])) for row in rows}
+
+    def physical_route_validations(
+        self, map_id: str, resource_version: str
+    ) -> Iterable[Dict[str, object]]:
+        """Return physical single-truck route facts without promoting them.
+
+        These records are for scenario admission/reporting.  A reached route
+        remains an isolated single-truck result, not fleet-safety evidence.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT route_id, from_point_id, to_point_id, validation_status,
+                   target_speed_kmh, duration_seconds, final_distance_m
+            FROM route_execution_validations
+            WHERE map_id = ? AND resource_version = ?
+            ORDER BY started_at, validation_id
+            """,
+            (map_id, resource_version),
+        ).fetchall()
+        return [
+            {
+                "route_id": str(row[0]),
+                "from_point_id": str(row[1]),
+                "to_point_id": str(row[2]),
+                "validation_status": str(row[3]),
+                "target_speed_kmh": float(row[4]),
+                "duration_seconds": row[5],
+                "final_distance_m": row[6],
+            }
+            for row in rows
+        ]
+
+    def upsert_operating_areas(self, records: Iterable[Dict[str, object]]) -> int:
+        """Write versioned operating-area semantics for a map resource set.
+
+        Area records describe an intended selection pool.  Their validation
+        status must remain explicit: a candidate pool is not promoted to a
+        physically drivable multi-vehicle area merely by being recorded here.
+        """
+        rows = []
+        for item in records:
+            required = (
+                "area_id", "map_id", "resource_version", "display_name",
+                "area_type", "selection_mode", "allowed_roles", "point_ids",
+                "validation_status", "source",
+            )
+            missing = [key for key in required if item.get(key) is None]
+            if missing:
+                raise ValueError("operating area missing: {}".format(", ".join(missing)))
+            point_ids = [str(value) for value in item["point_ids"]]
+            if not point_ids or len(point_ids) != len(set(point_ids)):
+                raise ValueError("operating area requires unique point_ids")
+            rows.append((
+                str(item["area_id"]), str(item["map_id"]),
+                str(item["resource_version"]), str(item["display_name"]),
+                str(item["area_type"]), str(item["selection_mode"]),
+                item.get("capacity"),
+                json.dumps(list(item["allowed_roles"]), ensure_ascii=False, sort_keys=True),
+                json.dumps(point_ids, ensure_ascii=False, sort_keys=True),
+                str(item["validation_status"]), str(item["source"]), item.get("notes"),
+            ))
+        self.connection.executemany(
+            """
+            INSERT INTO operating_areas(
+                area_id, map_id, resource_version, display_name, area_type,
+                selection_mode, capacity, allowed_roles_json, point_ids_json,
+                validation_status, source, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(area_id) DO UPDATE SET
+                map_id = excluded.map_id,
+                resource_version = excluded.resource_version,
+                display_name = excluded.display_name,
+                area_type = excluded.area_type,
+                selection_mode = excluded.selection_mode,
+                capacity = excluded.capacity,
+                allowed_roles_json = excluded.allowed_roles_json,
+                point_ids_json = excluded.point_ids_json,
+                validation_status = excluded.validation_status,
+                source = excluded.source,
+                notes = excluded.notes
+            """,
+            rows,
+        )
+        self.connection.commit()
+        return len(rows)
+
+    def operating_areas(
+        self, map_id: str, resource_version: str
+    ) -> Iterable[Dict[str, object]]:
+        """Return stored area semantics; map facts remain in their own tables."""
+        rows = self.connection.execute(
+            """
+            SELECT area_id, display_name, area_type, selection_mode, capacity,
+                   allowed_roles_json, point_ids_json, validation_status, source, notes
+            FROM operating_areas
+            WHERE map_id = ? AND resource_version = ?
+            ORDER BY area_id
+            """,
+            (map_id, resource_version),
+        ).fetchall()
+        return [
+            {
+                "area_id": str(row[0]), "display_name": str(row[1]),
+                "area_type": str(row[2]), "selection_mode": str(row[3]),
+                "capacity": row[4], "allowed_roles": json.loads(row[5]),
+                "point_ids": json.loads(row[6]), "validation_status": str(row[7]),
+                "source": str(row[8]), "notes": row[9],
+            }
+            for row in rows
+        ]
+
+    def upsert_point_conflicts(self, records: Iterable[Dict[str, object]]) -> int:
+        """Persist static inferences or explicitly-labelled pair-test results."""
+        rows = []
+        for item in records:
+            required = ("map_id", "resource_version", "point_a_id", "point_b_id",
+                        "conflict_type", "validation_status", "source")
+            missing = [name for name in required if item.get(name) is None]
+            if missing:
+                raise ValueError("point conflict record missing: {}".format(", ".join(missing)))
+            point_a, point_b = sorted((str(item["point_a_id"]), str(item["point_b_id"])))
+            if point_a == point_b:
+                raise ValueError("point conflict requires two distinct point IDs")
+            rows.append((
+                str(item["map_id"]), str(item["resource_version"]), point_a, point_b,
+                str(item["conflict_type"]), item.get("minimum_clearance_m"),
+                str(item["validation_status"]), str(item["source"]), item.get("notes"),
+            ))
+        self.connection.executemany(
+            """
+            INSERT INTO point_conflicts(
+                map_id, resource_version, point_a_id, point_b_id, conflict_type,
+                minimum_clearance_m, validation_status, source, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(resource_version, point_a_id, point_b_id, conflict_type) DO UPDATE SET
+                minimum_clearance_m = excluded.minimum_clearance_m,
+                validation_status = excluded.validation_status,
+                source = excluded.source,
+                notes = excluded.notes
+            """,
+            rows,
+        )
+        self.connection.commit()
+        return len(rows)
+
+    def upsert_reachable_pairs(self, records: Iterable[Dict[str, object]]) -> int:
+        """Persist directed planner reachability facts idempotently.
+
+        These rows describe route-planner output only.  They must not be
+        interpreted as evidence that a heavy truck physically traversed the
+        route, passed a clearance check, or avoided collisions.
+        """
+        rows = []
+        for item in records:
+            if not isinstance(item, dict):
+                raise ValueError("reachable pair must be an object")
+            required = (
+                "map_id", "resource_version", "from_point_id", "to_point_id",
+                "planner_version", "reachable", "validation_status", "source",
+            )
+            missing = [name for name in required if item.get(name) is None]
+            if missing:
+                raise ValueError("reachable pair record missing: {}".format(", ".join(missing)))
+            from_point_id = str(item["from_point_id"])
+            to_point_id = str(item["to_point_id"])
+            if from_point_id == to_point_id:
+                raise ValueError("reachable pair requires two distinct point IDs")
+            rows.append((
+                str(item["map_id"]), str(item["resource_version"]),
+                from_point_id, to_point_id, str(item["planner_version"]),
+                1 if bool(item["reachable"]) else 0,
+                item.get("route_length_m"), item.get("endpoint_error_m"),
+                item.get("junction_count"), item.get("route_hash"),
+                str(item["validation_status"]), str(item["source"]), item.get("notes"),
+            ))
+        self.connection.executemany(
+            """
+            INSERT INTO reachable_pairs(
+                map_id, resource_version, from_point_id, to_point_id,
+                planner_version, reachable, route_length_m, endpoint_error_m,
+                junction_count, route_hash, validation_status, source, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(resource_version, from_point_id, to_point_id, planner_version)
+            DO UPDATE SET
+                map_id = excluded.map_id,
+                reachable = excluded.reachable,
+                route_length_m = excluded.route_length_m,
+                endpoint_error_m = excluded.endpoint_error_m,
+                junction_count = excluded.junction_count,
+                route_hash = excluded.route_hash,
+                validation_status = excluded.validation_status,
+                source = excluded.source,
+                notes = excluded.notes
+            """,
+            rows,
+        )
+        self.connection.commit()
+        return len(rows)
+
+    def terminal_reachable_pair_keys(self, map_id: str, resource_version: str,
+                                     planner_version: str):
+        """Return completed directed-pair keys for resumable P5 scans."""
+        rows = self.connection.execute(
+            """
+            SELECT from_point_id, to_point_id
+            FROM reachable_pairs
+            WHERE map_id = ? AND resource_version = ? AND planner_version = ?
+              AND validation_status IN (
+                  'PLANNER_REACHABLE', 'PLANNER_UNREACHABLE',
+                  'PLANNER_NEAR_ENDPOINT', 'PLANNER_ENDPOINT_MISMATCH'
+              )
+            """,
+            (map_id, resource_version, planner_version),
+        ).fetchall()
+        return {(row[0], row[1]) for row in rows}
+
+    def reachable_pair_summary(self, map_id: str, resource_version: str,
+                               planner_version: str) -> Dict[str, int]:
+        """Return factual P5 status counts for reporting and preflight use."""
+        rows = self.connection.execute(
+            """
+            SELECT validation_status, count(*)
+            FROM reachable_pairs
+            WHERE map_id = ? AND resource_version = ? AND planner_version = ?
+            GROUP BY validation_status
+            """,
+            (map_id, resource_version, planner_version),
+        ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def planner_reachable_pairs(self, map_id: str, resource_version: str):
+        """Return only strict P5 planner candidates for offline selection.
+
+        This deliberately excludes ``NEAR_ENDPOINT`` records.  Returned rows
+        are navigation-planner facts only, never physical-route approval.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT from_point_id, to_point_id, route_length_m,
+                   endpoint_error_m, junction_count, planner_version
+            FROM reachable_pairs
+            WHERE map_id = ? AND resource_version = ?
+              AND validation_status = 'PLANNER_REACHABLE' AND reachable = 1
+            ORDER BY from_point_id, to_point_id, planner_version
+            """,
+            (map_id, resource_version),
+        ).fetchall()
+        return [{
+            "from_point_id": str(row[0]), "to_point_id": str(row[1]),
+            "route_length_m": row[2], "endpoint_error_m": row[3],
+            "junction_count": row[4], "planner_version": str(row[5]),
+        } for row in rows]
+
+    def add_route_execution_validation(self, record: Dict[str, object]) -> None:
+        """Append one physical traversal result without replacing P5 facts."""
+        required = (
+            "validation_id", "calibration_run_id", "map_id", "resource_version",
+            "route_profile_id", "route_id", "from_point_id", "to_point_id",
+            "vehicle_blueprint", "target_speed_kmh", "arrival_tolerance_m",
+            "validation_status", "started_at", "ended_at",
+        )
+        missing = [key for key in required if record.get(key) is None]
+        if missing:
+            raise ValueError("route execution validation missing: {}".format(", ".join(missing)))
+        self.connection.execute(
+            """
+            INSERT INTO route_execution_validations(
+                validation_id, calibration_run_id, map_id, resource_version,
+                route_profile_id, route_id, from_point_id, to_point_id,
+                vehicle_blueprint, target_speed_kmh, arrival_tolerance_m,
+                validation_status, started_at, ended_at, duration_seconds,
+                tick_count, initial_distance_m, final_distance_m,
+                distance_travelled_m, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(record["validation_id"]), str(record["calibration_run_id"]),
+                str(record["map_id"]), str(record["resource_version"]),
+                str(record["route_profile_id"]), str(record["route_id"]),
+                str(record["from_point_id"]), str(record["to_point_id"]),
+                str(record["vehicle_blueprint"]), float(record["target_speed_kmh"]),
+                float(record["arrival_tolerance_m"]), str(record["validation_status"]),
+                str(record["started_at"]), str(record["ended_at"]),
+                record.get("duration_seconds"), record.get("tick_count"),
+                record.get("initial_distance_m"), record.get("final_distance_m"),
+                record.get("distance_travelled_m"), record.get("notes"),
+            ),
+        )
+        self.connection.commit()
+
 
     def upsert_route_candidates(self, records: Iterable[Dict[str, object]]) -> int:
         """Idempotently write static route candidates into the map library.
@@ -409,6 +876,32 @@ class MapResourceStore:
         )
         self.connection.commit()
         return len(rows)
+
+    def replace_route_candidates(self, records: Iterable[Dict[str, object]],
+                                 map_id: str, resource_version: str,
+                                 source: str) -> int:
+        """Replace one derivation source without touching captured/manual routes."""
+        items = list(records)
+        for item in items:
+            if (str(item.get("map_id")) != str(map_id)
+                    or str(item.get("resource_version")) != str(resource_version)
+                    or str(item.get("source")) != str(source)):
+                raise ValueError("route candidate does not match replacement scope")
+        self.upsert_route_candidates(items)
+        identifiers = {str(item["route_candidate_id"]) for item in items}
+        existing = {
+            str(row[0]) for row in self.connection.execute(
+                "SELECT route_candidate_id FROM route_candidates WHERE map_id=? "
+                "AND resource_version=? AND source=?",
+                (str(map_id), str(resource_version), str(source)),
+            )
+        }
+        self.connection.executemany(
+            "DELETE FROM route_candidates WHERE route_candidate_id=?",
+            [(route_id,) for route_id in sorted(existing - identifiers)],
+        )
+        self.connection.commit()
+        return len(items)
     def table_names(self) -> Iterable[str]:
         rows = self.connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
@@ -418,9 +911,9 @@ class MapResourceStore:
     def validate_schema(self) -> Dict[str, object]:
         required = {
             "schema_migrations", "maps", "map_resource_versions",
-            "calibration_runs", "map_points", "point_roles",
+            "calibration_runs", "map_points", "point_roles", "operating_areas",
             "point_conflicts", "road_nodes", "road_edges", "road_clusters",
-            "reachable_pairs", "route_candidates", "task_points",
+            "reachable_pairs", "route_execution_validations", "route_candidates", "task_points",
             "safe_wait_points", "hazard_zones", "junctions", "junction_connections",
         }
         present = set(self.table_names())

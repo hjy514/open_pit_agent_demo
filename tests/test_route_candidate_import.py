@@ -35,6 +35,16 @@ class RouteCandidateImportTest(unittest.TestCase):
                 count = store.connection.execute("SELECT COUNT(*) FROM route_candidates").fetchone()[0]
                 self.assertEqual(1, count)
 
+                manual = dict(record)
+                manual["route_candidate_id"] = "manual-route"
+                manual["source"] = "MANUAL"
+                store.upsert_route_candidates([manual])
+                store.replace_route_candidates([], "m", "v", "ROUTE_IMPORT")
+                rows = store.connection.execute(
+                    "SELECT route_candidate_id FROM route_candidates ORDER BY route_candidate_id"
+                ).fetchall()
+                self.assertEqual([("manual-route",)], rows)
+
 
 if __name__ == "__main__":
     unittest.main()

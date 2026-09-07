@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+  "model": "MultiObjectiveCostModel",
+  "policy_version": "multi-objective-cost-v1",
+  "weight_status": "initial_equal_engineering_weights_not_validated_as_optimal",
+  "normalization": "candidate_set_min_max",
+  "include_surrogate_costs": false,
+  "weights": {
+    "cost_time": 1.0,
+    "cost_wait": 1.0,
+    "cost_delay": 1.0,
+    "cost_transport": 1.0,
+    "cost_workload": 1.0,
+    "cost_recovery": 1.0,
+    "cost_switch": 1.0,
+    "cost_prod": 1.0,
+    "cost_idle": 1.0,
+    "cost_energy": 1.0
+  },
+  "structural_reward": {
+    "reward_version": "structural-terminal-reward-v1",
+    "weight_status": "initial_equal_engineering_weights_not_validated_as_optimal",
+    "weights": {
+      "task_completion": 1.0,
+      "closed_loop_evidence": 1.0,
+      "scenario_resolution": 1.0,
+      "switch_cost": 1.0,
+      "detour_cost": 1.0
+    },
+    "normalization": "weighted_mean_of_available_components",
+    "notes": "Only observed structural terminal facts are scored. Missing time, energy, collision and CARLA physical metrics remain unavailable."
+  },
+  "notes": "Equal non-optimal interface weights. Missing objectives are excluded, not replaced with fabricated zero values. Tune only by fixed-scenario sensitivity or Pareto analysis."
+}

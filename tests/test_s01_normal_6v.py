@@ -29,6 +29,17 @@ class S01NormalSixVehicleTest(unittest.TestCase):
         self.assertEqual(first.fleet_snapshot, second.fleet_snapshot)
         self.assertEqual(first.to_fleet_snapshot().to_dict()["vehicles"], second.to_fleet_snapshot().to_dict()["vehicles"])
 
+    def test_s01_keeps_vehicle_identity_and_role_semantics_fixed(self):
+        episode = build_episode(self.config, run_id="s01-role-semantics", seed=202601)
+        configured_roles = {
+            item.vehicle_id: item.role_name for item in self.config.vehicles
+        }
+        self.assertEqual("fixed", self.config.fleet.role_policy)
+        self.assertEqual(
+            configured_roles,
+            {item.vehicle_id: item.initial_role for item in episode.vehicles},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

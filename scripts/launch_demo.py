@@ -43,7 +43,9 @@ def carla_command(carla_root):
         raise DemoLaunchError(
             "CARLA launcher not found: {}".format(launcher)
         )
-    return [str(launcher), "-quality-level=Low"]
+    # The custom mine map relies on CARLA's default rendering settings.
+    # Do not force low-quality flags here: they can leave map resources blank.
+    return [str(launcher)]
 
 
 def desktop_command(python_executable, fullscreen=False):

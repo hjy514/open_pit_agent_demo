@@ -1270,6 +1270,77 @@ class CarlaAdapter(EquipmentAdapter):
             "status": self._task_status.get(vehicle_id, "assigned"),
         }
 
+    def retarget_task(
+        self, task_id: str, zone: ZoneConfig,
+        speed_limit_kmh: Optional[float] = None,
+    ) -> Dict[str, object]:
+        """Move an active task to another admitted CARLA spawn target.
+
+        This is the execution-side operation used by equipment/work-point
+        scenarios.  The scenario layer decides *why* the target changes; the
+        adapter only resolves and executes the new destination.
+        """
+        self._require_connected()
+        task = self._task_objects.get(task_id)
+        if task is None:
+            raise CarlaAdapterError("Unknown task: {}".format(task_id))
+        vehicle_id = task.assigned_vehicle_id
+        if not vehicle_id or vehicle_id not in self._actors:
+            raise CarlaAdapterError(
+                "Task has no active CARLA vehicle: {}".format(task_id)
+            )
+        resolved = self.resolve_zones([zone])[0]
+        self._zones_by_id[resolved.zone_id] = resolved
+        task.zone_id = resolved.zone_id
+        if speed_limit_kmh is not None:
+            self._task_speed_limits[task_id] = float(speed_limit_kmh)
+        self._release_agent(vehicle_id)
+        self._task_ids.pop(vehicle_id, None)
+        self._task_queues[vehicle_id] = [
+            queued for queued in self._task_queues.get(vehicle_id, [])
+            if queued != task_id
+        ]
+        task.status = "assigned"
+        task.started_at = None
+        task.started_tick = None
+        task.status_reason = "retargeted_after_runtime_event"
+        self._task_queues[vehicle_id].insert(0, task_id)
+        self._start_next_task(vehicle_id)
+        payload = {
+            "task_id": task_id,
+            "vehicle_id": vehicle_id,
+            "zone_id": resolved.zone_id,
+            "target_spawn_point_index": resolved.target_spawn_point_index,
+            "speed_limit_kmh": speed_limit_kmh,
+        }
+        self._emit("task_retargeted_by_scenario", payload)
+        return payload
+
+    def set_task_speed_limit(
+        self, task_id: str, speed_limit_kmh: float
+    ) -> Dict[str, object]:
+        """Apply a runtime speed limit and refresh the active BasicAgent."""
+        self._require_connected()
+        task = self._task_objects.get(task_id)
+        if task is None:
+            raise CarlaAdapterError("Unknown task: {}".format(task_id))
+        value = max(1.0, float(speed_limit_kmh))
+        self._task_speed_limits[task_id] = value
+        vehicle_id = task.assigned_vehicle_id
+        if vehicle_id and self._task_ids.get(vehicle_id) == task_id:
+            target = self._task_targets.get(task_id)
+            self._release_agent(vehicle_id)
+            if target is not None:
+                self._start_navigation_leg(vehicle_id, task_id, target)
+                self._task_status[vehicle_id] = "executing"
+        payload = {
+            "task_id": task_id,
+            "vehicle_id": vehicle_id,
+            "speed_limit_kmh": value,
+        }
+        self._emit("task_speed_limit_changed", payload)
+        return payload
+
     def _build_takeover_route(
         self, task: Task, vehicle_id: str
     ) -> List[Position]:
@@ -1508,6 +1579,24 @@ class CarlaAdapter(EquipmentAdapter):
         self.client = None
         self.world = None
 
+    def destroy_spawned_vehicles(self) -> int:
+        """Destroy only vehicle actors created by this adapter instance."""
+
+        # Attached camera sensors must be stopped before their parent vehicle.
+        self._destroy_camera_streams()
+        destroyed = 0
+        spawned_ids = set(self.spawned_actor_ids)
+        for vehicle_id, actor in list(self._actors.items()):
+            if getattr(actor, "id", None) not in spawned_ids:
+                continue
+            try:
+                actor.destroy()
+                destroyed += 1
+            except (AttributeError, RuntimeError):
+                pass
+            self._actors.pop(vehicle_id, None)
+        return destroyed
+
     def _camera_wall_options(self) -> Dict[str, object]:
         options = self.config.scenario_variables.get("camera_wall", {})
         return options if isinstance(options, dict) else {}
@@ -1745,7 +1834,11 @@ class CarlaAdapter(EquipmentAdapter):
         return events
 
     def _import_carla(self) -> None:
-        root = Path(self.config.carla.root).expanduser().resolve()
+        # A scenario config can originate on another validation computer.
+        # Prefer the explicit local override while preserving the configured
+        # path as the backward-compatible fallback.
+        configured_root = os.environ.get("OPENPIT_CARLA_ROOT") or self.config.carla.root
+        root = Path(configured_root).expanduser().resolve()
         dist = root / "PythonAPI" / "carla" / "dist"
         egg_pattern = str(dist / "carla-*-py3.7-linux-x86_64.egg")
         eggs = sorted(glob.glob(egg_pattern))

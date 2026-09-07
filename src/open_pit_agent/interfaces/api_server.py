@@ -140,6 +140,8 @@ def runtime_sync(payload: dict):
         "vehicle_count": len(runtime.vehicles),
         "task_count": len(runtime.tasks),
         "event_count": len(runtime.events),
+        "state_revision": runtime.state_revision,
+        "execution_feedback_count": len(runtime.execution_feedback_history),
     }
 
 

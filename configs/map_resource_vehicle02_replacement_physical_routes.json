@@ -1,0 +1,9 @@
+{
+  "profile_id": "vehicle02-replacement-physical-routes-v1",
+  "map_id": "0325_5",
+  "description": "P6.1矿卡02替代任务候选的单矿卡物理行驶验证。候选47、10来自起点28定向P5扫描，均为PLANNER_NEAR_ENDPOINT；仅用于物理验证，尚未写入正式场景任务。",
+  "routes": [
+    {"route_id": "vehicle02_candidate_task_spawn47", "from_spawn_point_index": 28, "to_spawn_point_index": 47, "purpose": "矿卡02替代任务候选A：P5定向扫描候选"},
+    {"route_id": "vehicle02_candidate_task_spawn10", "from_spawn_point_index": 28, "to_spawn_point_index": 10, "purpose": "矿卡02替代任务候选B：P5定向扫描候选"}
+  ]
+}

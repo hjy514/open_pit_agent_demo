@@ -133,7 +133,7 @@ class ConfigTest(unittest.TestCase):
             len({vehicle.display_name for vehicle in config.vehicles}),
         )
         self.assertEqual(
-            3,
+            2,
             sum(zone.initial_task for zone in config.zones),
         )
         spatial = config.scenario_variables["slope_event"][

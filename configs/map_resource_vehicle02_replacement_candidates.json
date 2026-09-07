@@ -1,0 +1,11 @@
+{
+  "profile_id": "vehicle02-replacement-route-candidates-v1",
+  "map_id": "0325_5",
+  "description": "为出生点28的边坡复核矿卡02替换不可用原任务28->63而准备的候选终点。已排除点5：该点与28存在P4 DUAL_SPAWN_BLOCKED记录。候选仅用于P5/P6验证，尚未写入正式场景任务。",
+  "routes": [
+    {"route_id": "vehicle02_candidate_task_spawn24", "from_spawn_point_index": 28, "to_spawn_point_index": 24, "purpose": "矿卡02替代任务候选A"},
+    {"route_id": "vehicle02_candidate_task_spawn22", "from_spawn_point_index": 28, "to_spawn_point_index": 22, "purpose": "矿卡02替代任务候选B"},
+    {"route_id": "vehicle02_candidate_task_spawn46", "from_spawn_point_index": 28, "to_spawn_point_index": 46, "purpose": "矿卡02替代任务候选C"},
+    {"route_id": "vehicle02_candidate_task_spawn61", "from_spawn_point_index": 28, "to_spawn_point_index": 61, "purpose": "矿卡02替代任务候选D"}
+  ]
+}

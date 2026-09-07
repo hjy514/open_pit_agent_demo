@@ -42,7 +42,7 @@ class CombinedDemoLauncherTest(unittest.TestCase):
                 command[0],
             )
             self.assertEqual(
-                ["-quality-level=Low"], command[1:]
+                [], command[1:]
             )
 
     def test_desktop_command_forwards_fullscreen_only(self):

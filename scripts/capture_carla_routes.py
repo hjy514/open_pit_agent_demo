@@ -74,6 +74,7 @@ def capture_routes(args):
     try:
         import carla
         from agents.navigation.global_route_planner import GlobalRoutePlanner
+        from agents.navigation.global_route_planner_dao import GlobalRoutePlannerDAO
     except ImportError as exc:
         raise RuntimeError(
             "CARLA 0.9.10 Python API and agents package are required on the Ubuntu validation computer"
@@ -90,7 +91,12 @@ def capture_routes(args):
             )
         )
     spawn_points = world.get_map().get_spawn_points()
-    planner = GlobalRoutePlanner(world.get_map(), args.sampling_resolution)
+    # CARLA 0.9.10 uses the DAO-based constructor and requires setup() before
+    # trace_route().  Passing map/resolution directly is a later-version API.
+    planner = GlobalRoutePlanner(
+        GlobalRoutePlannerDAO(world.get_map(), args.sampling_resolution)
+    )
+    planner.setup()
     records = []
     for task_id, spec in endpoints.items():
         start_index = spec["from_spawn_point_index"]

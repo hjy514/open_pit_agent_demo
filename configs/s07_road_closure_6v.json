@@ -125,7 +125,7 @@
     "available_vehicles": 6,
     "active_vehicles": 6,
     "traffic_vehicles": 2,
-    "role_policy": "randomized",
+    "role_policy": "fixed",
     "task_load": "medium",
     "traffic_density": "low",
     "role_counts": {
@@ -249,10 +249,15 @@
       "enabled": false
     },
     "mission": {
-      "task_generation": "configured-six-zone-road-closure-baseline"
+      "task_generation": "seeded-map-resource-road-closure-when-random-map-enabled"
+    },
+    "resource_admission": {
+      "execution_mode": "structural_mock",
+      "spawn_policy": "VERIFIED_SPAWN_EXCLUDING_RECORDED_DUAL_SPAWN_BLOCKED",
+      "route_policy": "P5_STRICT_PLUS_TOPOLOGY_LENGTH_CONSISTENCY"
     },
     "randomization": {
-      "mode": "fixed",
+      "mode": "seeded_when_random_map_enabled",
       "seed": 202607,
       "events": [
         {
@@ -261,7 +266,8 @@
           "enabled": true,
           "probability": 1.0,
           "parameters": {
-            "road_id": "R1",
+            "road_selection": "active_internal_edge_with_graph_bypass",
+            "maximum_detour_ratio": 4.0,
             "trigger_tick": 30
           }
         }

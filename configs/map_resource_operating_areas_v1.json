@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.0-operating-area-profile",
+  "profile_id": "0325_5-operating-areas-v1",
+  "map_id": "0325_5",
+  "resource_version": "1.0-draft",
+  "source": "OPENPIT_SCENARIO_SEMANTICS_V1",
+  "data_boundary": "业务语义档案。PHYSICAL_ROUTE_ANCHORED仅表示相关单矿卡路线已有P6证据；CANDIDATE_ONLY只允许离线结构化场景，不允许多车CARLA物理运行。",
+  "areas": [
+    {
+      "area_id": "east_slope_hazard_anchor",
+      "display_name": "东帮边坡风险锚定区",
+      "area_type": "hazard_anchor",
+      "selection_mode": "not_selectable",
+      "capacity": 0,
+      "allowed_roles": ["inspection", "risk_monitoring"],
+      "point_spawn_indices": [12, 49],
+      "validation_status": "SYNTHETIC_HAZARD_ANCHOR",
+      "notes": "来自正式边坡演示的参数化合成风险区域锚点；不代表真实矿山灾害边界。"
+    },
+    {
+      "area_id": "h1_review_wait",
+      "display_name": "H1边坡复核与接管待命区",
+      "area_type": "safe_wait",
+      "selection_mode": "fixed_anchor",
+      "capacity": 1,
+      "allowed_roles": ["inspection", "emergency_support"],
+      "point_spawn_indices": [28],
+      "validation_status": "PHYSICAL_ROUTE_ANCHORED",
+      "notes": "矿卡02在正式边坡演示中的驻守点；28到48已完成P6单矿卡物理验证。"
+    },
+    {
+      "area_id": "east_slope_patrol_core",
+      "display_name": "东帮巡检与任务完成核心区",
+      "area_type": "inspection_task_core",
+      "selection_mode": "fixed_anchor",
+      "capacity": 2,
+      "allowed_roles": ["inspection", "emergency_support"],
+      "point_spawn_indices": [48, 78],
+      "validation_status": "PHYSICAL_ROUTE_ANCHORED",
+      "notes": "78到48已完成P6单矿卡物理验证；不包含多车冲突、净空或会车验证。"
+    },
+    {
+      "area_id": "south_patrol_core",
+      "display_name": "南部巡检与保障核心区",
+      "area_type": "inspection_task_core",
+      "selection_mode": "fixed_anchor",
+      "capacity": 2,
+      "allowed_roles": ["inspection", "emergency_support"],
+      "point_spawn_indices": [63, 70],
+      "validation_status": "PHYSICAL_ROUTE_ANCHORED",
+      "notes": "63到70及63到48已完成P6单矿卡物理验证；不包含多车冲突、净空或会车验证。"
+    },
+    {
+      "area_id": "low_bench_six_vehicle_candidate_pool",
+      "display_name": "低标高道路六车候选资源池",
+      "area_type": "candidate_spawn_pool",
+      "selection_mode": "seeded_random_mock_only",
+      "capacity": 8,
+      "allowed_roles": ["haul", "inspection", "support"],
+      "point_spawn_indices": [4, 5, 9, 10, 14, 15, 22, 24, 28, 43, 44, 46, 47, 48, 51, 54, 56, 61, 63, 69, 70],
+      "validation_status": "CANDIDATE_ONLY",
+      "notes": "按P3已验证出生点、低标高道路点和正式演示核心点建立的离线候选池。尚未完成路线、会车、碰撞、净空或多车CARLA验证。"
+    }
+  ]
+}

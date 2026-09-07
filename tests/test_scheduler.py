@@ -120,7 +120,7 @@ class SchedulerTest(unittest.TestCase):
         finally:
             adapter.close()
 
-    def test_mine_takeover_ranks_two_busy_capable_candidates(self):
+    def test_mine_takeover_prefers_idle_h1_standby_candidate(self):
         config = load_config(
             PROJECT_ROOT / "configs" / "mine_competition_demo.json"
         )
@@ -133,11 +133,10 @@ class SchedulerTest(unittest.TestCase):
             initial_assignments = scheduler.assign(
                 tasks, states, config.zones
             )
-            self.assertEqual(3, len(initial_assignments))
+            self.assertEqual(2, len(initial_assignments))
             self.assertEqual(
                 {
                     "routine_zone_01": "inspection_vehicle_01",
-                    "secondary_patrol_zone_02": "inspection_vehicle_02",
                     "southern_transport_patrol_zone_03": (
                         "emergency_vehicle_01"
                     ),
@@ -167,9 +166,12 @@ class SchedulerTest(unittest.TestCase):
                 {"inspection_vehicle_02", "emergency_vehicle_01"},
                 {item.vehicle_id for item in candidates},
             )
-            self.assertTrue(
-                all("active_load=1" in item.reason for item in candidates)
-            )
+            candidate_reasons = {
+                item.vehicle_id: item.reason for item in candidates
+            }
+            self.assertIn("active_load=0", candidate_reasons["inspection_vehicle_02"])
+            self.assertIn("active_load=1", candidate_reasons["emergency_vehicle_01"])
+            self.assertEqual("inspection_vehicle_02", candidates[0].vehicle_id)
         finally:
             adapter.close()
 

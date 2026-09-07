@@ -1,7 +1,7 @@
 """Deterministic capability-aware baseline scheduler."""
 
 from collections import Counter
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .config import ZoneConfig
 from .models import Assignment, Task, VehicleState, utc_now
@@ -18,11 +18,25 @@ class BaselineScheduler:
         self,
         load_penalty: float = 1000.0,
         experience_preferences: Dict[Tuple[str, str], float] = None,
+        distance_provider: Optional[Callable[[VehicleState, ZoneConfig], Optional[float]]] = None,
+        distance_label: str = "distance",
+        constrained_tasks_first: bool = False,
+        unique_vehicle_assignment: bool = False,
     ) -> None:
         self.load_penalty = float(load_penalty)
         self.experience_preferences = dict(
             experience_preferences or {}
         )
+        self.distance_provider = distance_provider
+        self.distance_label = str(distance_label)
+        self.constrained_tasks_first = bool(constrained_tasks_first)
+        self.unique_vehicle_assignment = bool(unique_vehicle_assignment)
+
+    def _distance(self, vehicle: VehicleState, zone: ZoneConfig) -> Optional[float]:
+        if self.distance_provider is None:
+            return vehicle.position.distance_to(zone.mock_position)
+        value = self.distance_provider(vehicle, zone)
+        return None if value is None else float(value)
 
     def rank_candidates(
         self,
@@ -52,7 +66,9 @@ class BaselineScheduler:
                 continue
             if not required.issubset(set(vehicle.capabilities)):
                 continue
-            distance = vehicle.position.distance_to(zone.mock_position)
+            distance = self._distance(vehicle, zone)
+            if distance is None:
+                continue
             load = loads[vehicle.vehicle_id]
             imitation_bonus = self.experience_preferences.get(
                 (task.task_type, vehicle.vehicle_id), 0.0
@@ -65,9 +81,9 @@ class BaselineScheduler:
                     vehicle_id=vehicle.vehicle_id,
                     score=round(score, 3),
                     reason=(
-                        "capabilities matched; distance={:.2f}m; "
+                        "capabilities matched; {}={:.2f}m; "
                         "active_load={}; imitation_bonus={:.2f}m"
-                    ).format(distance, load, imitation_bonus),
+                    ).format(self.distance_label, distance, load, imitation_bonus),
                 )
             )
         return sorted(
@@ -84,6 +100,8 @@ class BaselineScheduler:
     ) -> List[Assignment]:
         zone_by_id: Dict[str, ZoneConfig] = {zone.zone_id: zone for zone in zones}
         excluded: Set[str] = set(excluded_vehicle_ids)
+        if self.unique_vehicle_assignment:
+            return self._assign_unique(tasks, vehicles, zones, excluded)
         loads = Counter(
             task.assigned_vehicle_id
             for task in tasks
@@ -91,10 +109,21 @@ class BaselineScheduler:
         )
         assignments: List[Assignment] = []
 
-        ordered_tasks = sorted(
-            tasks,
-            key=lambda task: (-task.priority, task.created_at, task.task_id),
-        )
+        def task_order(task):
+            if not self.constrained_tasks_first:
+                return (-task.priority, task.created_at, task.task_id)
+            zone = zone_by_id[task.zone_id]
+            required = set(task.required_capabilities)
+            eligible_count = sum(
+                vehicle.vehicle_id not in excluded
+                and vehicle.available and vehicle.health == "healthy"
+                and required.issubset(set(vehicle.capabilities))
+                and self._distance(vehicle, zone) is not None
+                for vehicle in vehicles
+            )
+            return (eligible_count, -task.priority, task.created_at, task.task_id)
+
+        ordered_tasks = sorted(tasks, key=task_order)
         for task in ordered_tasks:
             if task.status in {"completed", "timed_out", "cancelled"}:
                 continue
@@ -120,7 +149,9 @@ class BaselineScheduler:
                     continue
                 if not required.issubset(set(vehicle.capabilities)):
                     continue
-                distance = vehicle.position.distance_to(zone.mock_position)
+                distance = self._distance(vehicle, zone)
+                if distance is None:
+                    continue
                 imitation_bonus = self.experience_preferences.get(
                     (task.task_type, vehicle.vehicle_id), 0.0
                 )
@@ -159,7 +190,7 @@ class BaselineScheduler:
                     vehicle_id=selected.vehicle_id,
                     score=round(score, 3),
                     reason=(
-                        "{}capabilities matched; distance={:.2f}m; "
+                        "{}capabilities matched; {}={:.2f}m; "
                         "prior_load={}; imitation_bonus={:.2f}m"
                     ).format(
                         (
@@ -168,7 +199,8 @@ class BaselineScheduler:
                             == task.preferred_vehicle_id
                             else ""
                         ),
-                        selected.position.distance_to(zone.mock_position),
+                        self.distance_label,
+                        self._distance(selected, zone),
                         loads[selected.vehicle_id] - 1,
                         self.experience_preferences.get(
                             (task.task_type, selected.vehicle_id),
@@ -178,6 +210,60 @@ class BaselineScheduler:
                 )
             )
 
+        return assignments
+
+    def _assign_unique(self, tasks, vehicles, zones, excluded):
+        """Find the minimum-cost one-task-per-vehicle assignment.
+
+        Intended for small structural fleets.  It avoids greedy dead ends and
+        is opt-in so all established baseline behavior remains unchanged.
+        """
+        pending = [task for task in tasks
+                   if task.status not in {"completed", "timed_out", "cancelled"}]
+        ranked = {}
+        for task in pending:
+            candidates = self.rank_candidates(task, vehicles, zones,
+                                              excluded_vehicle_ids=excluded)
+            if task.preferred_vehicle_id:
+                preferred = [item for item in candidates
+                             if item.vehicle_id == task.preferred_vehicle_id]
+                candidates = preferred or candidates
+            if not candidates:
+                raise SchedulingError("No eligible vehicle for task {} requiring {}".format(
+                    task.task_id, sorted(task.required_capabilities)))
+            ranked[task.task_id] = candidates
+        ordered = sorted(pending, key=lambda item: (len(ranked[item.task_id]),
+                                                    -item.priority, item.task_id))
+        best_cost, best = None, None
+
+        def search(index, used, cost, chosen):
+            nonlocal best_cost, best
+            if best_cost is not None and cost >= best_cost:
+                return
+            if index == len(ordered):
+                best_cost, best = cost, list(chosen)
+                return
+            task = ordered[index]
+            for candidate in ranked[task.task_id]:
+                if candidate.vehicle_id in used:
+                    continue
+                search(index + 1, used | {candidate.vehicle_id},
+                       cost + candidate.score, chosen + [(task, candidate)])
+
+        search(0, set(), 0.0, [])
+        if best is None:
+            raise SchedulingError("No one-task-per-vehicle assignment exists")
+        assignments = []
+        for task, candidate in best:
+            task.assigned_vehicle_id = candidate.vehicle_id
+            task.status = "assigned"
+            task.updated_at = utc_now()
+            task.status_reason = "assigned_by_global_unique_scheduler"
+            assignments.append(Assignment(
+                task_id=candidate.task_id, zone_id=candidate.zone_id,
+                vehicle_id=candidate.vehicle_id, score=candidate.score,
+                reason=candidate.reason + "; global_unique_assignment",
+            ))
         return assignments
 
 

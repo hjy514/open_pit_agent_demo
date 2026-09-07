@@ -29,6 +29,352 @@ python -m pip install -r requirements.txt
 ```bash
 ./start_api.sh
 ```
+
+## 正式运行入口
+
+日常运行和比赛演示只需关注下列入口：
+
+| 入口 | 用途 |
+|---|---|
+| `./start_carla.sh` | 以CARLA默认画质启动仿真端 |
+| `./start_api.sh` | 启动Agent API |
+| `./start_dispatch_app.sh` | 启动PyQt6调度中心 |
+| `./start_slope_demo.sh` | 启动正式边坡失稳Demo |
+| `./check_environment.sh` | 执行只读启动前健康检查 |
+| `./run_scenario.sh` | 正式统一场景入口；按场景和模式路由 |
+| `scripts/run_scenario.py` | 结构化多场景内部实现，一般无需直接调用 |
+| `./map_resources.sh` | 统一的地图资源建设与验证入口 |
+
+`start_demo.sh`、`start_desktop.sh`和`start_mine_demo.sh`是早期浏览器态势台/启动器的历史兼容入口，不再作为当前正式比赛流程的首选命令。
+
+查看所有已实现及规划中的场景：
+
+```bash
+./run_scenario.sh --list-scenarios
+```
+
+六车随机地图S01结构化运行：
+
+```bash
+./run_scenario.sh \
+  --scenario s01 \
+  --mode structural \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202601
+```
+
+该入口默认执行`--policy heuristic`，并将运行摘要、V0实际基线决策和
+V1影子多目标决策写入`artifacts/runs/`和`data/database/openpit.db`。
+仅需临时调试且不保存时可加`--no-record`。
+
+同一个S01 Seed也可以真正执行多目标优化策略：
+
+```bash
+./run_scenario.sh \
+  --scenario s01 \
+  --mode structural \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202601 \
+  --policy multi-objective
+```
+
+该模式按“硬约束→合法候选→归一化多目标代价→全局唯一分配”执行，
+同时保留Heuristic V0对照，输出两者的选择变化、归一化总代价和路线总长。
+`openpit.db`中的`scenario_runs.policy_version`记录本轮真实执行策略。
+当前多目标执行开关覆盖随机地图S01初始分配和S02故障接管；S07仍执行确定性
+路网决策，不能把本功能说成CARLA车辆控制策略已切换。
+
+S01–S07与S09已接入同一CARLA多场景执行桥接。场景由
+`--scenario`选择，不为每个场景另建启动脚本。首先进行不生成车辆的连接和资源准入检查：
+
+```bash
+./run_scenario.sh \
+  --scenario s01 \
+  --mode carla \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202601 \
+  --check-only
+```
+
+将`s01`换成`s02`、`s03`、`s04`、`s05`、`s06`、`s07`或`s09`
+即可检查相应场景；S09建议使用`--vehicle-count 8`。检查通过后可先执行短流程验证：
+
+```bash
+./run_scenario.sh \
+  --scenario s01 \
+  --mode carla \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202601 \
+  --ticks 120
+```
+
+该路径复用结构化决策、`CarlaAdapter`和`BasicAgent`。S02执行故障停车与任务改派，
+S03切换作业目标，S04/S06执行暂停与恢复，S05执行限速与速度恢复，
+S07/S09执行重规划或换车接管。执行反馈、事件和闭环Cycle由统一证据入口写入
+`openpit.db`与`artifacts/runs/`，退出时只销毁本轮生成车辆。封路和天气是参数化合成事件；
+未经某个Seed的CARLA完整实跑，不应宣称该Seed已通过物理验证。
+
+S02可在同一地图资源工作负载中按Seed选择一个具有合法备用接管车辆的
+故障对象，验证任务释放、硬约束剔除、V0/V1接管对比和数据库记录：
+
+```bash
+./run_scenario.sh \
+  --scenario s02 \
+  --mode structural \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202602
+```
+
+指定`--policy multi-objective`后，初始任务分配仍保持Heuristic V0，故障后的
+接管车辆改由MultiObjective V1实际选择。当前结构化S02可用的真实区分量主要是
+P5路线长度；等待、延误和恢复时间仍为`NOT_AVAILABLE`，因此多目标结果可能与
+最短路线V0完全相同。这是数据边界，不应人为增加Penalty制造“优化效果”。
+随机地图S01/S02中，Heuristic V0和MultiObjective V1现在都通过同一
+`ClosedLoopCoordinator`和Safety Shield执行门，并向`closed_loop_cycles`
+写入相同格式的State、Action、Feedback和Next State，可用于同Seed对照。
+可使用现有统一入口自动完成配对A/B运行与汇总：
+
+```bash
+./run_scenario.sh \
+  --scenario s01 \
+  --compare-policies \
+  --runs 10 \
+  --vehicle-count 6 \
+  --seed 202700
+```
+
+`--compare-policies`仅支持随机地图S01/S02，会对每个Seed分别执行
+Heuristic V0和MultiObjective V1，并在同一批次摘要中输出配对通过率、
+车辆选择变化、归一化代价、路线长度变化和Safety Shield状态。
+
+该命令仍是结构化Mock；P5可达路线是静态规划事实，不等同于多车CARLA
+物理行驶、会车、净空或碰撞安全验证。
+
+S03装载设备故障与替代作业点切换：
+
+```bash
+./run_scenario.sh \
+  --scenario s03 \
+  --mode structural \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202603
+```
+
+系统从本轮运输任务中选择一个关联装载设备，注入参数化设备故障，将故障
+作业点作为硬约束排除，并从`map_resources.db`中选择该车辆可达且不同的替代
+作业点。受影响车辆保持任务所有权并切换路线，其他车辆继续原任务。设备故障
+和作业点切换时间是合成场景输入，路线是静态地图资源事实，不代表CARLA设备
+物理故障、真实产量或真实作业节拍。
+
+S04爆破作业与临时危险区管控：
+
+```bash
+./run_scenario.sh \
+  --scenario s04 \
+  --mode structural \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202604
+```
+
+系统复用S07的真实拓扑道路约束与绕行能力，在爆破预告后对一条只影响部分
+车辆的道路实施临时管控。有安全绕行路线时由原车绕行；没有安全绕行路线时，
+原车等待爆破区域解除后继续任务，不因短时管控无依据地换车。当前危险范围只
+声明为`TOPOLOGY_EDGE_ANCHOR_ONLY`，不等同于真实爆破半径或CARLA爆破物理模型。
+
+S05极端降雨与道路能力下降：
+
+```bash
+./run_scenario.sh \
+  --scenario s05 \
+  --mode structural \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202605
+```
+
+系统从当前任务使用的真实拓扑边中选择只影响部分车辆的路段，按Seed生成
+参数化降雨、能见度和安全速度折减，然后比较原路线降速通行与规避该路段的
+绕行ETA。天气数值属于`PARAMETERIZED_SYNTHETIC_SCENARIO`，ETA属于
+`SURROGATE_ONLY_NOT_CARLA_MEASURED`，均不代表真实矿山观测或CARLA实测。
+
+S06共享道路拥堵与安全放行：
+
+```bash
+./run_scenario.sh \
+  --scenario s06 \
+  --mode structural \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202606
+```
+
+系统从本轮任务的真实拓扑路线中选择至少由两辆车共享、但不影响全部车辆的
+内部道路段，将其容量设置为1，并依据预计到达时间、任务优先级、占用时间和
+最小安全车头时距生成排队放行决策。道路拓扑和路线长度来自`map_resources.db`；
+初始阻塞、容量及车头时距是可复现的参数化场景输入；到达、等待和通过时间是
+基于路线长度与配置目标速度的工程估算，不是Traffic Manager或CARLA实测。
+
+当P5全图点对标定完成且路网已导入后，可将严格可达点对转换为
+可供S07识别受影响任务的有向路网边序列：
+
+```bash
+./map_resources.sh build-route-candidates
+```
+
+该命令只读取已有的CARLA拓扑与P5结果，无需启动CARLA。符合
+P5/拓扑长度一致性门槛的记录标为`TOPOLOGY_DERIVED_UNVERIFIED`，偏差
+过大的记录标为`TOPOLOGY_LENGTH_MISMATCH`并不进入S07；两者都不是
+重型矿卡物理通行证明。
+
+S07可在这些路网候选上运行可复现的6/8车随机道路中断闭环：
+
+```bash
+./run_scenario.sh \
+  --scenario s07 \
+  --mode structural \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202607
+```
+
+场景只从当前任务路线的真实内部路网边中选择中断点，要求只影响
+部分车辆。原车有合法绕行路线时保持原任务；原车无路可绕时，才从非受影响
+车辆中按能力、路网一致性、关闭边规避和绕行比例硬约束选择接管车辆。
+接管车的原任务保留，新任务作为后续任务；其他未受影响任务不重新调度。
+这仍是离线结构化验证，不是多车
+CARLA物理通行结论。
+
+S01至S07及S09的统一批量闭环入口：
+
+```bash
+./run_scenario.sh \
+  --scenario all \
+  --mode structural \
+  --runs 10 \
+  --vehicle-count 6 \
+  --seed 202607 \
+  --policy auto
+```
+
+`--scenario all`会自动启用地图资源约束随机模式。每个场景每轮都作为独立
+Run写入`openpit.db`，并在`artifacts/batches/<batch_id>/summary.json`
+生成任务完成率、故障接管率、路线重规划率和失败原因汇总。临时验证
+可加`--no-record`，此时数据库和批次文件都不写入。
+
+`--policy auto`是批量采集策略编排：S01/S02自动执行多目标调度，
+S03至S07及S09执行各自的安全事件策略。每批结束后还会自动将
+本批`closed_loop_cycles`导出到
+`data/datasets/openpit-closed-loop-transition-v1/<batch_id>/`；通过
+`run_id_filter`保证不混入历史运行。
+
+批量采集前可对运行数据库做只读健康检查：
+
+```bash
+./run_scenario.sh --database-health --stale-hours 24
+```
+
+报告包含Run状态、表记录数、事件量、高量Run和闭环场景覆盖。
+该命令不修改数据。确认后可显式将超过阈值且仍为
+`running/planned`的中断Run标记为`INCOMPLETE`：
+
+```bash
+./run_scenario.sh --repair-stale-runs --stale-hours 24
+```
+
+修复不删除运行、事件或证据。新Run在未产生终结摘要即退出时，
+会自动收尾为`INCOMPLETE`，避免继续积累伪`running`记录。
+
+现有CARLA边坡失稳Golden Demo也通过同一入口启动：
+
+```bash
+./run_scenario.sh --scenario s08 --mode carla
+```
+
+它内部复用`start_slope_demo.sh`，没有复制风险、调度或CARLA控制代码。
+运行前仍需先启动CARLA、Agent API和PyQt调度中心。仅检查启动条件时使用：
+
+```bash
+./run_scenario.sh --scenario s08 --mode carla --check-only
+```
+
+S09复合扰动已纳入同一入口：
+
+```bash
+./run_scenario.sh \
+  --scenario s09 \
+  --mode structural \
+  --random-map \
+  --vehicle-count 6 \
+  --seed 202609
+```
+
+S09 V1在同一份Seed地图、车队和任务状态上，按顺序施加“道路封闭→车辆
+故障”两个参数化合成事件。系统先处理受影响路线，再释放故障车任务，
+只在能力匹配、P5点对可用且路线避开封闭边的合法候选中选择接管车。
+不可执行的随机组合会在20次上限内按固定规则重采样，并保留`workload_seed`
+和`generation_attempt`；不会放松安全硬约束。当前仍属于结构化闭环验证，
+不代表六车或八车已完成CARLA物理实跑。
+
+默认记录模式还会在
+`data/datasets/openpit-structural-transition-v1/<batch_id>/`生成
+`transitions.jsonl`和`manifest.json`。S01任务分派、S02车辆故障重分配、
+S03作业点切换、S04爆破管控、S05天气响应、S06道路放行、S07封路重规划和
+S09复合事件共用同一
+`state/action/result/next_state/done`格式。
+当前是“决策到结构化终态”的离线样本，可用于BC数据准备和分析。
+`structural-terminal-reward-v1`只对任务终态、闭环证据、场景恢复、换车和可计算绕行代价
+进行透明评价，权重为尚未经敏感性验证的初始工程权重。CARLA逐步物理反馈、
+真实能耗和碰撞指标仍为`NOT_AVAILABLE`，且数据仍明确标记不可直接用于PPO训练。
+
+`manifest.json` 内置数据质量报告，统计每个场景的Seed覆盖、动作类型、
+车辆选择、故障车、封路边和Reward分布，并检查重复ID、关键字段缺失、
+场景缺失、闭环证据及源运行失败。失败运行只如实列入报告，不会伪造成训练Transition。
+
+将已通过质量检查的多个批次聚合成不可变数据集版本：
+
+```bash
+./run_scenario.sh \
+  --aggregate-datasets \
+  --dataset-version structural-bc-v1-YYYYMMDD \
+  --split-seed 202616
+```
+
+输出位于`data/datasets/openpit-structural-transition-v1/versions/<version>/`，
+包含`train.jsonl`、`validation.jsonl`、`test.jsonl`和`manifest.json`。
+划分以Seed为最小单位，不允许同一Seed跨集合；在保持集合大小和Seed隔离的
+前提下，系统会交换整组Seed以尽量覆盖所有场景和动作类型。
+若原始数据无法满足覆盖，则输出`DATASET_VERSION_READY_WITH_COVERAGE_WARNINGS`，
+不隐藏数据偏斜。
+
+训练不带CARLA执行权限的BC候选车辆排序模型：
+
+```bash
+./run_scenario.sh \
+  --train-bc \
+  --dataset-version structural-bc-v1-110seeds-20260906 \
+  --model-version bc-dispatch-v1-YYYYMMDD \
+  --epochs 400
+```
+
+模型仅在硬约束通过的候选集中学习Softmax排序，并保存在
+`data/models/dispatch_policy/<model_version>/`。当前仅为离线Shadow Policy，
+无权向CARLA发送命令；未通过A/B、Safety Shield和CARLA回归前不得提升为执行策略。
+首个110-Seed模型的多候选测试准确率为48.94%，仅略高于47.52%的均匀机会基线；
+它能完整复现故障重分配样本，但不能仅凭单任务特征复现全局唯一分配。
+因此当前`promotion_status=NOT_PROMOTED`。
+
+批量结果同时区分`status=PASS`和`closed_loop_status=CLOSED_LOOP_PASS`。
+前者只表示程序正常结束，后者还要通过场景业务规则和SQLite证据检查。
+默认记录模式会在`metrics`表写入`closed_loop_evidence_pass`；
+`--no-record`时数据库验收状态为`NOT_AVAILABLE`，不会伪造入库结论。
+
 ## 新电脑快速配置
 
 本项目已将 open_pit_dispatch_app 纳入同一仓库。默认情况下，
@@ -66,7 +412,23 @@ export OPENPIT_CARLA_ROOT="/实际路径/CARLA_0.9.10"
 ./start_slope_demo.sh --check-only
 ```
 
-另开终端运行 Mock 演示或完整演示：
+正式启动场景前，建议先运行只读健康检查。它会检查当前 CARLA
+服务、目标矿山地图的出生点和路网拓扑、矿卡蓝图及两个 SQLite
+数据库；不会切换地图、生成车辆或修改任何数据：
+
+```bash
+./check_environment.sh
+```
+
+如 Agent API 与调度中心已经启动，可额外检查：
+
+```bash
+./check_environment.sh \
+  --check-api \
+  --check-ui
+```
+
+如需回归早期浏览器态势台，可使用历史兼容入口：
 
 ```bash
 ./start_demo.sh --check-only
@@ -193,8 +555,8 @@ cd /home/hjy/open_pit_agent_demo
 先在桌面终端启动 CARLA：
 
 ```bash
-cd /home/hjy/桌面/carla0.9.10_package/CARLA_0.9.10-dirty
-./CarlaUE4.sh -quality-level=Low
+cd /home/xiaoa/矿山调度/open_pit_agent_demo
+./start_carla.sh
 ```
 
 另开终端，只检查连接和当前车辆：
@@ -314,9 +676,9 @@ artifacts/runs/town03-red-response-v1-20260801T073742Z-9ae20f38
 
 完整设计和结果见 `docs/05_red_risk_multi_action_response.md`。
 
-## 8. 一键启动完整Demo
+## 8. 历史兼容：浏览器态势台一键启动
 
-首选使用方式：
+该入口用于回归早期浏览器态势台：
 
 ```bash
 cd /home/hjy/open_pit_agent_demo
@@ -359,9 +721,9 @@ cd /home/hjy/open_pit_agent_demo
 ./start_demo.sh --keep-carla
 ```
 
-## 9. 仅启动独立桌面窗口
+## 9. 历史兼容：仅启动早期独立桌面窗口
 
-推荐使用方式：
+该入口用于回归早期独立窗口：
 
 ```bash
 cd /home/hjy/open_pit_agent_demo

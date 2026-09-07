@@ -1,0 +1,12 @@
+{
+  "profile_id": "slope-demo-physical-routes-v1",
+  "map_id": "0325_5",
+  "description": "P6单矿卡真实行驶验证范围。每条路线独立生成一辆vehicle.cat.cat并在结束时销毁。结果只表示该次默认蓝图、目标速度与地图版本下的单车尝试，不代表多车安全。",
+  "routes": [
+    {"route_id": "vehicle01_original_patrol", "from_spawn_point_index": 78, "to_spawn_point_index": 48, "purpose": "矿区巡检矿卡01原任务"},
+    {"route_id": "vehicle02_original_patrol", "from_spawn_point_index": 28, "to_spawn_point_index": 63, "purpose": "边坡复核矿卡02原任务"},
+    {"route_id": "vehicle03_original_patrol", "from_spawn_point_index": 63, "to_spawn_point_index": 70, "purpose": "综合巡检矿卡03原任务"},
+    {"route_id": "vehicle02_takeover_vehicle01_task", "from_spawn_point_index": 28, "to_spawn_point_index": 48, "purpose": "矿卡02接管矿卡01原任务"},
+    {"route_id": "vehicle03_takeover_vehicle01_task", "from_spawn_point_index": 63, "to_spawn_point_index": 48, "purpose": "矿卡03接管矿卡01原任务"}
+  ]
+}

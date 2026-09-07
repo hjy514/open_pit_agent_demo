@@ -6,10 +6,14 @@ run_demo.py通过HTTP /runtime/sync向API进程推送状态。
 规划路线和历史轨迹的地图数据管理。
 """
 
+from copy import deepcopy
 from datetime import datetime
 from threading import RLock
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+
+EXECUTION_FEEDBACK_SCHEMA_VERSION = "openpit.execution-feedback.v1"
 
 
 class RuntimeState:
@@ -38,6 +42,15 @@ class RuntimeState:
         ]
 
         self.environment: Dict[str, Any] = {}
+        self.roads: Dict[str, Any] = {}
+        self.traffic: Dict[str, Any] = {}
+        self.equipment: Dict[str, Any] = {}
+        self.scenario: Dict[str, Any] = {}
+        self.execution: Dict[str, Any] = {}
+        self.feedback: Dict[str, Any] = {}
+        self.execution_feedback_history: List[Dict[str, Any]] = []
+        self.state_revision = 0
+        self.lifecycle: Dict[str, Any] = {}
         self.risk: Dict[str, Any] = {
             "level": "UNKNOWN",
             "assessment": [],
@@ -80,6 +93,15 @@ class RuntimeState:
         self.tasks = []
         self.events = []
         self.environment = {}
+        self.roads = {}
+        self.traffic = {}
+        self.equipment = {}
+        self.scenario = {}
+        self.execution = {}
+        self.feedback = {}
+        self.execution_feedback_history = []
+        self.state_revision = 0
+        self.lifecycle = {}
         self.risk = {
             "level": "UNKNOWN",
             "assessment": [],
@@ -115,14 +137,15 @@ class RuntimeState:
         with self._command_lock:
             self.commands = []
 
-    def add_event(self, event_type, message):
-        self.events.append(
-            {
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "type": event_type,
-                "message": message,
-            }
-        )
+    def add_event(self, event_type, message, payload=None):
+        event = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "type": event_type,
+            "message": message,
+        }
+        if isinstance(payload, dict):
+            event["payload"] = dict(payload)
+        self.events.append(event)
         if len(self.events) > 1000:
             self.events = self.events[-1000:]
 
@@ -228,8 +251,146 @@ class RuntimeState:
             "timestamp": vehicle.get("timestamp"),
         }
 
+    @staticmethod
+    def _task_id(task):
+        if not isinstance(task, dict):
+            return None
+        value = task.get("task_id") or task.get("id")
+        return str(value) if value is not None else None
+
+    @staticmethod
+    def _vehicle_id(vehicle):
+        if not isinstance(vehicle, dict):
+            return None
+        value = vehicle.get("vehicle_id") or vehicle.get("id")
+        return str(value) if value is not None else None
+
+    def _merge_task_feedback(self, task_states):
+        tasks_by_id = {
+            self._task_id(item): dict(item)
+            for item in self.tasks if self._task_id(item) is not None
+        }
+        order = [
+            self._task_id(item) for item in self.tasks
+            if self._task_id(item) is not None
+        ]
+        for state in task_states:
+            task_id = self._task_id(state)
+            if task_id is None:
+                continue
+            if task_id not in tasks_by_id:
+                order.append(task_id)
+                tasks_by_id[task_id] = {}
+            tasks_by_id[task_id].update(dict(state))
+        self.tasks = [tasks_by_id[task_id] for task_id in order]
+
+    def _merge_vehicle_feedback(self, vehicle_states):
+        vehicles_by_id = {
+            self._vehicle_id(item): dict(item)
+            for item in self.vehicles if self._vehicle_id(item) is not None
+        }
+        order = [
+            self._vehicle_id(item) for item in self.vehicles
+            if self._vehicle_id(item) is not None
+        ]
+        for state in vehicle_states:
+            vehicle_id = self._vehicle_id(state)
+            if vehicle_id is None:
+                continue
+            if vehicle_id not in vehicles_by_id:
+                order.append(vehicle_id)
+                vehicles_by_id[vehicle_id] = {}
+            vehicles_by_id[vehicle_id].update(dict(state))
+        self.vehicles = [
+            self._normalize_vehicle(vehicles_by_id[vehicle_id])
+            for vehicle_id in order
+        ]
+
+    @staticmethod
+    def _feedback_identity(feedback):
+        return (
+            str(feedback.get("command_id") or ""),
+            str(feedback.get("phase") or ""),
+            str(feedback.get("timestamp") or ""),
+        )
+
+    def apply_execution_feedback(self, feedback):
+        """Merge factual execution feedback into the runtime source of truth."""
+        if not isinstance(feedback, dict):
+            raise ValueError("execution feedback must be an object")
+        schema_version = feedback.get("schema_version")
+        if schema_version != EXECUTION_FEEDBACK_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported execution feedback schema: {}".format(
+                    schema_version
+                )
+            )
+        for required in ("command_id", "phase", "status"):
+            if not str(feedback.get(required) or "").strip():
+                raise ValueError("execution feedback requires {}".format(required))
+
+        task_states = feedback.get("task_states", [])
+        vehicle_states = feedback.get("vehicle_states", [])
+        if isinstance(task_states, list):
+            self._merge_task_feedback([
+                item for item in task_states if isinstance(item, dict)
+            ])
+        if isinstance(vehicle_states, list):
+            self._merge_vehicle_feedback([
+                item for item in vehicle_states if isinstance(item, dict)
+            ])
+
+        identity = self._feedback_identity(feedback)
+        if any(
+            self._feedback_identity(item) == identity
+            for item in self.execution_feedback_history
+        ):
+            return False
+
+        record = dict(feedback)
+        self.execution_feedback_history.append(record)
+        if len(self.execution_feedback_history) > 500:
+            self.execution_feedback_history = self.execution_feedback_history[-500:]
+        merged_feedback = dict(self.feedback)
+        merged_feedback["latest_execution_feedback"] = record
+        merged_feedback["execution_feedback_count"] = len(
+            self.execution_feedback_history
+        )
+        self.feedback = merged_feedback
+        self.state_revision += 1
+
+        for event in feedback.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("event_type") or event.get("type") \
+                or "execution_event"
+            message = event.get("message") or "{} {}".format(
+                feedback["command_id"], event_type
+            )
+            self.add_event(event_type, message, payload=event)
+        self.add_event(
+            "execution_feedback_applied",
+            "{} {}：{}".format(
+                feedback["command_id"], feedback["phase"], feedback["status"]
+            ),
+            payload={
+                "command_id": feedback["command_id"],
+                "phase": feedback["phase"],
+                "status": feedback["status"],
+                "physical_execution": bool(feedback.get("physical_execution")),
+                "measurement_status": feedback.get("measurement_status"),
+                "safety_gate_status": feedback.get("safety_gate_status"),
+                "state_revision": self.state_revision,
+            },
+        )
+        return True
+
     def sync_snapshot(self, payload):
-        vehicles = payload.get("vehicles")
+        world_state = payload.get("world_state")
+        if not isinstance(world_state, dict):
+            world_state = {}
+
+        vehicles = world_state.get("vehicles", payload.get("vehicles"))
         if isinstance(vehicles, list):
             self.vehicles = [
                 self._normalize_vehicle(item)
@@ -237,7 +398,7 @@ class RuntimeState:
                 if isinstance(item, dict)
             ]
 
-        tasks = payload.get("tasks")
+        tasks = world_state.get("tasks", payload.get("tasks"))
         if isinstance(tasks, list):
             self.tasks = [
                 dict(item)
@@ -245,7 +406,7 @@ class RuntimeState:
                 if isinstance(item, dict)
             ]
 
-        run_id = payload.get("run_id")
+        run_id = world_state.get("run_id") or payload.get("run_id")
         if run_id:
             self.run_id = str(run_id)
 
@@ -253,7 +414,7 @@ class RuntimeState:
         if map_name:
             self.map_name = str(map_name)
 
-        environment = payload.get("environment")
+        environment = world_state.get("environment", payload.get("environment"))
         if isinstance(environment, dict):
             merged_environment = dict(self.environment)
             merged_environment.update(environment)
@@ -261,7 +422,7 @@ class RuntimeState:
             if environment.get("map_name"):
                 self.map_name = str(environment.get("map_name"))
 
-        risk = payload.get("risk")
+        risk = world_state.get("risk", payload.get("risk"))
         if isinstance(risk, dict):
             normalized_risk = dict(risk)
             normalized_risk.setdefault(
@@ -275,11 +436,39 @@ class RuntimeState:
             self.decision = dict(decision)
 
         monitoring = payload.get("monitoring")
+        if isinstance(world_state.get("monitoring"), dict):
+            monitoring = world_state.get("monitoring")
         if isinstance(monitoring, dict):
             merged_monitoring = dict(self.monitoring)
             merged_monitoring.update(monitoring)
             merged_monitoring["updated_at"] = datetime.now().isoformat()
             self.monitoring = merged_monitoring
+
+        for field_name in ("roads", "traffic", "equipment"):
+            value = world_state.get(field_name, payload.get(field_name))
+            if isinstance(value, dict):
+                setattr(self, field_name, dict(value))
+
+        run_context = payload.get("run_context")
+        if isinstance(run_context, dict):
+            self.scenario = dict(run_context)
+        execution = payload.get("execution")
+        if isinstance(execution, dict):
+            self.execution = dict(execution)
+        outcome = payload.get("outcome")
+        if isinstance(outcome, dict):
+            self.feedback = dict(outcome)
+        lifecycle = payload.get("lifecycle")
+        if isinstance(lifecycle, dict):
+            self.lifecycle = dict(lifecycle)
+
+        execution_feedback = payload.get("execution_feedback", [])
+        if isinstance(execution_feedback, dict):
+            execution_feedback = [execution_feedback]
+        if isinstance(execution_feedback, list):
+            for feedback in execution_feedback:
+                if isinstance(feedback, dict):
+                    self.apply_execution_feedback(feedback)
 
         assignments = payload.get("assignments")
         if isinstance(assignments, list) and assignments:
@@ -461,6 +650,17 @@ class RuntimeState:
         return {
             "agents": self.agents,
             "environment": self.environment,
+            "roads": self.roads,
+            "traffic": self.traffic,
+            "equipment": self.equipment,
+            "scenario": self.scenario,
+            "execution": self.execution,
+            "feedback": self.feedback,
+            "execution_feedback_history": list(
+                self.execution_feedback_history
+            ),
+            "state_revision": self.state_revision,
+            "lifecycle": self.lifecycle,
             "risk": self.risk,
             "decision": self.decision,
             "monitoring": self.monitoring,
@@ -657,6 +857,22 @@ class RuntimeState:
             "updated_at": datetime.now().isoformat(),
         }
 
+    def get_world_state(self):
+        """Return one simulator-neutral snapshot from the authoritative state."""
+        return {
+            "schema_version": "openpit.world-state.v1",
+            "run_id": self.run_id,
+            "state_revision": self.state_revision,
+            "vehicles": deepcopy(self.vehicles),
+            "tasks": deepcopy(self.tasks),
+            "roads": deepcopy(self.roads),
+            "environment": deepcopy(self.environment),
+            "monitoring": deepcopy(self.monitoring),
+            "risk": deepcopy(self.risk),
+            "traffic": deepcopy(self.traffic),
+            "equipment": deepcopy(self.equipment),
+        }
+
     def get_state(self):
         return {
             "vehicles": self.vehicles,
@@ -664,6 +880,17 @@ class RuntimeState:
             "events": self.events,
             "agents": self.agents,
             "environment": self.environment,
+            "roads": self.roads,
+            "traffic": self.traffic,
+            "equipment": self.equipment,
+            "scenario": self.scenario,
+            "execution": self.execution,
+            "feedback": self.feedback,
+            "execution_feedback_history": list(
+                self.execution_feedback_history
+            ),
+            "state_revision": self.state_revision,
+            "lifecycle": self.lifecycle,
             "risk": self.risk,
             "decision": self.decision,
             "monitoring": self.monitoring,

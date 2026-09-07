@@ -28,8 +28,7 @@ API可用时直接复用现有CARLA，不启动新实例，也不获得该进程
 启动器固定执行：
 
 ```text
-/home/hjy/桌面/carla0.9.10_package/CARLA_0.9.10-dirty/CarlaUE4.sh
--quality-level=Low
+/home/xiaoa/矿山调度/open_pit_agent_demo/start_carla.sh
 ```
 
 CARLA使用独立进程组启动，日志写入：

@@ -1,6 +1,8 @@
 import sys
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -8,7 +10,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from open_pit_agent.adapters.carla_adapter import CarlaAdapter
+from open_pit_agent.adapters.carla_adapter import CarlaAdapter, CarlaAdapterError
 from open_pit_agent.config import load_config
 from open_pit_agent.models import Position, Task
 
@@ -90,7 +92,9 @@ class FakeSpectator:
 
 
 class FakeActor:
-    def __init__(self):
+    def __init__(self, actor_id=1):
+        self.id = actor_id
+        self.destroyed = False
         self.location = FakeLocation()
         self.last_control = None
         self.physics_enabled = True
@@ -118,6 +122,10 @@ class FakeActor:
     def set_target_angular_velocity(self, velocity):
         self.target_angular_velocity = velocity
 
+    def destroy(self):
+        self.destroyed = True
+        return True
+
 
 class FakeCarla:
     @staticmethod
@@ -142,6 +150,31 @@ class FakeCarla:
 
 
 class CarlaAdapterLifecycleTest(unittest.TestCase):
+    def test_destroy_spawned_vehicles_only_removes_owned_actors(self):
+        config = load_config(
+            PROJECT_ROOT / "configs" / "mine_competition_demo.json"
+        )
+        adapter = CarlaAdapter(config)
+        owned = FakeActor(actor_id=101)
+        discovered = FakeActor(actor_id=202)
+        adapter._actors = {"owned": owned, "discovered": discovered}
+        adapter.spawned_actor_ids = [101]
+
+        self.assertEqual(1, adapter.destroy_spawned_vehicles())
+        self.assertTrue(owned.destroyed)
+        self.assertFalse(discovered.destroyed)
+        self.assertNotIn("owned", adapter._actors)
+        self.assertIn("discovered", adapter._actors)
+
+    def test_local_environment_root_overrides_stale_configured_root(self):
+        config = load_config(PROJECT_ROOT / "configs" / "mine_competition_demo.json")
+        adapter = CarlaAdapter(config)
+        with patch.dict(os.environ, {"OPENPIT_CARLA_ROOT": "/tmp/local-carla"}):
+            with patch("open_pit_agent.adapters.carla_adapter.glob.glob", return_value=[]):
+                with self.assertRaises(CarlaAdapterError) as raised:
+                    adapter._import_carla()
+        self.assertIn("/tmp/local-carla/PythonAPI/carla/dist", str(raised.exception))
+
     def test_hazard_route_progress_is_frozen_ahead_of_affected_truck(self):
         config = load_config(
             PROJECT_ROOT / "configs" / "mine_competition_demo.json"
