@@ -30,7 +30,6 @@ S02 不能只要求“有足够多的成功路线”，还必须存在“故障�
 
 ## 下一阶段
 
-1. 建立 `scenario_catalog.json`，统一 S01–S09 的逻辑定义并保留旧配置兼容层。
-2. 建立统一约束随机 Episode Generator，解决 S02 接管组合与事件语义。
-3. 用统一 Resource Admission 判断场景、车辆数、Seed、模式是否可运行。
-4. 再将场景选择、车辆数、Seed、Policy 和 Mode 接入 FastAPI 与 PyQt。
+1. 建立统一约束随机 Episode Generator，解决 S02 接管组合与事件语义。
+2. 用统一 Resource Admission 判断场景、车辆数、Seed、模式是否可运行。
+3. 再将场景选择、车辆数、Seed、Policy 和 Mode 接入 FastAPI 与 PyQt。

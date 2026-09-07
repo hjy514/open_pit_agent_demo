@@ -8,6 +8,10 @@ from .models import (
     build_world_state_snapshot, normalize_scenario_run_result,
 )
 from .loader import load_logical_scenario
+from .catalog import (
+    compatibility_config_path, load_scenario_catalog,
+    selectable_vehicle_counts, validate_scenario_request,
+)
 from .events import EventEngine
 from .fleet import (
     FleetSnapshot, EpisodeVehicle as FleetEpisodeVehicle, VehicleMaster,
@@ -38,6 +42,8 @@ __all__ = [
     "normalize_scenario_run_result", "RUN_RESULT_SCHEMA_VERSION",
     "SCENARIO_LIFECYCLE_SCHEMA_VERSION", "WORLD_STATE_SCHEMA_VERSION",
     "ScenarioLifecycle", "load_logical_scenario", "EventEngine",
+    "load_scenario_catalog", "compatibility_config_path",
+    "selectable_vehicle_counts", "validate_scenario_request",
     "VehicleMaster", "FleetEpisodeVehicle", "FleetSnapshot", "resolve_fleet", "vehicle_state_snapshot",
     "snapshot_from_episode", "run_s01_structural_mock", "run_s02_structural_mock",
     "run_random_s02_structural_mock", "run_s07_structural_mock",

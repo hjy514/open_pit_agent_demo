@@ -15,28 +15,10 @@ from .s07_runner import run_random_s07_structural_mock, run_s07_structural_mock
 from .s09_runner import run_random_s09_structural_mock
 from .random_s01 import run_random_s01_structural_mock
 from .models import ScenarioLifecycle, normalize_scenario_run_result
+from .catalog import load_scenario_catalog
 
 
-SCENARIO_CATALOG = {
-    "s01": {"name": "正常多车协同", "status": "IMPLEMENTED",
-            "modes": ["structural", "carla"]},
-    "s02": {"name": "车辆故障与任务接管", "status": "IMPLEMENTED",
-            "modes": ["structural"]},
-    "s03": {"name": "装载设备故障", "status": "IMPLEMENTED",
-            "modes": ["structural"]},
-    "s04": {"name": "爆破与临时管控", "status": "IMPLEMENTED",
-            "modes": ["structural"]},
-    "s05": {"name": "极端天气与道路降级", "status": "IMPLEMENTED",
-            "modes": ["structural"]},
-    "s06": {"name": "拥堵与交通冲突", "status": "IMPLEMENTED",
-            "modes": ["structural"]},
-    "s07": {"name": "道路中断与动态重规划", "status": "IMPLEMENTED",
-            "modes": ["structural"]},
-    "s08": {"name": "边坡渐进失稳Golden Demo", "status": "IMPLEMENTED",
-            "modes": ["carla"]},
-    "s09": {"name": "多事件复合扰动", "status": "IMPLEMENTED",
-            "modes": ["structural"]},
-}
+SCENARIO_CATALOG = load_scenario_catalog()
 SUPPORTED_STRUCTURAL_SCENARIOS = tuple(
     key for key, detail in SCENARIO_CATALOG.items()
     if "structural" in detail["modes"]

@@ -24,19 +24,14 @@ from open_pit_agent.adapters.carla_adapter import CarlaAdapterError
 from open_pit_agent.scenario import (
     SCENARIO_CATALOG, SUPPORTED_STRUCTURAL_SCENARIOS, run_structural_scenario,
     summarize_structural_batch, run_carla_scenario_execution,
-    normalize_scenario_run_result,
+    normalize_scenario_run_result, compatibility_config_path,
+    validate_scenario_request,
 )
 
 
 DEFAULT_CONFIGS = {
-    "s01": ROOT / "configs" / "s01_normal_6v.json",
-    "s02": ROOT / "configs" / "s02_vehicle_failure_6v.json",
-    "s03": ROOT / "configs" / "s03_loading_equipment_failure_6v.json",
-    "s04": ROOT / "configs" / "s04_blasting_control_6v.json",
-    "s05": ROOT / "configs" / "s05_extreme_weather_6v.json",
-    "s06": ROOT / "configs" / "s06_congestion_6v.json",
-    "s07": ROOT / "configs" / "s07_road_closure_6v.json",
-    "s09": ROOT / "configs" / "s09_compound_road_fault_6v.json",
+    key: compatibility_config_path(key, SCENARIO_CATALOG)
+    for key in SCENARIO_CATALOG if key != "s08"
 }
 DECISION_CONFIG = ROOT / "configs" / "dispatch_cost_v1.json"
 
@@ -340,7 +335,8 @@ def main():
     parser.add_argument("--seed", type=int)
     parser.add_argument("--random-map", action="store_true",
                         help="S01/S02: use a seeded global P5 map-resource workload")
-    parser.add_argument("--vehicle-count", type=int, choices=(6, 8), default=6)
+    parser.add_argument("--vehicle-count", type=int, default=6,
+                        help="Fleet size admitted by Scenario Catalog (currently 6 or 8)")
     parser.add_argument(
         "--policy", choices=("heuristic", "multi-objective", "auto"),
         default="heuristic",
@@ -438,6 +434,13 @@ def main():
         return 0 if manifest["status"].startswith("DATASET_VERSION_READY") else 1
     if not args.scenario:
         parser.error("--scenario is required unless --aggregate-datasets is used")
+    if args.scenario != "all":
+        try:
+            validate_scenario_request(
+                args.scenario, args.mode, args.vehicle_count, SCENARIO_CATALOG
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.mode == "carla":
         if args.runs != 1:
             parser.error("CARLA execution currently requires --runs 1")
@@ -473,6 +476,14 @@ def main():
             parser.error("--compare-policies already runs both policies; omit --policy")
 
     scenarios = list(SUPPORTED_STRUCTURAL_SCENARIOS) if args.scenario == "all" else [args.scenario]
+    if args.scenario == "all":
+        for scenario in scenarios:
+            try:
+                validate_scenario_request(
+                    scenario, args.mode, args.vehicle_count, SCENARIO_CATALOG
+                )
+            except ValueError as exc:
+                parser.error(str(exc))
     batch_mode = args.scenario == "all" or args.runs > 1 or args.compare_policies
     results = []
     for scenario in scenarios:

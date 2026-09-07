@@ -126,12 +126,13 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
         self.assertEqual(
             ["structural", "carla"], SCENARIO_CATALOG["s01"]["modes"]
         )
-        self.assertEqual(["structural"], SCENARIO_CATALOG["s03"]["modes"])
-        self.assertEqual(["structural"], SCENARIO_CATALOG["s04"]["modes"])
-        self.assertEqual(["structural"], SCENARIO_CATALOG["s06"]["modes"])
+        self.assertEqual(["structural", "carla"], SCENARIO_CATALOG["s03"]["modes"])
+        self.assertEqual(["structural", "carla"], SCENARIO_CATALOG["s04"]["modes"])
+        self.assertEqual(["structural", "carla"], SCENARIO_CATALOG["s06"]["modes"])
         self.assertEqual(["carla"], SCENARIO_CATALOG["s08"]["modes"])
         self.assertEqual("IMPLEMENTED", SCENARIO_CATALOG["s09"]["status"])
-        self.assertEqual(["structural"], SCENARIO_CATALOG["s09"]["modes"])
+        self.assertEqual(["structural", "carla"], SCENARIO_CATALOG["s09"]["modes"])
+        self.assertEqual("RESOURCE_GATED", SCENARIO_CATALOG["s02"]["carla_readiness"])
 
     def test_shell_entry_reports_scope_without_starting_carla(self):
         completed = subprocess.run(
