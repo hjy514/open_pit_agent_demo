@@ -44,6 +44,7 @@ class HumanDispatchWindow(QDialog):
         self.dispatch_data = {}
         self.vehicle_data = []
         self.command_data = []
+        self.pending_decision_points = []
         self.api_error = None
 
         self.init_ui()
@@ -205,12 +206,17 @@ class HumanDispatchWindow(QDialog):
             self.dispatch_data = self.get_json("/dispatch")
             self.vehicle_data = self.get_json("/vehicles")
             self.command_data = self.get_json("/commands?limit=100")
+            self.pending_decision_points = self.get_json(
+                "/decision-points/pending"
+            )
             if not isinstance(self.dispatch_data, dict):
                 self.dispatch_data = {}
             if not isinstance(self.vehicle_data, list):
                 self.vehicle_data = []
             if not isinstance(self.command_data, list):
                 self.command_data = []
+            if not isinstance(self.pending_decision_points, list):
+                self.pending_decision_points = []
             self.api_error = None
             self.connection_label.setText("Agent API：已连接")
             self.connection_label.setStyleSheet("color:#1b8f3a;")
@@ -425,6 +431,12 @@ class HumanDispatchWindow(QDialog):
         )
 
     def update_plan_buttons(self):
+        if self.pending_decision_points:
+            self.accept_button.setEnabled(True)
+            self.reject_button.setEnabled(True)
+            self.accept_button.setText("批准当前事件调度方案")
+            self.reject_button.setText("驳回并保持安全暂停")
+            return
         task = self.ai_recommended_task()
         status = str((task or {}).get("status", "")).lower()
         pending_handover = bool(
@@ -445,6 +457,22 @@ class HumanDispatchWindow(QDialog):
             self.accept_button.setText("暂无待确认接管方案")
 
     def build_recommendation_text(self):
+        if self.pending_decision_points:
+            point = self.pending_decision_points[0]
+            return (
+                "【需要人工确认】\n"
+                "决策编号：{}\n"
+                "场景：{}\n"
+                "推荐动作：{}\n"
+                "决策原因：{}\n\n"
+                "批准后，CARLA执行已生成的安全接管/改道方案；"
+                "驳回或不处理时，受影响车队保持安全暂停。"
+            ).format(
+                point.get("decision_point_id", "-"),
+                point.get("scenario_key", "-"),
+                point.get("action_type", "-"),
+                point.get("reason", "-"),
+            )
         tasks = self.dispatch_data.get("tasks", [])
         if not tasks:
             return "当前没有AI调度建议。\n\n请先运行Agent场景。"
@@ -598,6 +626,9 @@ class HumanDispatchWindow(QDialog):
             QMessageBox.critical(self, "操作失败", str(error))
 
     def accept_ai_plan(self):
+        if self.pending_decision_points:
+            self.resolve_pending_decision_point("approve")
+            return
         task = self.ai_recommended_task()
         if task is None:
             QMessageBox.warning(self, "没有方案", "当前没有AI方案。")
@@ -634,6 +665,9 @@ class HumanDispatchWindow(QDialog):
             )
 
     def reject_ai_plan(self):
+        if self.pending_decision_points:
+            self.resolve_pending_decision_point("reject")
+            return
         self.post_decision(
             {
                 "action": "reject_ai_plan",
@@ -642,6 +676,27 @@ class HumanDispatchWindow(QDialog):
             },
             "已驳回AI方案",
         )
+
+    def resolve_pending_decision_point(self, response):
+        point = self.pending_decision_points[0]
+        point_id = point.get("decision_point_id")
+        if not point_id:
+            return
+        try:
+            self.post_json(
+                "/decision-points/{}/resolve".format(point_id),
+                {"response": response, "source": "human_dispatch_center"},
+            )
+            QMessageBox.information(
+                self,
+                "人工确认已提交",
+                "已{}事件响应方案，CARLA将据此继续或以安全结果结束本轮。".format(
+                    "批准" if response == "approve" else "驳回"
+                ),
+            )
+            self.refresh_data()
+        except Exception as error:
+            QMessageBox.critical(self, "操作失败", str(error))
 
     def send_manual_task(self):
         vehicle_id = self.vehicle_combo.currentData()

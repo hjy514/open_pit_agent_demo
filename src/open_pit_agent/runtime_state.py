@@ -58,6 +58,10 @@ class RuntimeState:
         self.decision: Dict[str, Any] = {
             "status": "PASS",
         }
+        # DecisionPoint records are the cross-process human-in-the-loop gate.
+        # They are runtime facts, not static map facts and not model training
+        # labels until the episode is closed and evaluated.
+        self.decision_points: Dict[str, Dict[str, Any]] = {}
         self.monitoring: Dict[str, Any] = {
             "phase": "等待运行",
             "phase_index": 0,
@@ -109,6 +113,7 @@ class RuntimeState:
         self.decision = {
             "status": "PASS",
         }
+        self.decision_points = {}
         self.monitoring = {
             "phase": "等待运行",
             "phase_index": 0,
@@ -434,6 +439,26 @@ class RuntimeState:
         decision = payload.get("decision")
         if isinstance(decision, dict):
             self.decision = dict(decision)
+            for item in decision.get("decision_points", []):
+                if not isinstance(item, dict) or not item.get("decision_point_id"):
+                    continue
+                point_id = str(item["decision_point_id"])
+                previous = self.decision_points.get(point_id, {})
+                merged = dict(item)
+                # A periodic runner snapshot must never overwrite an actual
+                # operator response made between two snapshots.
+                if previous.get("operator_response"):
+                    merged["operator_response"] = dict(
+                        previous["operator_response"]
+                    )
+                    merged["review_status"] = previous.get(
+                        "review_status", merged.get("review_status")
+                    )
+                self.decision_points[point_id] = merged
+            if self.decision_points:
+                self.decision["decision_points"] = [
+                    dict(item) for _, item in sorted(self.decision_points.items())
+                ]
 
         monitoring = payload.get("monitoring")
         if isinstance(world_state.get("monitoring"), dict):
@@ -483,6 +508,8 @@ class RuntimeState:
             self.add_event(
                 event.get("type", "system"),
                 event.get("message", ""),
+                payload=event.get("payload")
+                if isinstance(event.get("payload"), dict) else None,
             )
 
     def update_vehicle(self, vehicle_id, data):
@@ -663,6 +690,9 @@ class RuntimeState:
             "lifecycle": self.lifecycle,
             "risk": self.risk,
             "decision": self.decision,
+            "decision_points": [
+                dict(item) for _, item in sorted(self.decision_points.items())
+            ],
             "monitoring": self.monitoring,
         }
 
@@ -674,6 +704,53 @@ class RuntimeState:
             "tasks": self.tasks,
             "run_id": self.run_id,
         }
+
+    def get_pending_decision_points(self):
+        return [
+            dict(item) for _, item in sorted(self.decision_points.items())
+            if str(item.get("review_policy")) == "REQUIRED_BEFORE_EXECUTION"
+            and str(item.get("review_status")) == "PENDING_HUMAN_CONFIRMATION"
+        ]
+
+    def get_decision_point(self, decision_point_id):
+        item = self.decision_points.get(str(decision_point_id))
+        return None if item is None else dict(item)
+
+    def resolve_decision_point(self, decision_point_id, response, source="human_operator"):
+        point_id = str(decision_point_id)
+        item = self.decision_points.get(point_id)
+        if item is None:
+            return None
+        choice = str(response).lower().strip()
+        if choice not in {"approve", "reject"}:
+            raise ValueError("决策响应必须是approve或reject")
+        if item.get("operator_response"):
+            raise ValueError("该决策点已经处理")
+        item["operator_response"] = {
+            "action": choice,
+            "source": str(source),
+            "responded_at": self._command_timestamp(),
+        }
+        item["review_status"] = (
+            "APPROVED_BY_HUMAN" if choice == "approve"
+            else "REJECTED_BY_HUMAN"
+        )
+        self.decision_points[point_id] = item
+        self.decision = {
+            "status": item["review_status"],
+            "decision_point_id": point_id,
+            "decision_points": [
+                dict(value) for _, value in sorted(self.decision_points.items())
+            ],
+        }
+        self.add_event(
+            "human_decision_point_{}".format(choice),
+            "调度员{}决策方案：{}".format(
+                "批准" if choice == "approve" else "驳回", point_id
+            ),
+            payload={"decision_point_id": point_id, "response": choice},
+        )
+        return dict(item)
 
     def _map_points(self):
         points = []

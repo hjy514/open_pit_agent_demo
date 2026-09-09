@@ -36,6 +36,8 @@
         "parameters": {
           "event_tick": 30,
           "recovery_tick": 60,
+          "trigger_tick_range": [20, 60],
+          "duration_ticks_range": [40, 100],
           "rainfall_intensity_mm_h_range": [35.0, 70.0],
           "restricted_speed_factor_range": [0.45, 0.65],
           "visibility_m": 120.0,

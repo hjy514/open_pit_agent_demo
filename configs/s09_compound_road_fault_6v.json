@@ -33,7 +33,7 @@
       "seed": 202609,
       "events": [{
         "event_type": "road_closure_then_vehicle_failure",
-        "parameters": {"road_closure_tick": 30, "vehicle_failure_tick": 40, "recovery_tick": 80, "maximum_detour_ratio": 4.0}
+        "parameters": {"road_closure_tick": 30, "vehicle_failure_tick": 40, "recovery_tick": 80, "trigger_tick_range": [20, 45], "inter_event_gap_ticks_range": [10, 30], "recovery_delay_ticks_range": [30, 70], "maximum_detour_ratio": 4.0}
       }]
     },
     "resource_admission": {"execution_mode": "structural_mock", "spawn_policy": "VERIFIED_SPAWN_EXCLUDING_RECORDED_DUAL_SPAWN_BLOCKED", "route_policy": "TOPOLOGY_DERIVED_UNVERIFIED_ONLY"},

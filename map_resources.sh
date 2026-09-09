@@ -39,7 +39,7 @@ usage() {
   build-route-candidates   把P5可达点对关联到现有路网边
   calibrate-spawns         标定CARLA Spawn Point
   calibrate-reachability   标定路线规划可达性
-  validate-physical        执行单矿卡物理路线验证
+  validate-physical        执行单矿卡物理路线验证（可用 --from-spawn-point-index 定向筛选）
   coverage                 输出全图路线覆盖报告
 
 所有 [options] 均透传给对应的底层工具。

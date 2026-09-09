@@ -17,6 +17,7 @@ from ..runtime_state import RuntimeState
 from ..scheduler import BaselineScheduler, release_failed_vehicle_tasks, tasks_from_zones
 from .episode import build_episode
 from .fleet import snapshot_from_episode, vehicle_state_snapshot
+from .generator import sample_event_timing
 from .random_s01 import prepare_random_map_workload
 
 
@@ -265,6 +266,7 @@ def run_random_s02_structural_mock(config: Any, seed: Optional[int] = None,
     vehicle_origins = workload["vehicle_origins"]
     zone_targets = workload["zone_targets"]
     route_costs = workload["route_costs"]
+    route_validation_statuses = workload["route_validation_statuses"]
 
     def route_distance(vehicle, zone):
         value = route_costs.get(
@@ -286,8 +288,9 @@ def run_random_s02_structural_mock(config: Any, seed: Optional[int] = None,
         distance_provider=route_distance,
         distance_label="p5_route_length",
     )
-    # Select only a failure whose assigned task has at least one legal P5
-    # takeover candidate.  This is scenario admissibility, not a soft cost.
+    # The Episode Generator has already constructed a primary/standby route
+    # triple.  Retain this probe as a runtime defensive check: it verifies the
+    # configured scheduler still sees a legal takeover after assignment.
     probe_adapter = MockAdapter(base_dynamic)
     probe_tasks = deepcopy(workload["tasks"])
     probe_adapter.connect()
@@ -311,16 +314,24 @@ def run_random_s02_structural_mock(config: Any, seed: Optional[int] = None,
                 recoverable_failure_ids.append(assignment.vehicle_id)
     finally:
         probe_adapter.close()
-    if not recoverable_failure_ids:
+    planned_failure_id = workload.get("generation", {}).get("metadata", {}).get("failed_vehicle_id")
+    if planned_failure_id and planned_failure_id in recoverable_failure_ids:
+        failed_vehicle_id = str(planned_failure_id)
+    elif not recoverable_failure_ids:
         raise ValueError(
-            "seeded S02 workload has no recoverable vehicle-failure candidate"
+            "S02_RUNTIME_ADMISSION_FAILED: generated workload has no recoverable vehicle-failure candidate"
         )
-    failed_vehicle_id = Random(effective_seed + 2002).choice(
-        sorted(set(recoverable_failure_ids))
-    )
+    else:
+        failed_vehicle_id = Random(effective_seed + 2002).choice(
+            sorted(set(recoverable_failure_ids))
+        )
+    event_timing = sample_event_timing(base_dynamic, "s02", effective_seed)
     dynamic = replace(
         base_dynamic,
-        demo=replace(base_dynamic.demo, failure_vehicle_id=failed_vehicle_id),
+        demo=replace(
+            base_dynamic.demo, failure_vehicle_id=failed_vehicle_id,
+            failure_tick=event_timing["failure_tick"],
+        ),
     )
     task_templates = deepcopy(workload["tasks"])
     baseline_result = run_s02_structural_mock(
@@ -368,9 +379,9 @@ def run_random_s02_structural_mock(config: Any, seed: Optional[int] = None,
                     route_reachable=route_length is not None,
                     route_length_m=route_length,
                     planner_version="CARLA_GlobalRoutePlanner_0.9.10_res_2.000m",
-                    validation_status=(
-                        "PLANNER_REACHABLE" if route_length is not None else None
-                    ),
+                    validation_status=route_validation_statuses.get(
+                        (vehicle_origins[vehicle_config.vehicle_id], zone_targets[task.zone_id])
+                    ) if route_length is not None else None,
                 ),
                 runtime_state={
                     "minimum_route_length_m": minimum_length_m,
@@ -475,7 +486,8 @@ def run_random_s02_structural_mock(config: Any, seed: Optional[int] = None,
             "physical driving, collision, clearance or multi-vehicle validation."
         ),
         "random_mode": "seeded_structural_failure_mock_only",
-        "failure_selection": "seeded_redundant_role_vehicle",
+        "failure_selection": "episode_admitted_primary_with_scheduler_defensive_check",
+        "episode_generation": workload.get("generation", {}),
         "policy_comparison": {
             "mode": (
                 "multi_objective_v1_executed_with_v0_baseline"

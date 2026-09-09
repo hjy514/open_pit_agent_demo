@@ -33,7 +33,7 @@
       "seed": 202604,
       "events": [{
         "event_type": "planned_blasting_temporary_control",
-        "parameters": {"notice_tick": 20, "blast_start_tick": 40, "clearance_tick": 60}
+        "parameters": {"notice_tick": 20, "blast_start_tick": 40, "clearance_tick": 60, "trigger_tick_range": [35, 70], "notice_lead_ticks_range": [10, 25], "duration_ticks_range": [20, 50]}
       }]
     },
     "resource_admission": {"execution_mode": "structural_mock", "spawn_policy": "VERIFIED_SPAWN_EXCLUDING_RECORDED_DUAL_SPAWN_BLOCKED", "route_policy": "TOPOLOGY_DERIVED_UNVERIFIED_ONLY"},

@@ -9,6 +9,7 @@ from ..map_resources.road_graph import route_plans_from_store
 from ..scheduler import BaselineScheduler
 from .episode import build_episode
 from .fleet import snapshot_from_episode, vehicle_state_snapshot
+from .generator import sample_event_timing
 from .random_s01 import prepare_random_map_workload
 
 
@@ -24,9 +25,9 @@ def _event_parameters(config: Any, seed: int) -> Dict[str, Any]:
             or float(delay_range[0]) < 0
             or float(delay_range[0]) > float(delay_range[1])):
         raise ValueError("S03 work_point_switch_delay_seconds_range is invalid")
+    timing = sample_event_timing(config, "s03", seed)
     return {
-        "failure_tick": int(raw.get("failure_tick", 30)),
-        "recovery_tick": int(raw.get("recovery_tick", 70)),
+        **timing,
         "work_point_switch_delay_s": round(Random(seed + 3003).uniform(
             float(delay_range[0]), float(delay_range[1])
         ), 6),

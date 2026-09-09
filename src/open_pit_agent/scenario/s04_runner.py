@@ -2,19 +2,18 @@
 from copy import deepcopy
 from typing import Any, Dict, Optional, Set, Tuple
 
+from .generator import sample_event_timing
 from .s07_runner import run_random_s07_structural_mock
 
 
 POLICY_VERSION = "planned-blast-road-control-v1"
 
 
-def _blast_parameters(config: Any) -> Dict[str, Any]:
-    randomization = config.scenario_variables.get("randomization", {})
-    events = randomization.get("events", []) if isinstance(randomization, dict) else []
-    raw = events[0].get("parameters", {}) if events else {}
-    notice_tick = int(raw.get("notice_tick", 20))
-    start_tick = int(raw.get("blast_start_tick", 40))
-    clearance_tick = int(raw.get("clearance_tick", 60))
+def _blast_parameters(config: Any, seed: int) -> Dict[str, Any]:
+    timing = sample_event_timing(config, "s04", seed)
+    notice_tick = timing["notice_tick"]
+    start_tick = timing["blast_start_tick"]
+    clearance_tick = timing["clearance_tick"]
     if not notice_tick < start_tick < clearance_tick:
         raise ValueError("S04 requires notice_tick < blast_start_tick < clearance_tick")
     return {
@@ -36,14 +35,20 @@ def run_random_s04_structural_mock(config: Any, seed: Optional[int] = None,
     S04 converts it to a deterministic wait: a planned blast does not justify
     transferring the task merely to cross a temporarily controlled segment.
     """
-    result = run_random_s07_structural_mock(
-        config, seed=seed, vehicle_count=vehicle_count,
-        minimum_length_m=minimum_length_m,
-        maximum_length_m=maximum_length_m, scenario_key="s04",
-        eligible_pairs_override=eligible_pairs_override,
-    )
+    try:
+        result = run_random_s07_structural_mock(
+            config, seed=seed, vehicle_count=vehicle_count,
+            minimum_length_m=minimum_length_m,
+            maximum_length_m=maximum_length_m, scenario_key="s04",
+            eligible_pairs_override=eligible_pairs_override,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "seeded S04 workload has no selective temporary road-control "
+            "action: {}".format(exc)
+        ) from exc
     result = deepcopy(result)
-    parameters = _blast_parameters(config)
+    parameters = _blast_parameters(config, int(result["seed"]))
     restricted_edge_id = result.pop("closed_edge_id")
     result.pop("closed_road_id", None)
     task_by_id = {

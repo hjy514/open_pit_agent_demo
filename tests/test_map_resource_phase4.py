@@ -31,6 +31,10 @@ class Phase4StaticConflictTests(unittest.TestCase):
                     "FROM point_conflicts"
                 ).fetchone()
                 self.assertEqual(("carla-spawn:0", "carla-spawn:1", 5.0, "STATIC_INFERRED"), row)
+                self.assertEqual(
+                    {("carla-spawn:0", "carla-spawn:1")},
+                    store.static_inferred_conflict_pairs("m", "v"),
+                )
 
     def test_threshold_must_be_positive(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -60,6 +60,50 @@
       "point_spawn_indices": [4, 5, 9, 10, 14, 15, 22, 24, 28, 43, 44, 46, 47, 48, 51, 54, 56, 61, 63, 69, 70],
       "validation_status": "CANDIDATE_ONLY",
       "notes": "按P3已验证出生点、低标高道路点和正式演示核心点建立的离线候选池。尚未完成路线、会车、碰撞、净空或多车CARLA验证。"
+    },
+    {
+      "area_id": "haul_loading_candidate_pool",
+      "display_name": "运输任务装载候选区",
+      "area_type": "haul_loading",
+      "selection_mode": "seeded_random_route_endpoint",
+      "capacity": 8,
+      "allowed_roles": ["haul"],
+      "point_spawn_indices": [18, 22, 46, 52, 53, 55, 77, 80],
+      "validation_status": "P6_ROUTE_ENDPOINT_ANCHORED",
+      "notes": "由已有P6单矿卡成功路线起点构成，仅作为参数化装载业务锚点；不代表真实铲装设备位置或多车安全容量。"
+    },
+    {
+      "area_id": "haul_dump_candidate_pool",
+      "display_name": "运输任务卸载候选区",
+      "area_type": "haul_dump",
+      "selection_mode": "seeded_random_route_endpoint",
+      "capacity": 8,
+      "allowed_roles": ["haul"],
+      "point_spawn_indices": [2, 3, 17, 23, 34, 50, 73, 79],
+      "validation_status": "P6_ROUTE_ENDPOINT_ANCHORED",
+      "notes": "由已有P6单矿卡成功路线终点构成，仅作为参数化卸载业务锚点；不代表真实排土场标定或物料流量测量。"
+    },
+    {
+      "area_id": "inspection_service_candidate_pool",
+      "display_name": "巡检任务服务候选区",
+      "area_type": "inspection_task_core",
+      "selection_mode": "seeded_random_route_endpoint",
+      "capacity": 3,
+      "allowed_roles": ["inspection"],
+      "point_spawn_indices": [42, 48, 70],
+      "validation_status": "P6_ROUTE_ENDPOINT_ANCHORED",
+      "notes": "巡检任务的参数化服务终点，保留P6单车路线验证边界，不声称为真实矿山巡检站。"
+    },
+    {
+      "area_id": "support_service_candidate_pool",
+      "display_name": "保障任务服务候选区",
+      "area_type": "support_task_core",
+      "selection_mode": "seeded_random_route_endpoint",
+      "capacity": 3,
+      "allowed_roles": ["support", "emergency_support"],
+      "point_spawn_indices": [23, 34, 50],
+      "validation_status": "P6_ROUTE_ENDPOINT_ANCHORED",
+      "notes": "保障任务的参数化服务终点；仅有单车路线终点依据，尚无真实保障站、净空或多车容量验证。"
     }
   ]
 }

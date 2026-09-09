@@ -1,5 +1,6 @@
 """Single structural-scenario dispatch point for the supported baseline set."""
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from copy import deepcopy
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..adapters import ExecutionCommand, ExecutionFeedback
 from ..closed_loop import ClosedLoopCoordinator
@@ -15,7 +16,8 @@ from .s07_runner import run_random_s07_structural_mock, run_s07_structural_mock
 from .s09_runner import run_random_s09_structural_mock
 from .random_s01 import run_random_s01_structural_mock
 from .models import ScenarioLifecycle, normalize_scenario_run_result
-from .catalog import load_scenario_catalog
+from .catalog import load_scenario_catalog, scenario_spec
+from .generator import simulate_structural_production_cycle
 
 
 SCENARIO_CATALOG = load_scenario_catalog()
@@ -23,6 +25,271 @@ SUPPORTED_STRUCTURAL_SCENARIOS = tuple(
     key for key, detail in SCENARIO_CATALOG.items()
     if "structural" in detail["modes"]
 )
+
+
+def build_structural_runtime_snapshots(
+    result: Dict[str, Any],
+    map_points: Dict[str, Dict[str, Any]],
+    road_segments: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Project factual structural results into short UI playback snapshots.
+
+    The snapshots visualize logical state transitions only. They never claim
+    CARLA motion, measured speed, collision clearance or physical arrival.
+    """
+    scenario_key = str(result.get("scenario_key") or "unknown")
+    run_id = str(result.get("run_id") or result.get("scenario_id") or "runtime")
+    episode = result.get("generated_episode", {})
+    if not isinstance(episode, dict):
+        episode = {}
+    fleet = episode.get("fleet", result.get("fleet", {}))
+    if not isinstance(fleet, dict):
+        fleet = {}
+    episode_vehicles = [
+        dict(item) for item in fleet.get("vehicles", [])
+        if isinstance(item, dict) and item.get("vehicle_id")
+    ]
+    resource_drafts = {
+        str(item["task_id"]): dict(item)
+        for item in result.get("map_resource_task_draft", [])
+        if isinstance(item, dict) and item.get("task_id")
+    }
+    task_drafts = []
+    for item in episode.get("tasks", []):
+        if not isinstance(item, dict) or not item.get("task_id"):
+            continue
+        merged = dict(resource_drafts.get(str(item["task_id"]), {}))
+        merged.update(item)
+        task_drafts.append(merged)
+    if not task_drafts:
+        task_drafts = list(resource_drafts.values())
+    draft_by_task = {
+        str(item["task_id"]): item for item in task_drafts
+    }
+    final_tasks = [
+        dict(item) for item in result.get("tasks", [])
+        if isinstance(item, dict) and item.get("task_id")
+    ]
+    initial_tasks = result.get("initial_task_states")
+    if not isinstance(initial_tasks, list):
+        initial_tasks = [
+            {
+                "task_id": item["task_id"],
+                "task_type": item.get("task_type"),
+                "priority": item.get("priority"),
+                "status": "pending",
+                "assigned_vehicle_id": item.get("vehicle_id"),
+            }
+            for item in task_drafts
+        ]
+    initial_tasks = [
+        dict(item) for item in initial_tasks
+        if isinstance(item, dict) and item.get("task_id")
+    ]
+    final_by_task = {
+        str(item["task_id"]): item for item in final_tasks
+    }
+    failed_vehicle_id = result.get("failed_vehicle_id")
+
+    def point(point_id):
+        value = map_points.get(str(point_id), {})
+        if not isinstance(value, dict) or value.get("x") is None:
+            return None
+        return {
+            "x": float(value["x"]), "y": float(value["y"]),
+            "z": float(value.get("z") or 0.0),
+        }
+
+    def phase_tasks(phase):
+        if phase == "prepare":
+            return [dict(item, status="pending") for item in initial_tasks]
+        if phase == "start":
+            return [dict(item, status="executing") for item in initial_tasks]
+        if phase == "event":
+            values = [dict(item, status="executing") for item in initial_tasks]
+            for item in values:
+                if item.get("assigned_vehicle_id") == failed_vehicle_id:
+                    item["status"] = "interrupted"
+                    item["status_reason"] = "scenario_event_applied"
+            return values
+        if phase == "decision":
+            return [dict(item, status="executing") for item in final_tasks]
+        return deepcopy(final_tasks)
+
+    def vehicles_for(tasks, phase):
+        tasks_by_vehicle = {}
+        for task in tasks:
+            vehicle_id = task.get("assigned_vehicle_id")
+            if vehicle_id:
+                tasks_by_vehicle.setdefault(str(vehicle_id), []).append(task)
+        values = []
+        for source in episode_vehicles:
+            vehicle_id = str(source["vehicle_id"])
+            assigned = tasks_by_vehicle.get(vehicle_id, [])
+            task = assigned[0] if assigned else None
+            task_id = str(task["task_id"]) if task else None
+            draft = draft_by_task.get(task_id, {})
+            if not draft and task_id:
+                draft = draft_by_task.get(str(task_id), {})
+            source_point_id = draft.get("from_point_id")
+            if source_point_id is None and source.get(
+                "spawn_point_index"
+            ) is not None:
+                source_point_id = "carla-spawn:{}".format(
+                    source["spawn_point_index"]
+                )
+            start = point(source_point_id)
+            target = point(draft.get("to_point_id"))
+            position = (
+                target if target is not None and phase == "finish"
+                and task and task.get("status") == "completed" else start
+            )
+            failed = vehicle_id == failed_vehicle_id and phase in {
+                "event", "decision", "finish",
+            }
+            if failed:
+                status, health = "fault", "failed"
+            elif phase == "prepare":
+                status, health = "idle", source.get("health", "healthy")
+            elif phase == "finish":
+                status, health = (
+                    "completed" if task else "idle"
+                ), source.get("health", "healthy")
+            else:
+                status, health = (
+                    "executing" if task else "idle"
+                ), source.get("health", "healthy")
+            values.append({
+                "vehicle_id": vehicle_id,
+                "display_name": source.get("display_name") or vehicle_id,
+                "equipment_type": source.get("role") or "multi_role_truck",
+                "status": status,
+                "task_status": status,
+                "health": health,
+                "available": not failed,
+                "current_task_id": task_id,
+                "position": position,
+                "target_position": target,
+                "yaw_deg": float(
+                    map_points.get(str(source_point_id), {}).get(
+                        "yaw"
+                    ) or 0.0
+                ),
+                "speed_mps": 0.0,
+                "source": "STRUCTURAL_LOGICAL_STATE_NO_CARLA_PHYSICS",
+            })
+        return values
+
+    scenario_events = [
+        dict(item) for item in result.get("scenario_events", [])
+        if isinstance(item, dict)
+    ]
+    map_context = result.get("provenance", {}).get("map_context", {})
+    if not isinstance(map_context, dict):
+        map_context = {}
+    phases = [("prepare", None), ("start", None)]
+    phases.extend(("event", event) for event in scenario_events)
+    phases.extend((("decision", None), ("finish", None)))
+    labels = {
+        "prepare": "场景准备",
+        "start": "任务执行",
+        "event": "事件触发",
+        "decision": "调度响应",
+        "finish": "闭环完成",
+    }
+    snapshots = []
+    for phase_index, (phase, event) in enumerate(phases):
+        tasks = phase_tasks(phase)
+        decisions = result.get("decisions", []) if phase in {
+            "decision", "finish"
+        } else []
+        closed = phase == "finish" and result.get(
+            "closed_loop_validation", {}
+        ).get("status") == "CLOSED_LOOP_PASS"
+        event_type = (
+            event.get("event_type") if isinstance(event, dict)
+            else "structural_{}".format(phase)
+        )
+        event_message = (
+            "{}：{}".format(scenario_key.upper(), labels[phase])
+            if event is None else
+            "{}触发：{}".format(
+                scenario_key.upper(), event_type
+            )
+        )
+        snapshots.append({
+            "run_id": run_id,
+            "map_name": map_context.get("map_id") or "0325_5",
+            "world_state": {
+                "schema_version": "openpit.world-state.v1",
+                "run_id": run_id,
+                "vehicles": vehicles_for(tasks, phase),
+                "tasks": tasks,
+                "roads": deepcopy(result.get("world_state", {}).get("roads", {})),
+                "environment": {
+                    "map_name": map_context.get("map_id") or "0325_5",
+                    "map_context": deepcopy(map_context),
+                    "road_segments": deepcopy(road_segments or []),
+                    "simulation_mode": "structural_logical_playback",
+                    "physical_execution": False,
+                },
+                "monitoring": {
+                    "phase": labels[phase],
+                    "phase_index": phase_index,
+                    "risk_level": "NOT_APPLICABLE_OR_NOT_AVAILABLE",
+                    "feedback_count": 1 if phase == "finish" else 0,
+                    "closed_loop_complete": closed,
+                    "latest_event": event_message,
+                    "simulation_claim": "STRUCTURAL_ONLY_NO_CARLA_PHYSICS",
+                },
+                "risk": {
+                    "level": "NOT_AVAILABLE",
+                    "scenario_event": deepcopy(event) if event else None,
+                },
+                "traffic": deepcopy(result.get("world_state", {}).get("traffic", {})),
+                "equipment": deepcopy(result.get("world_state", {}).get("equipment", {})),
+            },
+            "run_context": {
+                "run_id": run_id,
+                "scenario_key": scenario_key,
+                "scenario_id": result.get("scenario_id"),
+                "seed": result.get("seed"),
+            },
+            "execution": {
+                "mode": "structural_logical_playback",
+                "physical_execution": False,
+                "phase": phase,
+                "status": "PASS" if phase == "finish" else "RUNNING",
+            },
+            "outcome": (
+                deepcopy(result.get("outcome", {})) if phase == "finish"
+                else {"status": "RUNNING", "closed_loop_status": None}
+            ),
+            "lifecycle": {
+                "current_phase": phase,
+                "phases": [
+                    deepcopy(item) for item in result.get(
+                        "lifecycle", {}
+                    ).get("phases", [])
+                    if int(item.get("sequence", 999)) <= phase_index
+                ],
+            },
+            "decision": {
+                "status": (
+                    "CLOSED_LOOP_PASS" if closed else
+                    "DECIDED" if decisions else "WAITING"
+                ),
+                "decisions": deepcopy(decisions),
+            },
+            "assignments": deepcopy(result.get("assignments", []))
+                if phase in {"decision", "finish"} else [],
+            "event": {
+                "type": event_type,
+                "message": event_message,
+                "payload": deepcopy(event) if event else {},
+            },
+        })
+    return snapshots
 
 
 def _apply_structural_safety_gate(
@@ -806,6 +1073,22 @@ def run_structural_scenario(scenario: str, config: Any,
         ),
     })
     result["lifecycle"] = lifecycle.to_dict()
-    return normalize_scenario_run_result(
-        result, scenario_key=name, map_context=result["map_context"]
+    spec = scenario_spec(name, SCENARIO_CATALOG).to_dict()
+    normalized = normalize_scenario_run_result(
+        result, scenario_key=name, map_context=result["map_context"],
+        scenario_spec=spec,
     )
+    production_runtime = simulate_structural_production_cycle(
+        normalized["concrete_episode_v2"], normalized
+    )
+    normalized["production_runtime"] = production_runtime
+    normalized["data_contract"]["production_runtime"] = (
+        production_runtime["schema_version"]
+    )
+    normalized["concrete_episode_v2"]["production_system"][
+        "runtime_status"
+    ] = "STRUCTURAL_SURROGATE_EXECUTED"
+    normalized["concrete_episode_v2"]["execution_binding"][
+        "production_state_machine"
+    ] = "COMMON_STRUCTURAL_RUNTIME_V1"
+    return normalized

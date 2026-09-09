@@ -3,14 +3,18 @@
 from .episode import ConcreteEpisode, build_episode
 from .models import (
     RUN_RESULT_SCHEMA_VERSION, SCENARIO_LIFECYCLE_SCHEMA_VERSION,
-    WORLD_STATE_SCHEMA_VERSION, EventTrigger, LogicalScenario,
+    WORLD_STATE_SCHEMA_VERSION, SCENARIO_SPEC_SCHEMA_VERSION,
+    CONCRETE_EPISODE_SCHEMA_VERSION, CONCRETE_EPISODE_V2_SCHEMA_VERSION,
+    ConcreteEpisodeV2, DECISION_POINT_SCHEMA_VERSION,
+    EVENT_TIMELINE_SCHEMA_VERSION, EventTrigger, LogicalScenario,
+    ScenarioSpec,
     ScenarioEventSpec, ScenarioLifecycle, WorldStateSnapshot,
     build_world_state_snapshot, normalize_scenario_run_result,
 )
 from .loader import load_logical_scenario
 from .catalog import (
     compatibility_config_path, load_scenario_catalog,
-    selectable_vehicle_counts, validate_scenario_request,
+    scenario_spec, selectable_vehicle_counts, validate_scenario_request,
 )
 from .events import EventEngine
 from .fleet import (
@@ -27,8 +31,10 @@ from .s07_runner import run_random_s07_structural_mock, run_s07_structural_mock
 from .s09_runner import run_random_s09_structural_mock
 from .resource_admission import ScenarioResourceAdmission, admit_scenario_resources
 from .operating_areas import load_operating_area_profile, register_operating_area_profile
+from .generator import simulate_structural_production_cycle
 from .runner import (
-    SCENARIO_CATALOG, SUPPORTED_STRUCTURAL_SCENARIOS, run_structural_scenario,
+    SCENARIO_CATALOG, SUPPORTED_STRUCTURAL_SCENARIOS,
+    build_structural_runtime_snapshots, run_structural_scenario,
     summarize_structural_batch, validate_structural_closed_loop,
 )
 from .carla_execution import (
@@ -38,6 +44,10 @@ from .random_s01 import run_random_s01_structural_mock
 
 __all__ = [
     "ConcreteEpisode", "build_episode", "EventTrigger", "LogicalScenario",
+    "ScenarioSpec", "scenario_spec", "SCENARIO_SPEC_SCHEMA_VERSION",
+    "CONCRETE_EPISODE_SCHEMA_VERSION",
+    "CONCRETE_EPISODE_V2_SCHEMA_VERSION", "ConcreteEpisodeV2",
+    "DECISION_POINT_SCHEMA_VERSION", "EVENT_TIMELINE_SCHEMA_VERSION",
     "ScenarioEventSpec", "WorldStateSnapshot", "build_world_state_snapshot",
     "normalize_scenario_run_result", "RUN_RESULT_SCHEMA_VERSION",
     "SCENARIO_LIFECYCLE_SCHEMA_VERSION", "WORLD_STATE_SCHEMA_VERSION",
@@ -55,7 +65,9 @@ __all__ = [
     "run_random_s09_structural_mock",
     "ScenarioResourceAdmission", "admit_scenario_resources",
     "load_operating_area_profile", "register_operating_area_profile",
+    "simulate_structural_production_cycle",
     "SCENARIO_CATALOG", "SUPPORTED_STRUCTURAL_SCENARIOS", "run_structural_scenario",
+    "build_structural_runtime_snapshots",
     "summarize_structural_batch",
     "validate_structural_closed_loop",
     "run_random_s01_structural_mock",

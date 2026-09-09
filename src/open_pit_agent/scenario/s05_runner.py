@@ -11,6 +11,7 @@ from ..map_resources.road_graph import (
 from ..scheduler import BaselineScheduler
 from .episode import build_episode
 from .fleet import snapshot_from_episode, vehicle_state_snapshot
+from .generator import sample_event_timing
 from .random_s01 import prepare_random_map_workload
 
 
@@ -30,9 +31,9 @@ def _parameters(config: Any, seed: int) -> Dict[str, float]:
             or float(rain_range[0]) < 0 or float(rain_range[0]) > float(rain_range[1])):
         raise ValueError("S05 rainfall_intensity_mm_h_range is invalid")
     random = Random(int(seed) + 5005)
+    timing = sample_event_timing(config, "s05", seed)
     return {
-        "event_tick": int(raw.get("event_tick", 30)),
-        "recovery_tick": int(raw.get("recovery_tick", 60)),
+        **timing,
         "restricted_speed_factor": round(random.uniform(
             float(speed_range[0]), float(speed_range[1])
         ), 6),

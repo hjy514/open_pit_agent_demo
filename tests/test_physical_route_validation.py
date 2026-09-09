@@ -51,6 +51,11 @@ class PhysicalRouteValidationTests(unittest.TestCase):
                 self.assertEqual(0, store.connection.execute(
                     "SELECT count(*) FROM reachable_pairs"
                 ).fetchone()[0])
+                records = list(store.physical_route_validations(
+                    "0325_5", "v"
+                ))
+                self.assertEqual(1, len(records))
+                self.assertEqual(12.0, records[0]["arrival_tolerance_m"])
 
 
 if __name__ == "__main__":

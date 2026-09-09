@@ -268,7 +268,9 @@
           "parameters": {
             "road_selection": "active_internal_edge_with_graph_bypass",
             "maximum_detour_ratio": 4.0,
-            "trigger_tick": 30
+            "trigger_tick": 30,
+            "trigger_tick_range": [25, 65],
+            "duration_ticks_range": [20, 60]
           }
         }
       ]

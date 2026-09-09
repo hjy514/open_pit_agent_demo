@@ -4,6 +4,7 @@ import json
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable
 from uuid import uuid4
 
@@ -86,6 +87,125 @@ class EvidenceRecorder:
         self._store(
             lambda store: store.record_episode(episode, config_path=config_path)
         )
+
+    def record_unified_scenario_contract(
+        self, result: Dict[str, Any], config_path: Path = None
+    ) -> int:
+        """Persist the common S01-S09 episode envelope in existing tables."""
+        episode = result.get("generated_episode")
+        spec = result.get("scenario_spec")
+        if not isinstance(episode, dict) or not isinstance(spec, dict):
+            return 0
+        self.write_json("scenario_contract.json", {
+            "data_contract": result.get("data_contract", {}),
+            "scenario_spec": spec,
+            "generated_episode": episode,
+            "concrete_episode_v2": result.get("concrete_episode_v2", {}),
+            "production_runtime": result.get("production_runtime", {}),
+            "scenario_events": result.get("scenario_events", []),
+            "event_timeline": result.get("event_timeline", {}),
+            "decisions": result.get("decisions", []),
+            "decision_points": result.get("decision_points", []),
+            "route_plans": result.get("route_plans", []),
+            "task_results": result.get("task_results", []),
+            "metrics": result.get("metrics", {}),
+            "closed_loop_validation": result.get("closed_loop_validation", {}),
+        })
+
+        def item_value(item, *names, default=None):
+            for name in names:
+                if item.get(name) is not None:
+                    return item[name]
+            return default
+
+        vehicles = []
+        for item in episode.get("vehicles", []):
+            if not isinstance(item, dict) or not item.get("vehicle_id"):
+                continue
+            role = str(item_value(item, "initial_role", "role", "role_name",
+                                  default="unassigned"))
+            status = str(item_value(item, "initial_status", "status",
+                                    "task_status", default="unknown"))
+            vehicles.append(SimpleNamespace(
+                vehicle_id=str(item["vehicle_id"]),
+                display_name=str(item_value(item, "display_name",
+                                            default=item["vehicle_id"])),
+                equipment_type=str(item_value(item, "equipment_type",
+                                               default=role)),
+                blueprint=str(item_value(item, "blueprint",
+                                         default="NOT_AVAILABLE")),
+                capabilities=list(item.get("capabilities") or []),
+                spawn_point_index=item.get("spawn_point_index"),
+                initial_role=role, initial_status=status,
+                available=bool(item.get("available", True)),
+                active=bool(item.get("active", True)),
+                in_traffic=bool(item.get("in_traffic", False)),
+            ))
+        tasks = []
+        for item in episode.get("tasks", []):
+            if not isinstance(item, dict) or not item.get("task_id"):
+                continue
+            tasks.append(SimpleNamespace(
+                task_id=str(item["task_id"]),
+                zone_id=item.get("zone_id"),
+                task_type=item.get("task_type"),
+                priority=item.get("priority"),
+                required_capabilities=list(item.get("required_capabilities") or []),
+                preferred_vehicle_id=item.get("preferred_vehicle_id"),
+            ))
+        events = []
+        for item in episode.get("events", []):
+            if not isinstance(item, dict) or not item.get("event_id"):
+                continue
+            trigger = item.get("trigger") if isinstance(item.get("trigger"), dict) else {}
+            events.append(SimpleNamespace(
+                event_id=str(item["event_id"]),
+                event_type=str(item.get("event_type") or "scenario_event"),
+                trigger_tick=trigger.get("tick"),
+                target_vehicle_id=item.get("payload", {}).get("vehicle_id")
+                    if isinstance(item.get("payload"), dict) else None,
+                parameters=dict(item.get("payload") or {}),
+            ))
+        fleet = dict(episode.get("fleet") or {})
+        total = int(fleet.get("total") or fleet.get("total_vehicles") or len(vehicles))
+        fleet_snapshot = {
+            "total_vehicles": total,
+            "available_vehicles": int(fleet.get("available") or fleet.get("available_vehicles") or total),
+            "active_vehicles": int(fleet.get("active") or fleet.get("active_vehicles") or total),
+            "traffic_vehicles": int(fleet.get("traffic") or fleet.get("traffic_vehicles") or 0),
+            "task_load": fleet.get("task_load"),
+            "traffic_density": fleet.get("traffic_density"),
+        }
+        snapshot = SimpleNamespace(
+            run_id=self.run_id,
+            scenario_id=str(episode.get("scenario_id") or result.get("scenario_id")),
+            scenario_name=str(spec.get("name") or episode.get("scenario_id")),
+            scenario_version=str(spec.get("schema_version") or "openpit.scenario-spec.v1"),
+            seed=episode.get("seed"), fleet_snapshot=fleet_snapshot,
+            vehicles=vehicles, tasks=tasks, events=events,
+            to_dict=lambda: dict(episode),
+        )
+        self._store(lambda store: store.record_episode(
+            snapshot, config_path=config_path,
+            policy_version=result.get("provenance", {}).get("policy_version"),
+            route_planner_version=result.get("provenance", {}).get("route_planner_version"),
+            risk_model_version=result.get("provenance", {}).get("risk_model_version"),
+        ))
+        # Keep the decision boundary queryable before a future UI adds human
+        # responses.  This is a declaration of a recommendation/review point,
+        # not evidence that an operator approved a structural result.
+        for point in result.get("decision_points", []):
+            if not isinstance(point, dict) or not point.get("decision_point_id"):
+                continue
+            self.record("decision_point_created", dict(point))
+        production = result.get("production_runtime")
+        if isinstance(production, dict):
+            for transition in production.get("transitions", []):
+                if isinstance(transition, dict):
+                    self.record(
+                        "task_production_stage_changed", dict(transition)
+                    )
+        return 1
 
     def record_runtime_events(self, result: Dict[str, Any]) -> int:
         """Persist simulator feedback already emitted by an execution adapter.

@@ -78,7 +78,8 @@ def constrained_seeded_tasks(routes: Iterable[Dict[str, object]], blocked_spawn_
                              seed: int, vehicle_count: int, minimum_length_m: float,
                              maximum_length_m: float, minimum_incoming: int = 1,
                              minimum_outgoing: int = 1,
-                             scenario_key: str = "s01") -> List[Dict[str, object]]:
+                             scenario_key: str = "s01",
+                             avoid_spawn_pairs=None) -> List[Dict[str, object]]:
     """Build an auditable structural scenario draft from the global P5 index.
 
     Each draft uses strict planner routes within the configured length window,
@@ -103,7 +104,15 @@ def constrained_seeded_tasks(routes: Iterable[Dict[str, object]], blocked_spawn_
     randomizer = Random(int(seed))
     origins = sorted(by_origin)
     randomizer.shuffle(origins)
+    # ``blocked_spawn_pairs`` are observed failed simultaneous spawns.  The
+    # optional set contains P4 static proximity inferences.  Treating the
+    # latter as a conservative sampler exclusion reduces risky initial
+    # layouts without promoting it to a collision/clearance conclusion.
     blocked = {tuple(sorted((str(a), str(b)))) for a, b in blocked_spawn_pairs}
+    blocked.update(
+        tuple(sorted((str(a), str(b))))
+        for a, b in (avoid_spawn_pairs or set())
+    )
     # Route-combination selection handles one-way map structure.  Selecting
     # all origins first can otherwise leave an origin with no legal endpoint.
     selected = None

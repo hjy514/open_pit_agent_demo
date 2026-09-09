@@ -10,7 +10,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from open_pit_agent.scenario.catalog import (
     DEFAULT_CATALOG_PATH, compatibility_config_path, load_scenario_catalog,
-    selectable_vehicle_counts, validate_scenario_request,
+    scenario_spec, selectable_vehicle_counts, validate_scenario_request,
 )
 
 
@@ -29,6 +29,19 @@ class ScenarioCatalogTests(unittest.TestCase):
         self.assertTrue(compatibility_config_path("s01").is_file())
         self.assertTrue(compatibility_config_path("s08").is_file())
         self.assertEqual((6, 8), selectable_vehicle_counts("s02"))
+
+    def test_every_catalog_entry_exposes_the_same_scenario_spec_contract(self):
+        for key in load_scenario_catalog():
+            spec = scenario_spec(key).to_dict()
+            self.assertEqual("openpit.scenario-spec.v1", spec["schema_version"])
+            self.assertEqual(key, spec["scenario_key"])
+            self.assertIn("fleet", spec)
+            self.assertIn("events", spec)
+            self.assertIn("success_criteria", spec)
+        self.assertEqual(
+            "legacy_golden_compatibility_adapter",
+            scenario_spec("s08").implementation_mode,
+        )
 
     def test_request_validation_is_fail_closed(self):
         validate_scenario_request("s01", "structural", 6)

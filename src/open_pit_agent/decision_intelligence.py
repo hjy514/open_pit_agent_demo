@@ -901,6 +901,17 @@ def build_structural_transition_dataset(
         for item in result.get("tasks", [])
         if isinstance(item, dict) and item.get("task_id")
     }
+    decision_point_by_task = {}
+    for point in result.get("decision_points", []):
+        if not isinstance(point, dict) or not point.get("decision_point_id"):
+            continue
+        for action in point.get("candidate_actions", []):
+            if not isinstance(action, dict) or not action.get("task_id"):
+                continue
+            # Event response takes precedence over the initial dispatch point.
+            task_id = str(action["task_id"])
+            if point.get("trigger_event_id") or task_id not in decision_point_by_task:
+                decision_point_by_task[task_id] = point
     initial_assignments = {
         str(item.get("task_id")): item
         for item in result.get("initial_assignments", [])
@@ -1326,6 +1337,12 @@ def build_structural_transition_dataset(
             "task": task,
         }
         decision = dict(decision)
+        point = decision_point_by_task.get(str(decision.get("task_id")), {})
+        if point:
+            decision["decision_point_id"] = point.get("decision_point_id")
+            decision["review_policy"] = point.get("review_policy")
+            decision["review_status"] = point.get("review_status")
+            decision["operator_response"] = point.get("operator_response")
         decision["schema_version"] = DECISION_ACTION_SCHEMA_VERSION
         source_decision = source_decision_by_key.get((
             str(decision.get("task_id")), str(decision.get("action_type")),

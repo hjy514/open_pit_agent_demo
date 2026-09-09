@@ -9,6 +9,7 @@ from ..map_resources.road_graph import route_plans_from_store
 from ..scheduler import BaselineScheduler
 from .episode import build_episode
 from .fleet import snapshot_from_episode, vehicle_state_snapshot
+from .generator import sample_event_timing
 from .random_s01 import prepare_random_map_workload
 
 
@@ -31,9 +32,9 @@ def _traffic_parameters(config: Any, seed: int) -> Dict[str, float]:
     if headway < 0:
         raise ValueError("S06 minimum_safety_headway_seconds must be non-negative")
     random = Random(int(seed) + 6006)
+    timing = sample_event_timing(config, "s06", seed)
     return {
-        "event_tick": int(raw.get("event_tick", 30)),
-        "recovery_tick": int(raw.get("recovery_tick", 60)),
+        **timing,
         "road_capacity_vehicles": capacity,
         "minimum_safety_headway_seconds": headway,
         "initial_blockage_seconds": round(random.uniform(
@@ -59,8 +60,12 @@ def run_random_s06_structural_mock(config: Any, seed: Optional[int] = None,
                 (binding.map_id, binding.resource_version),
             )
         }
-    if eligible_pairs_override is not None:
-        eligible_pairs &= set(eligible_pairs_override)
+    physical_override = (
+        set(eligible_pairs_override)
+        if eligible_pairs_override is not None else None
+    )
+    if physical_override is not None:
+        eligible_pairs = physical_override
     if not eligible_pairs:
         raise ValueError(
             "S06 has no topology-consistent route candidates; run "
@@ -112,7 +117,8 @@ def run_random_s06_structural_mock(config: Any, seed: Optional[int] = None,
 
         with MapResourceStore(binding.database_path) as store:
             plans = route_plans_from_store(
-                store, binding.map_id, binding.resource_version, endpoints
+                store, binding.map_id, binding.resource_version, endpoints,
+                physically_reached_pairs=physical_override,
             )
             if len(plans) != len(assignments):
                 raise ValueError("S06 requires a topology route for every active task")

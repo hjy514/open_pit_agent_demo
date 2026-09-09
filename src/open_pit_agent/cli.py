@@ -42,7 +42,11 @@ from .risk import (
 )
 from .restrictions import RestrictionRegistry
 from .scenario_runtime import ResolvedScenario, resolve_scenario
-from .scenario import build_episode
+from .scenario import (
+    build_episode,
+    normalize_scenario_run_result,
+    scenario_spec,
+)
 from .scheduler import (
     BaselineScheduler,
     SchedulingError,
@@ -54,6 +58,72 @@ RUNTIME_API_URL = os.environ.get(
     "OPENPIT_RUNTIME_API_URL",
     "http://127.0.0.1:8000/runtime/sync",
 )
+
+
+def _normalize_s08_golden_summary(
+    summary: Dict[str, object], config: ScenarioConfig
+) -> Dict[str, object]:
+    """Expose the established Golden Demo through the common S01-S09 result."""
+    normalized = dict(summary)
+    tasks = [dict(item) for item in normalized.get("tasks", [])
+             if isinstance(item, dict)]
+    vehicles = [dict(item) for item in normalized.get("vehicle_states", [])
+                if isinstance(item, dict)]
+    task_count = len(tasks)
+    completed = sum(item.get("status") == "completed" for item in tasks)
+    closed = bool(normalized.get("monitoring_dispatch_closed_loop"))
+    normalized.update({
+        "scenario_key": "s08",
+        "seed": normalized.get("scenario_seed"),
+        "task_count": task_count,
+        "completed_task_count": completed,
+        "final_vehicle_states": vehicles,
+        "fleet": {
+            "total": len(vehicles), "available": sum(
+                bool(item.get("available", True)) for item in vehicles
+            ),
+            "active": len(vehicles), "traffic": 0,
+            "vehicles": vehicles,
+        },
+        "assignments": [{
+            "task_id": item.get("task_id"),
+            "vehicle_id": item.get("assigned_vehicle_id"),
+            "score": None,
+            "reason": item.get("recommendation_reason")
+                or item.get("status_reason"),
+        } for item in tasks if item.get("task_id") and item.get("assigned_vehicle_id")],
+        "slope_event": {
+            "event_type": "progressive_slope_risk",
+            "assessment_count": len(normalized.get("risk_assessments", [])),
+            "risk_triggered": bool(normalized.get("risk_triggered")),
+            "data_origin": normalized.get("risk_dataset_label"),
+        },
+        "closed_loop_validation": {
+            "status": "CLOSED_LOOP_PASS" if closed else "CLOSED_LOOP_FAIL",
+            "scenario_key": "s08",
+            "checks": [{
+                "check": "s08_monitoring_dispatch_closed_loop",
+                "passed": closed,
+                "detail": normalized.get("monitoring_dispatch_closed_loop"),
+            }],
+        },
+        "closed_loop_status": (
+            "CLOSED_LOOP_PASS" if closed else "CLOSED_LOOP_FAIL"
+        ),
+        "simulation_claim": "carla_s08_golden_compatibility_execution",
+    })
+    map_resource = config.map_resource
+    return normalize_scenario_run_result(
+        normalized, scenario_key="s08",
+        map_context={
+            "map_id": config.carla.map_name,
+            "resource_version": (
+                map_resource.resource_version
+                if map_resource is not None else None
+            ),
+        },
+        scenario_spec=scenario_spec("s08").to_dict(),
+    )
 RUNTIME_API_BASE_URL = RUNTIME_API_URL.rsplit(
     "/runtime/sync", 1
 )[0]
@@ -2416,6 +2486,21 @@ def run_carla(
         finalize_learning_and_acceptance(
             recorder, summary, decision_records
         )
+        if config.scenario_id == "openpit-mine-competition-demo-v1":
+            summary = _normalize_s08_golden_summary(summary, config)
+            recorder.write_json("scenario_contract.json", {
+                "data_contract": summary["data_contract"],
+                "scenario_spec": summary["scenario_spec"],
+                "generated_episode": summary["generated_episode"],
+                "scenario_events": summary["scenario_events"],
+                "decisions": summary["decisions"],
+                "route_plans": summary["route_plans"],
+                "task_results": summary["task_results"],
+                "metrics": summary["metrics"],
+                "closed_loop_validation": summary[
+                    "closed_loop_validation"
+                ],
+            })
         recorder.record("run_completed", summary)
         recorder.write_json("summary.json", summary)
         export_interface(summary, recorder)

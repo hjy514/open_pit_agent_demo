@@ -277,6 +277,7 @@ def route_plans_from_store(
     map_id: str,
     resource_version: str,
     endpoint_pairs: Dict[str, Tuple[str, str]],
+    physically_reached_pairs: Optional[Iterable[Tuple[str, str]]] = None,
 ) -> Dict[str, List[str]]:
     """Load the best available candidate route for each task from the map DB.
 
@@ -286,20 +287,50 @@ def route_plans_from_store(
     safety validation.
     """
     plans: Dict[str, List[str]] = {}
+    physical = {
+        (str(item[0]), str(item[1]))
+        for item in (physically_reached_pairs or set())
+    }
     query = (
-        "SELECT road_lane_sequence_json FROM route_candidates "
+        "SELECT road_lane_sequence_json,validation_status FROM route_candidates "
         "WHERE map_id=? AND resource_version=? AND from_point_id=? "
-        "AND to_point_id=? AND validation_status NOT IN "
-        "('REJECTED','TOPOLOGY_LENGTH_MISMATCH') "
+        "AND to_point_id=? AND validation_status != 'REJECTED' "
         "ORDER BY candidate_rank ASC LIMIT 1"
     )
+    graph = None
+    planner = None
+    anchors = None
     for task_id, pair in endpoint_pairs.items():
         if not isinstance(pair, (tuple, list)) or len(pair) != 2:
             continue
         row = store.connection.execute(
             query, (str(map_id), str(resource_version), str(pair[0]), str(pair[1]))
         ).fetchone()
+        pair_key = (str(pair[0]), str(pair[1]))
+        if (not row or not row[0]) and pair_key in physical:
+            # P6 is the execution-admission fact.  Some early P6 runs were
+            # recorded before the derived route-candidate table was rebuilt;
+            # reconstruct only that exact directed pair from the persisted
+            # Road Graph instead of silently discarding physical evidence.
+            if graph is None:
+                graph = RoadGraph.from_store(store, map_id, resource_version)
+                planner = RoutePlanner(graph)
+                anchors = verified_point_anchors_from_store(
+                    store, graph, map_id
+                )
+            start = anchors.get(pair_key[0])
+            goal = anchors.get(pair_key[1])
+            if start is None or goal is None:
+                continue
+            reconstructed = planner.plan(start, goal).to_dict()
+            edge_ids = reconstructed.get("edge_ids") or []
+            if reconstructed.get("reachable") and edge_ids:
+                plans[str(task_id)] = [str(edge_id) for edge_id in edge_ids]
+            continue
         if not row or not row[0]:
+            continue
+        if str(row[1]) == "TOPOLOGY_LENGTH_MISMATCH" \
+                and pair_key not in physical:
             continue
         try:
             payload = json.loads(row[0])

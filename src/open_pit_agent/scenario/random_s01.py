@@ -4,23 +4,15 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Set, Tuple
 
-from ..config import VehicleConfig, ZoneConfig
 from ..decision import (CandidateCostInput, MapContext, MultiObjectiveCostModel,
                         OptimizationAssignmentAdapter, OptimizationScheduler,
                         load_cost_weights,
                         review_selected_candidate_rankings)
-from ..models import Position, Task, VehicleState
-from ..map_resources import MapResourceStore
-from ..map_resources.route_coverage import BOUNDARY, constrained_seeded_tasks
+from ..models import Task, VehicleState
+from ..map_resources.route_coverage import BOUNDARY
 from ..scheduler import BaselineScheduler
 from .mock_runner import run_s01_structural_mock
-
-
-ROLE_DETAILS = {
-    "haul": ("运输车", "haul_truck", ["haul", "inspection"], ["haul"]),
-    "inspection": ("巡检车", "inspection_vehicle", ["inspection", "slope_monitoring"], ["inspection", "slope_monitoring"]),
-    "support": ("保障车", "support_vehicle", ["inspection", "emergency_support"], ["emergency_support"]),
-}
+from .generator import ROLE_DETAILS, generate_map_constrained_workload
 
 
 def prepare_random_map_workload(config: Any, seed: Optional[int] = None,
@@ -28,81 +20,16 @@ def prepare_random_map_workload(config: Any, seed: Optional[int] = None,
                                 minimum_length_m: float = 500.0,
                                 maximum_length_m: float = 3000.0,
                                 scenario_key: str = "s01",
-                                eligible_pairs: Optional[Set[Tuple[str, str]]] = None
+                                eligible_pairs: Optional[Set[Tuple[str, str]]] = None,
+                                deadhead_eligible_pairs: Optional[
+                                    Set[Tuple[str, str]]
+                                ] = None,
                                 ) -> Dict[str, Any]:
-    """Resolve one reproducible multi-vehicle workload from static P5 facts."""
-    binding = config.map_resource
-    if binding is None or not binding.database_path or not binding.map_id or not binding.resource_version:
-        raise ValueError("random map workload requires a map_resource database binding")
-    effective_seed = config.demo.random_seed if seed is None else int(seed)
-    with MapResourceStore(binding.database_path) as store:
-        points = {item["point_id"]: item for item in store.verified_spawn_points(binding.map_id)}
-        planner_routes = list(store.planner_reachable_pairs(binding.map_id, binding.resource_version))
-        if eligible_pairs is not None:
-            planner_routes = [
-                item for item in planner_routes
-                if (item["from_point_id"], item["to_point_id"]) in eligible_pairs
-            ]
-        tasks = constrained_seeded_tasks(
-            planner_routes,
-            store.blocked_dual_spawn_pairs(binding.map_id, binding.resource_version),
-            effective_seed, vehicle_count, minimum_length_m, maximum_length_m,
-            scenario_key=scenario_key,
-        )
-    vehicles, zones, runtime_tasks = [], [], []
-    for item in tasks:
-        role = item["vehicle_role"]
-        display_prefix, equipment_type, capabilities, requirements = ROLE_DETAILS[role]
-        start, target = points[item["from_point_id"]], points[item["to_point_id"]]
-        vehicles.append(VehicleConfig(
-            vehicle_id=item["vehicle_id"], display_name="{}{:02d}".format(display_prefix, item["vehicle_slot"]),
-            equipment_type=equipment_type, role_name=role, blueprint="vehicle.cat.cat",
-            spawn_point_index=int(start["spawn_point_index"]),
-            mock_position=Position(float(start["x"]), float(start["y"]), float(start["z"])),
-            target_speed_kmh=25.0 if role == "haul" else 20.0,
-            capabilities=list(capabilities),
-        ))
-        zones.append(ZoneConfig(
-            zone_id=item["task_id"], display_name="随机{}任务区".format(role),
-            priority=60 if role == "haul" else 50 if role == "inspection" else 45,
-            required_capabilities=list(requirements),
-            target_spawn_point_index=int(target["spawn_point_index"]),
-            mock_position=Position(float(target["x"]), float(target["y"]), float(target["z"])),
-            preferred_vehicle_id=None,
-        ))
-        runtime_tasks.append(Task(
-            task_id=item["task_id"], zone_id=item["task_id"],
-            priority=60 if role == "haul" else 50 if role == "inspection" else 45,
-            required_capabilities=list(requirements), preferred_vehicle_id=None,
-            task_type="haul_transport" if role == "haul" else "slope_inspection" if role == "inspection" else "equipment_support",
-        ))
-    dynamic = replace(config, scenario_id="{}-{}v-seed-{}".format(
-                          str(scenario_key).lower(), vehicle_count, effective_seed),
-                      vehicles=vehicles, zones=zones,
-                      fleet=replace(config.fleet, total_vehicles=vehicle_count,
-                                    available_vehicles=vehicle_count, active_vehicles=vehicle_count,
-                                    traffic_vehicles=0, role_policy="fixed"))
-    vehicle_origins = {item["vehicle_id"]: item["from_point_id"] for item in tasks}
-    zone_targets = {item["task_id"]: item["to_point_id"] for item in tasks}
-    route_costs = {
-        (item["from_point_id"], item["to_point_id"]): item["route_length_m"]
-        for item in planner_routes
-    }
-
-    return {
-        "config": dynamic,
-        "seed": effective_seed,
-        "vehicle_count": vehicle_count,
-        "vehicles": vehicles,
-        "zones": zones,
-        "tasks": runtime_tasks,
-        "task_drafts": tasks,
-        "vehicle_origins": vehicle_origins,
-        "zone_targets": zone_targets,
-        "route_costs": route_costs,
-        "minimum_length_m": minimum_length_m,
-        "maximum_length_m": maximum_length_m,
-    }
+    """Compatibility name for the unified map-constrained generator."""
+    return generate_map_constrained_workload(
+        config, seed, vehicle_count, minimum_length_m, maximum_length_m,
+        scenario_key, eligible_pairs, deadhead_eligible_pairs,
+    )
 
 
 def run_random_s01_structural_mock(config: Any, seed: Optional[int] = None,
@@ -124,6 +51,7 @@ def run_random_s01_structural_mock(config: Any, seed: Optional[int] = None,
     vehicle_origins = workload["vehicle_origins"]
     zone_targets = workload["zone_targets"]
     route_costs = workload["route_costs"]
+    route_validation_statuses = workload["route_validation_statuses"]
 
     def route_distance(vehicle, zone):
         value = route_costs.get((vehicle_origins[vehicle.vehicle_id], zone_targets[zone.zone_id]))
@@ -171,7 +99,9 @@ def run_random_s01_structural_mock(config: Any, seed: Optional[int] = None,
                     route_reachable=route_length is not None,
                     route_length_m=route_length,
                     planner_version="CARLA_GlobalRoutePlanner_0.9.10_res_2.000m",
-                    validation_status="PLANNER_REACHABLE" if route_length is not None else None,
+                    validation_status=route_validation_statuses.get(
+                        (vehicle_origins[vehicle_config.vehicle_id], zone_targets[task.zone_id])
+                    ) if route_length is not None else None,
                 ),
                 runtime_state={
                     "minimum_route_length_m": minimum_length_m,

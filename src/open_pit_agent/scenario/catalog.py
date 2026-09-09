@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
+from .models import ScenarioSpec
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CATALOG_PATH = PROJECT_ROOT / "configs" / "scenario_catalog.json"
@@ -69,6 +71,18 @@ def selectable_vehicle_counts(scenario_id: str,
     if key not in entries:
         raise ValueError("unknown scenario: {}".format(scenario_id))
     return tuple(int(value) for value in entries[key]["fleet"]["selectable_vehicle_counts"])
+
+
+def scenario_spec(
+    scenario_id: str,
+    catalog: Optional[Dict[str, Dict[str, object]]] = None,
+) -> ScenarioSpec:
+    """Return the common immutable ScenarioSpec for any S01-S09 entry."""
+    entries = catalog or load_scenario_catalog()
+    key = str(scenario_id).lower()
+    if key not in entries:
+        raise ValueError("unknown scenario: {}".format(scenario_id))
+    return ScenarioSpec.from_catalog_entry(key, entries[key])
 
 
 def validate_scenario_request(scenario_id: str, mode: str, vehicle_count: int,

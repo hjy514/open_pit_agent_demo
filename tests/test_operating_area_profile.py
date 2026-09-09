@@ -43,9 +43,9 @@ class OperatingAreaProfileTest(unittest.TestCase):
                      "z": 0.0, "validation_status": "VERIFIED_SPAWN", "source": "TEST"}
                     for index in indices
                 ])
-                self.assertEqual(5, register_operating_area_profile(store, profile))
+                self.assertEqual(9, register_operating_area_profile(store, profile))
                 stored = list(store.operating_areas("0325_5", "1.0-draft"))
-                self.assertEqual(5, len(stored))
+                self.assertEqual(9, len(stored))
                 self.assertEqual(19, len(store.table_names()))
 
 

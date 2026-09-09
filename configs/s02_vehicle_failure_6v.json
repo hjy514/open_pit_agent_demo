@@ -228,7 +228,7 @@
     "random_seed": 202602,
     "arrival_tolerance_m": 3.0,
     "task_timeout_ticks": 1000,
-    "fault_pull_over_offset_m": 0,
+    "fault_pull_over_offset_m": 12.0,
     "idle_pull_over_offset_m": 0
   },
   "map_resource": {
@@ -271,8 +271,11 @@
           ],
           "tick_range": [
             20,
-            20
-          ]
+            60
+          ],
+          "parameters": {
+            "trigger_tick_range": [20, 60]
+          }
         }
       ]
     }

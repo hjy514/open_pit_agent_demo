@@ -33,7 +33,7 @@
       "seed": 202603,
       "events": [{
         "event_type": "loading_equipment_failure",
-        "parameters": {"failure_tick": 30, "recovery_tick": 70, "work_point_switch_delay_seconds_range": [30.0, 60.0]}
+        "parameters": {"failure_tick": 30, "recovery_tick": 70, "trigger_tick_range": [25, 55], "duration_ticks_range": [30, 70], "work_point_switch_delay_seconds_range": [30.0, 60.0]}
       }]
     },
     "resource_admission": {"execution_mode": "structural_mock", "spawn_policy": "VERIFIED_SPAWN_EXCLUDING_RECORDED_DUAL_SPAWN_BLOCKED", "route_policy": "TOPOLOGY_DERIVED_UNVERIFIED_ONLY"},

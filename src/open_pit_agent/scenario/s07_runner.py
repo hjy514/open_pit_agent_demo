@@ -13,6 +13,7 @@ from ..map_resources.road_graph import (
 from ..scheduler import BaselineScheduler, tasks_from_zones
 from .episode import build_episode
 from .fleet import snapshot_from_episode, vehicle_state_snapshot
+from .generator import sample_event_timing
 from .road_state import RoadState
 from .random_s01 import prepare_random_map_workload
 
@@ -137,8 +138,12 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
                 (binding.map_id, binding.resource_version),
             )
         }
-    if eligible_pairs_override is not None:
-        eligible_pairs &= set(eligible_pairs_override)
+    physical_override = (
+        set(eligible_pairs_override)
+        if eligible_pairs_override is not None else None
+    )
+    if physical_override is not None:
+        eligible_pairs = physical_override
     if not eligible_pairs:
         raise ValueError(
             "S07 has no topology-consistent route candidates; run "
@@ -151,6 +156,9 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
     )
     dynamic = workload["config"]
     effective_seed = workload["seed"]
+    event_timing = sample_event_timing(dynamic, "s07", effective_seed)
+    closure_tick = event_timing["closure_tick"]
+    recovery_tick = event_timing["recovery_tick"]
     randomization = dynamic.scenario_variables.get("randomization", {})
     events = randomization.get("events", []) if isinstance(randomization, dict) else []
     event_parameters = (
@@ -205,7 +213,8 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
         }
         with MapResourceStore(binding.database_path) as store:
             normal_plans = route_plans_from_store(
-                store, binding.map_id, binding.resource_version, endpoints
+                store, binding.map_id, binding.resource_version, endpoints,
+                physically_reached_pairs=physical_override,
             )
             if len(normal_plans) != len(assignments):
                 raise ValueError(
@@ -219,12 +228,36 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
             anchors = verified_point_anchors_from_store(
                 store, graph, binding.map_id
             )
+            topology_event_pairs = {
+                (str(row[0]), str(row[1]))
+                for row in store.connection.execute(
+                    "SELECT from_point_id,to_point_id FROM route_candidates "
+                    "WHERE map_id=? AND resource_version=? "
+                    "AND validation_status='TOPOLOGY_DERIVED_UNVERIFIED'",
+                    (binding.map_id, binding.resource_version),
+                )
+            }
+            require_topology_consistency = scenario_key == "s07"
 
             admitted = []
             assignment_by_task = {item.task_id: item for item in assignments}
             task_by_id = {task.task_id: task for task in tasks}
+            # A P6 endpoint pair proves a BasicAgent traversal, while a
+            # RoadGraph sequence describes which edge a closure affects.
+            # Require both facts for the task selected by the event.  This
+            # prevents a topology-length mismatch (for example a few-hundred-
+            # metre P5 route reconstructed as several kilometres) from being
+            # promoted into a CARLA detour.
+            event_eligible_task_ids = {
+                task_id for task_id, pair in endpoints.items()
+                if not require_topology_consistency
+                or tuple(pair) in topology_event_pairs
+            }
             internal_edges = sorted({
-                edge_id for plan in normal_plans.values() for edge_id in plan[1:-1]
+                edge_id
+                for task_id, plan in normal_plans.items()
+                if task_id in event_eligible_task_ids
+                for edge_id in plan[1:-1]
             })
             for edge_id in internal_edges:
                 impacted = sorted(
@@ -232,6 +265,11 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
                     if edge_id in plan
                 )
                 if not impacted or len(impacted) >= len(normal_plans):
+                    continue
+                if any(
+                    task_id not in event_eligible_task_ids
+                    for task_id in impacted
+                ):
                     continue
                 # The closure must be ahead of, rather than under, every
                 # affected vehicle and must permit deterministic graph bypass.
@@ -282,6 +320,12 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
                             continue
                         candidate_start_id = vehicle_origins[candidate.vehicle_id]
                         if (candidate_start_id, goal_id) not in eligible_pairs:
+                            continue
+                        if (
+                            require_topology_consistency
+                            and (candidate_start_id, goal_id)
+                            not in topology_event_pairs
+                        ):
                             continue
                         candidate_start = anchors.get(candidate_start_id)
                         if candidate_start is None:
@@ -369,7 +413,7 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
                     task.original_vehicle_id = assignment.vehicle_id
                     task.assigned_vehicle_id = selected_vehicle_id
                     task.handover_reason = "original_vehicle_has_no_safe_road_bypass"
-                    task.handover_tick = 30
+                    task.handover_tick = closure_tick
                     task.transfer_count += 1
                 route_changes.append({
                     "task_id": task_id,
@@ -387,6 +431,11 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
                     "constraint_results": {
                         "selected_route_reachable": bool(alternative.get("reachable")),
                         "selected_route_nonempty": bool(alternative.get("edge_ids")),
+                        "topology_length_consistent": (
+                            not require_topology_consistency
+                            or (solution["start_point_id"], goal_id)
+                            in topology_event_pairs
+                        ),
                         "closed_edge_avoided": (
                             closed_edge_id not in alternative.get("edge_ids", [])
                         ),
@@ -419,7 +468,7 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
         }
         for task in tasks:
             task.status = "completed"
-            task.completed_tick = 31
+            task.completed_tick = recovery_tick
             task.status_reason = (
                 "structural_mock_completion_after_takeover"
                 if action_by_task.get(task.task_id) == "task_takeover_after_no_safe_bypass"
@@ -438,6 +487,8 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
             "scenario_source": "map_resources_topology_and_global_p5",
             "random_mode": "seeded_structural_road_closure_mock_only",
             "closed_edge_id": closed_edge_id,
+            "closure_tick": closure_tick,
+            "recovery_tick": recovery_tick,
             "closure_candidate_count": len(admitted),
             "maximum_admitted_detour_ratio": maximum_detour_ratio,
             "route_source": "map_resource_db",

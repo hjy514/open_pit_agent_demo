@@ -10,7 +10,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from open_pit_agent.map_resources import (
     GraphEdge, MapResourceStore, RoadGraph, RoutePlanner,
     derive_topology_route_candidates,
-    identify_affected_routes,
+    identify_affected_routes, route_plans_from_store,
 )
 
 
@@ -117,6 +117,38 @@ class RoadGraphTest(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(["e1"], json.loads(row[0])["edge_ids"])
                 self.assertEqual("TOPOLOGY_DERIVED_UNVERIFIED", row[1])
+
+    def test_exact_p6_pair_can_reconstruct_missing_candidate_sequence(self):
+        with tempfile.TemporaryDirectory() as td:
+            with MapResourceStore(Path(td) / "map.db") as store:
+                store.initialise_map(
+                    "m", "m", "m", "vehicle.cat.cat", resource_version="v"
+                )
+                self._insert_node(store, "a", 0, 0)
+                self._insert_node(store, "b", 100, 0)
+                self._insert_edge(
+                    store, "e1", "a", "b", 100,
+                    [[0, 0, 0], [100, 0, 0]],
+                )
+                for point_id, x in (("p1", 10), ("p2", 90)):
+                    store.connection.execute(
+                        "INSERT INTO map_points(point_id,map_id,x,y,z,road_id,"
+                        "lane_id,validation_status,source) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (point_id, "m", x, 0, 0, "1", 1,
+                         "VERIFIED_SPAWN", "TEST"),
+                    )
+                store.connection.commit()
+                endpoints = {"task": ("p1", "p2")}
+                self.assertEqual(
+                    {}, route_plans_from_store(store, "m", "v", endpoints)
+                )
+                self.assertEqual(
+                    {"task": ["e1"]},
+                    route_plans_from_store(
+                        store, "m", "v", endpoints,
+                        physically_reached_pairs={("p1", "p2")},
+                    ),
+                )
 
 
 if __name__ == "__main__":

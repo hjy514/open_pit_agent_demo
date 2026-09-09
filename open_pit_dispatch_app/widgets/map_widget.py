@@ -827,7 +827,7 @@ class MapWidget(QGraphicsView):
 
         message = self.scene.addText(
             "当前没有可绘制的车辆坐标。\n"
-            "请先启动API，再运行 --mode carla-run。"
+            "请先启动API，再从界面启动结构化或CARLA场景。"
         )
         message.setDefaultTextColor(
             QColor("#ffcc80")

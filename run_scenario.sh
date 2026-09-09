@@ -60,13 +60,14 @@ OpenPit统一场景入口
   ./run_scenario.sh --scenario s01 [--mode structural] [场景参数]
   ./run_scenario.sh --scenario s01 --compare-policies --runs 10 --seed 202700
   ./run_scenario.sh --scenario s01 --mode carla --random-map [--check-only]
+  ./run_scenario.sh --scenario all --mode carla --check-only
   ./run_scenario.sh --scenario s08 --mode carla [--check-only]
   ./run_scenario.sh --list-scenarios
   ./run_scenario.sh --database-health [--stale-hours 24]
 
 当前可运行：
   structural : s01正常生产、s02车辆故障、s03设备故障、s04爆破管控、s05极端天气、s06道路拥堵、s07道路中断、s09复合扰动、all批量
-  carla      : s01–s07/s09统一多车事件执行、s08边坡失稳Golden Demo
+  carla      : s01–s09统一场景入口；s08当前由边坡Golden兼容适配器执行
 
 常用参数：
   --seed N --vehicle-count 6|8 --random-map --runs N
@@ -78,7 +79,7 @@ OpenPit统一场景入口
 
 批量采集推荐--policy auto：S01/S02使用多目标调度，其余场景使用原生安全策略。
 边界：multi-objective实际执行目前支持structural随机地图S01/S02；
-S03/S04/S05/S06/S07/S09使用真实地图资源和结构化事件决策，S08复用原start_slope_demo.sh。
+S03/S04/S05/S06/S07/S09使用真实地图资源和结构化事件决策；S08已纳入统一目录和入口，当前复用原start_slope_demo.sh实现。
 EOF
   exit 0
 fi
@@ -94,7 +95,7 @@ if [[ "${mode}" == "structural" ]]; then
 fi
 
 if [[ "${mode}" == "carla" ]]; then
-  if [[ "${scenario}" =~ ^s0(1|2|3|4|5|6|7|9)$ ]]; then
+  if [[ "${scenario}" =~ ^s0(1|2|3|4|5|6|7|9)$ || "${scenario}" == "all" ]]; then
     carla_args=(--mode carla "${forward_args[@]}")
     if [[ "${check_only}" == "true" ]]; then
       carla_args+=(--check-only)
@@ -105,8 +106,9 @@ if [[ "${mode}" == "carla" ]]; then
     echo "ERROR: CARLA统一入口支持s01–s07/s09；S08使用Golden Demo。" >&2
     exit 2
   fi
-  # Structural arguments must not leak into run_demo.py through the legacy
-  # launcher.  S08 currently has a fixed, regression-tested configuration.
+  # S08 is registered under the same Scenario Catalog and public command.
+  # Its current execution adapter remains the fixed regression-tested Golden
+  # implementation until the random multi-vehicle S08 handler is admitted.
   if ((${#forward_args[@]} != 2)); then
     echo "ERROR: S08 CARLA当前只接受--scenario s08和可选--check-only。" >&2
     exit 2

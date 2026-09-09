@@ -2,9 +2,13 @@
 """Unified entry for existing CARLA-free structural baseline scenarios."""
 import argparse
 import json
+import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib import error as url_error
+from urllib import request as url_request
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,12 +24,17 @@ from open_pit_agent.decision import (
 )
 from open_pit_agent.evidence import EvidenceRecorder
 from open_pit_agent.sqlite_store import SqliteRunStore
-from open_pit_agent.adapters.carla_adapter import CarlaAdapterError
+from open_pit_agent.adapters.carla_adapter import CarlaAdapter, CarlaAdapterError
 from open_pit_agent.scenario import (
     SCENARIO_CATALOG, SUPPORTED_STRUCTURAL_SCENARIOS, run_structural_scenario,
     summarize_structural_batch, run_carla_scenario_execution,
     normalize_scenario_run_result, compatibility_config_path,
-    validate_scenario_request,
+    validate_scenario_request, build_structural_runtime_snapshots,
+    scenario_spec,
+)
+from open_pit_agent.map_resources import MapResourceStore, RoadGraph
+from open_pit_agent.monitoring import (
+    build_fixed_observations, load_monitoring_layout, monitoring_summary,
 )
 
 
@@ -34,6 +43,422 @@ DEFAULT_CONFIGS = {
     for key in SCENARIO_CATALOG if key != "s08"
 }
 DECISION_CONFIG = ROOT / "configs" / "dispatch_cost_v1.json"
+DEFAULT_MONITORING_CONFIG = ROOT / "configs" / "monitoring_demo.json"
+DEFAULT_RUNTIME_SYNC_URL = os.environ.get(
+    "OPENPIT_RUNTIME_API_URL", "http://127.0.0.1:8000/runtime/sync"
+)
+
+
+def process_control_state():
+    """Read the UI process-control request without coupling scenario logic to API."""
+    path_value = os.environ.get("OPENPIT_SCENARIO_CONTROL_FILE")
+    if not path_value:
+        return "running"
+    try:
+        payload = json.loads(Path(path_value).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "running"
+    state = str(payload.get("requested_state") or "running").lower()
+    return state if state in {"running", "paused"} else "running"
+
+
+def _s08_carla_admission_result(config):
+    result = {
+            "status": "READY",
+            "mode": "carla_execution_check",
+            "scenario_key": "s08",
+            "scenario_id": config.scenario_id,
+            "seed": config.demo.random_seed,
+            "vehicle_count": len(config.vehicles),
+            "task_count": 0,
+            "simulation_claim": (
+                "carla_connection_and_golden_adapter_admission_only"
+            ),
+            "execution": {
+                "status": "READY", "mode": "carla_execution_check",
+                "simulator": "carla", "physical_execution": False,
+            },
+    }
+    return normalize_scenario_run_result(
+        result, scenario_key="s08",
+        scenario_spec=scenario_spec(
+            "s08", SCENARIO_CATALOG
+        ).to_dict(),
+    )
+
+
+def _check_s08_carla_admission(config, load_map=False,
+                               adapter_factory=CarlaAdapter):
+    """Check the fixed S08 Golden adapter without starting its actors."""
+    adapter = adapter_factory(config, load_map=load_map)
+    try:
+        adapter.connect()
+        blueprints = adapter.world.get_blueprint_library().filter(
+            "vehicle.cat.cat"
+        )
+        if not blueprints:
+            raise CarlaAdapterError(
+                "S08 Golden Demo requires blueprint vehicle.cat.cat"
+            )
+        return _s08_carla_admission_result(config)
+    finally:
+        adapter.close()
+
+
+def _run_carla_admission_batch(args):
+    """Run one non-physical admission gate for the complete catalog."""
+    class ConnectedAdmissionAdapter:
+        """No-op adapter after the batch has verified CARLA once."""
+
+        def __init__(self, config, load_map=False):
+            self.config = config
+
+        def connect(self):
+            return None
+
+        def close(self):
+            return None
+
+    checks = []
+    connection_config = load_config(
+        compatibility_config_path("s01", SCENARIO_CATALOG)
+    )
+    connection_adapter = CarlaAdapter(
+        connection_config, load_map=bool(args.load_map)
+    )
+    try:
+        connection_adapter.connect()
+        blueprints = connection_adapter.world.get_blueprint_library().filter(
+            "vehicle.cat.cat"
+        )
+        if not blueprints:
+            raise CarlaAdapterError(
+                "CARLA world does not provide blueprint vehicle.cat.cat"
+            )
+        carla_connection = {
+            "status": "READY",
+            "map_name": connection_adapter.world.get_map().name.split("/")[-1],
+            "vehicle_blueprint": "vehicle.cat.cat",
+        }
+    except (CarlaAdapterError, RuntimeError) as exc:
+        reason = "{}: {}".format(type(exc).__name__, exc)
+        carla_connection = {"status": "BLOCKED", "reason": reason}
+        for scenario_key in SCENARIO_CATALOG:
+            checks.append({
+                "scenario_key": scenario_key, "status": "BLOCKED",
+                "vehicle_count": (
+                    3 if scenario_key == "s08" else int(args.vehicle_count)
+                ),
+                "task_count": None,
+                "carla_readiness": SCENARIO_CATALOG[scenario_key][
+                    "carla_readiness"
+                ],
+                "reason": reason,
+            })
+        return {
+            "schema_version": "openpit.carla-admission-batch.v1",
+            "status": "BLOCKED", "scenario_count": len(checks),
+            "ready_count": 0, "blocked_count": len(checks),
+            "physical_execution": False, "database_recording": False,
+            "carla_connection": carla_connection, "checks": checks,
+        }
+    finally:
+        connection_adapter.close()
+
+    for scenario_key in SCENARIO_CATALOG:
+        config = None
+        config_path = compatibility_config_path(
+            scenario_key, SCENARIO_CATALOG
+        )
+        try:
+            config = load_config(config_path)
+            if scenario_key == "s08":
+                result = _s08_carla_admission_result(config)
+                vehicle_count = len(config.vehicles)
+            else:
+                vehicle_count = int(args.vehicle_count)
+                validate_scenario_request(
+                    scenario_key, "carla", vehicle_count,
+                    SCENARIO_CATALOG,
+                )
+                result = run_carla_scenario_execution(
+                    scenario_key, config, seed=args.seed,
+                    vehicle_count=vehicle_count, ticks=args.ticks,
+                    load_map=False, check_only=True,
+                    execution_policy=args.policy,
+                    adapter_factory=ConnectedAdmissionAdapter,
+                )
+            checks.append({
+                "scenario_key": scenario_key,
+                "status": result.get("status"),
+                "vehicle_count": vehicle_count,
+                "task_count": result.get("task_count"),
+                "route_evidence_admission": (
+                    result.get("route_evidence_admission", {}).get("status")
+                ),
+                "carla_readiness": SCENARIO_CATALOG[scenario_key][
+                    "carla_readiness"
+                ],
+                "reason": None,
+            })
+        except (CarlaAdapterError, ValueError, RuntimeError) as exc:
+            checks.append({
+                "scenario_key": scenario_key,
+                "status": "BLOCKED",
+                "vehicle_count": (
+                    len(config.vehicles) if scenario_key == "s08"
+                    and config is not None else int(args.vehicle_count)
+                ),
+                "task_count": None,
+                "carla_readiness": SCENARIO_CATALOG[scenario_key][
+                    "carla_readiness"
+                ],
+                "reason": "{}: {}".format(type(exc).__name__, exc),
+            })
+    ready_count = sum(item["status"] == "READY" for item in checks)
+    return {
+        "schema_version": "openpit.carla-admission-batch.v1",
+        "status": "READY" if ready_count == len(checks) else "BLOCKED",
+        "scenario_count": len(checks),
+        "ready_count": ready_count,
+        "blocked_count": len(checks) - ready_count,
+        "physical_execution": False,
+        "database_recording": False,
+        "carla_connection": carla_connection,
+        "checks": checks,
+        "boundary": (
+            "Connection, catalog, map-resource and workload admission only; "
+            "no vehicle spawn, physical traversal or fleet-safety claim."
+        ),
+    }
+
+
+def _map_runtime_resources(config):
+    binding = config.map_resource
+    if binding is None or binding.database_path is None or not (
+        Path(binding.database_path).is_file()
+    ):
+        return {}, []
+    with MapResourceStore(binding.database_path) as store:
+        points = {
+            str(item["point_id"]): dict(item)
+            for item in store.verified_spawn_points(binding.map_id)
+        }
+        graph = RoadGraph.from_store(
+            store, binding.map_id, binding.resource_version
+        )
+    roads = []
+    for edge in graph.edges.values():
+        if len(edge.geometry) < 2:
+            continue
+        start, end = edge.geometry[0], edge.geometry[-1]
+        roads.append({
+            "road_id": edge.edge_id,
+            "start": {"x": start[0], "y": start[1], "z": start[2]},
+            "end": {"x": end[0], "y": end[1], "z": end[2]},
+            "status": edge.status,
+            "source": "MAP_RESOURCES_CARLA_TOPOLOGY",
+            "validation_status": "STATIC_TOPOLOGY_NOT_EXECUTED_ROUTE",
+        })
+    return points, roads
+
+
+def _common_monitoring_context():
+    """Load the shared static monitoring infrastructure and synthetic samples."""
+    layout = load_monitoring_layout(DEFAULT_MONITORING_CONFIG)
+    observations = build_fixed_observations(layout)
+    summary = monitoring_summary(layout, observations)
+    return {
+        "summary": summary,
+        "observations": [item.to_dict() for item in observations],
+    }
+
+
+def _attach_common_monitoring(result):
+    """Attach one monitoring contract to every unified scenario result."""
+    context = _common_monitoring_context()
+    summary = dict(context["summary"])
+    monitoring = dict(result.get("monitoring") or {})
+    monitoring.update(summary)
+    monitoring.update({
+        "observation_source": "PARAMETERIZED_SYNTHETIC_FIXED_STATIONS",
+        "runtime_event_coupling": "PENDING_SCENARIO_SPECIFIC_RISK_MODEL",
+    })
+    result["monitoring"] = monitoring
+    result["monitoring_observations"] = context["observations"]
+    environment = dict(result.get("environment") or {})
+    environment["monitoring_areas"] = summary["monitoring_areas"]
+    environment["fixed_monitoring_stations"] = summary[
+        "fixed_monitoring_stations"
+    ]
+    result["environment"] = environment
+    world_state = result.get("world_state")
+    if isinstance(world_state, dict):
+        world_state["monitoring"] = dict(monitoring)
+        world_environment = dict(world_state.get("environment") or {})
+        world_environment.update({
+            "monitoring_areas": summary["monitoring_areas"],
+            "fixed_monitoring_stations": summary[
+                "fixed_monitoring_stations"
+            ],
+        })
+        world_state["environment"] = world_environment
+    return result
+
+
+def _post_json(url, payload):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = url_request.Request(
+        url, data=body, headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with url_request.urlopen(request, timeout=2.0) as response:
+        response.read()
+
+
+def publish_structural_runtime(result, config, sync_url, delay_seconds,
+                               control_state_reader=process_control_state):
+    """Replay factual structural stages to the API without physics claims."""
+    points, roads = _map_runtime_resources(config)
+    snapshots = build_structural_runtime_snapshots(
+        result, points, road_segments=roads
+    )
+    monitoring_context = _common_monitoring_context()
+    monitoring_summary_data = monitoring_context["summary"]
+    for snapshot in snapshots:
+        world_state = snapshot.setdefault("world_state", {})
+        environment = world_state.setdefault("environment", {})
+        environment["monitoring_areas"] = monitoring_summary_data[
+            "monitoring_areas"
+        ]
+        environment["fixed_monitoring_stations"] = monitoring_summary_data[
+            "fixed_monitoring_stations"
+        ]
+        monitoring = world_state.setdefault("monitoring", {})
+        monitoring.update({
+            "monitoring_layout_id": monitoring_summary_data[
+                "monitoring_layout_id"
+            ],
+            "fixed_station_count": monitoring_summary_data[
+                "fixed_station_count"
+            ],
+            "fixed_observation_count": monitoring_summary_data[
+                "fixed_observation_count"
+            ],
+            "monitoring_synthetic_data": True,
+        })
+    reset_url = str(sync_url).rsplit("/runtime/sync", 1)[0] + "/runtime/reset"
+    try:
+        _post_json(reset_url, {})
+        for index, snapshot in enumerate(snapshots):
+            while control_state_reader() == "paused":
+                time.sleep(0.1)
+            _post_json(sync_url, snapshot)
+            if index + 1 < len(snapshots) and delay_seconds > 0:
+                time.sleep(delay_seconds)
+    except (OSError, ValueError, url_error.URLError) as exc:
+        return {
+            "status": "FAILED",
+            "snapshot_count": len(snapshots),
+            "published_snapshot_count": index if "index" in locals() else 0,
+            "reason": str(exc),
+        }
+    return {
+        "status": "PASS",
+        "snapshot_count": len(snapshots),
+        "published_snapshot_count": len(snapshots),
+        "playback_delay_seconds": delay_seconds,
+        "simulation_claim": "STRUCTURAL_ONLY_NO_CARLA_PHYSICS",
+    }
+
+
+def build_carla_runtime_publisher(config, sync_url):
+    """Create the optional Runtime API sink for a real CARLA episode.
+
+    Structural playback and CARLA execution intentionally use the same API
+    contract.  CARLA supplies actor snapshots through the callback; this entry
+    point only enriches them with static map-resource roads and transports
+    them.  Failure to reach the UI is non-fatal to the simulator run.
+    """
+    _, roads = _map_runtime_resources(config)
+    monitoring_context = _common_monitoring_context()
+    monitoring_summary_data = monitoring_context["summary"]
+    reset_url = str(sync_url).rsplit("/runtime/sync", 1)[0] + "/runtime/reset"
+    try:
+        _post_json(reset_url, {})
+    except (OSError, ValueError, url_error.URLError):
+        pass
+
+    def publish(snapshot):
+        payload = dict(snapshot)
+        world_state = dict(payload.get("world_state") or {})
+        environment = dict(world_state.get("environment") or {})
+        # CARLA supplies the active map geometry; resource-db topology adds
+        # the stable, labelled roads used by the dispatch map.
+        environment.setdefault("road_segments", roads)
+        environment.setdefault(
+            "monitoring_areas",
+            monitoring_summary_data["monitoring_areas"],
+        )
+        environment.setdefault(
+            "fixed_monitoring_stations",
+            monitoring_summary_data["fixed_monitoring_stations"],
+        )
+        monitoring = dict(world_state.get("monitoring") or {})
+        monitoring.update({
+            "monitoring_layout_id": monitoring_summary_data[
+                "monitoring_layout_id"
+            ],
+            "fixed_station_count": monitoring_summary_data[
+                "fixed_station_count"
+            ],
+            "fixed_observation_count": monitoring_summary_data[
+                "fixed_observation_count"
+            ],
+            "monitoring_synthetic_data": True,
+        })
+        world_state["monitoring"] = monitoring
+        world_state["environment"] = environment
+        payload["world_state"] = world_state
+        try:
+            _post_json(sync_url, payload)
+        except (OSError, ValueError, url_error.URLError):
+            # UI observability is optional.  Never abort a physical episode
+            # because a local API process was closed or restarted.
+            return
+    return publish
+
+
+def build_operator_reviewer(sync_url, timeout_seconds):
+    """Poll the Runtime API for an explicit human DecisionPoint response.
+
+    This is used only by the dispatch-center launcher.  A timeout resolves to
+    ``timeout`` so the CARLA bridge keeps the fleet in its safe hold state;
+    it never silently treats a missing operator as approval.
+    """
+    base_url = str(sync_url).rsplit("/runtime/sync", 1)[0]
+    timeout_seconds = max(1.0, float(timeout_seconds))
+
+    def review(point):
+        point_id = str(point["decision_point_id"])
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                request = url_request.Request(
+                    base_url + "/decision-points/{}".format(point_id),
+                    method="GET",
+                )
+                with url_request.urlopen(request, timeout=1.5) as response:
+                    current = json.loads(response.read().decode("utf-8"))
+                response_data = current.get("operator_response") or {}
+                action = str(response_data.get("action", "")).lower()
+                if action in {"approve", "reject"}:
+                    return action
+            except (OSError, ValueError, url_error.URLError):
+                pass
+            time.sleep(1.0)
+        return "timeout"
+    return review
 
 
 def _summary_for_storage(result, config_path, random_map):
@@ -79,6 +504,35 @@ def _record_result(result, config_path, random_map):
         result["run_directory"] = str(recorder.run_dir)
         result["database_path"] = str(recorder.database_path)
         result["database_recording"] = recorder.store is not None
+        observations = result.get("monitoring_observations")
+        if isinstance(observations, list):
+            recorder.write_jsonl(
+                "monitoring_observations.jsonl",
+                [dict(item) for item in observations if isinstance(item, dict)],
+            )
+            recorder.record("monitoring_layout_loaded", {
+                "layout_id": result.get("monitoring", {}).get(
+                    "monitoring_layout_id"
+                ),
+                "fixed_station_count": result.get("monitoring", {}).get(
+                    "fixed_station_count"
+                ),
+                "synthetic_data": True,
+            })
+            for observation in observations:
+                if isinstance(observation, dict):
+                    recorder.record(
+                        "fixed_monitoring_observation", dict(observation)
+                    )
+        if isinstance(result.get("generated_episode"), dict):
+            result["generated_episode"]["run_id"] = recorder.run_id
+        if isinstance(result.get("concrete_episode_v2"), dict):
+            result["concrete_episode_v2"]["episode_id"] = recorder.run_id
+        result["unified_contract_record_count"] = (
+            recorder.record_unified_scenario_contract(
+                result, config_path=config_path
+            )
+        )
         result["policy_comparison_decision_record_count"] = (
             recorder.record_policy_comparison(result)
         )
@@ -150,6 +604,7 @@ def _run_one(scenario, config_path, seed, random_map, vehicle_count, no_record,
         random_map=random_map, vehicle_count=vehicle_count,
         execution_policy=execution_policy,
     )
+    result = _attach_common_monitoring(result)
     if no_record:
         result["database_evidence_validation"] = {
             "status": "NOT_AVAILABLE", "reason": "--no-record"
@@ -179,6 +634,46 @@ def _record_failed_batch_run(scenario, config_path, seed, error):
     finally:
         recorder.close()
     return result
+
+
+def _primary_experience_dataset(manifest=None):
+    """Describe the one canonical experience export for a scenario run.
+
+    ``openpit.db.closed_loop_cycles`` is the runtime source of truth and the
+    closed-loop JSONL export is the common dataset contract for both
+    structural and CARLA modes.  The older structural transition dataset is
+    retained elsewhere only for the existing task-level BC baseline.
+    """
+    if not isinstance(manifest, dict):
+        return {
+            "status": "NOT_AVAILABLE_NO_DIRECT_CYCLES",
+            "schema_version": "openpit-closed-loop-transition-v1",
+            "source_database_table": "openpit.db.closed_loop_cycles",
+            "record_count": 0,
+            "reward_status": "NOT_AVAILABLE_NO_REWARD_MODEL",
+            "learning_status": "offline_analysis_only",
+        }
+    quality = manifest.get("dataset_quality", {})
+    return {
+        "status": quality.get("status", "DATASET_QUALITY_WARN"),
+        "schema_version": manifest.get("schema_version"),
+        "source_database": manifest.get("source_database"),
+        "source_database_table": manifest.get("source_table", "closed_loop_cycles"),
+        "manifest_path": manifest.get("manifest_path"),
+        "transitions_path": manifest.get("transitions_path"),
+        "record_count": manifest.get("record_count", 0),
+        "source_run_count": manifest.get("source_run_count", 0),
+        "reward_status": manifest.get("reward_summary", {}).get("status"),
+        "behavior_cloning_preparation_eligible_count": manifest.get(
+            "behavior_cloning_preparation_eligible_count", 0
+        ),
+        "ppo_eligible_record_count": manifest.get("ppo_eligible_record_count", 0),
+        "learning_status": "offline_analysis_only_no_online_policy_update",
+        "boundary": (
+            "Synthetic scenario records are not real mine data; reward stays "
+            "unavailable until an explicit reward model is validated."
+        ),
+    }
 
 
 def summarize_policy_ab_pairs(results, expected_pair_count):
@@ -353,6 +848,16 @@ def main():
     parser.add_argument("--seed-step", type=int, default=1)
     parser.add_argument("--no-record", action="store_true",
                         help="Do not write this structural run to artifacts/openpit.db")
+    parser.add_argument("--ui-sync", action="store_true",
+                        help="Publish structural playback or CARLA live state to the Agent API")
+    parser.add_argument("--operator-review", action="store_true",
+                        help="Require explicit DecisionPoint approval from the dispatch UI")
+    parser.add_argument("--operator-review-timeout-seconds", type=float, default=120.0,
+                        help="Safe-hold timeout for --operator-review (default: 120)")
+    parser.add_argument("--playback-delay-seconds", type=float, default=1.0,
+                        help="Delay between structural UI stages (default: 1.0)")
+    parser.add_argument("--runtime-api-url", default=DEFAULT_RUNTIME_SYNC_URL,
+                        help="Runtime sync endpoint used with --ui-sync")
     parser.add_argument("--ticks", type=int, default=1000,
                         help="Maximum CARLA ticks for S01 physical execution")
     parser.add_argument("--load-map", action="store_true",
@@ -444,15 +949,46 @@ def main():
     if args.mode == "carla":
         if args.runs != 1:
             parser.error("CARLA execution currently requires --runs 1")
+        if args.scenario == "all":
+            if not args.check_only:
+                parser.error(
+                    "--scenario all --mode carla is a read-only admission "
+                    "check; add --check-only"
+                )
+            if args.operator_review or args.ui_sync:
+                parser.error(
+                    "CARLA batch admission does not publish UI state or ask "
+                    "for operator review"
+                )
+            result = _run_carla_admission_batch(args)
+            print(json.dumps(
+                result, ensure_ascii=False, indent=2, sort_keys=True
+            ))
+            return 0 if result["status"] == "READY" else 1
+        if args.operator_review and not args.ui_sync:
+            parser.error("--operator-review requires --ui-sync so an operator can respond")
         if args.scenario not in DEFAULT_CONFIGS:
             parser.error("CARLA execution supports S01-S07/S09; S08 uses run_scenario.sh")
         config_path = args.config or DEFAULT_CONFIGS[args.scenario]
         try:
+            config = load_config(config_path)
+            runtime_publisher = (
+                build_carla_runtime_publisher(config, args.runtime_api_url)
+                if args.ui_sync and not args.check_only else None
+            )
+            operator_reviewer = (
+                build_operator_reviewer(
+                    args.runtime_api_url, args.operator_review_timeout_seconds
+                ) if args.operator_review and not args.check_only else None
+            )
             result = run_carla_scenario_execution(
-                args.scenario, load_config(config_path), seed=args.seed,
+                args.scenario, config, seed=args.seed,
                 vehicle_count=args.vehicle_count, ticks=args.ticks,
                 load_map=args.load_map, check_only=args.check_only,
                 execution_policy=args.policy,
+                runtime_publisher=runtime_publisher,
+                operator_reviewer=operator_reviewer,
+                control_state_reader=process_control_state,
             )
         except (CarlaAdapterError, ValueError, RuntimeError) as exc:
             print("ERROR: CARLA执行准备失败：{}".format(exc), file=sys.stderr)
@@ -461,12 +997,27 @@ def main():
             else:
                 print("请按上述资源准入提示处理后重试。", file=sys.stderr)
             return 2
+        if not args.check_only:
+            result = _attach_common_monitoring(result)
         if not args.check_only and not args.no_record:
             result = _record_result(result, config_path, True)
+            # CARLA and structural scenarios share closed_loop_cycles as the
+            # canonical runtime source.  Export it here as well; previously
+            # the CARLA branch returned immediately after recording and left
+            # an otherwise valid physical feedback cycle undiscoverable by
+            # the common experience-data workflow.
+            result["experience_dataset"] = _primary_experience_dataset(
+                export_closed_loop_transition_dataset(
+                    result["database_path"], ROOT / "data" / "datasets",
+                    result["run_id"], run_ids=[result["run_id"]],
+                )
+            )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if result.get("status") in {"PASS", "READY"} else 1
     if args.runs < 1:
         parser.error("--runs must be at least 1")
+    if args.playback_delay_seconds < 0 or args.playback_delay_seconds > 10:
+        parser.error("--playback-delay-seconds must be between 0 and 10")
     if args.config and args.scenario == "all":
         parser.error("--config cannot be used with --scenario all")
     if args.compare_policies:
@@ -485,6 +1036,8 @@ def main():
             except ValueError as exc:
                 parser.error(str(exc))
     batch_mode = args.scenario == "all" or args.runs > 1 or args.compare_policies
+    if args.ui_sync and batch_mode:
+        parser.error("--ui-sync requires one structural scenario run")
     results = []
     for scenario in scenarios:
         config_path = args.config or DEFAULT_CONFIGS[scenario]
@@ -543,6 +1096,14 @@ def main():
                         result["run_id"], run_ids=[result["run_id"]],
                     )
                 )
+            result["experience_dataset"] = _primary_experience_dataset(
+                result.get("closed_loop_training_dataset")
+            )
+        if args.ui_sync:
+            result["ui_sync"] = publish_structural_runtime(
+                result, config, args.runtime_api_url,
+                args.playback_delay_seconds,
+            )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if result.get("status") == "PASS" else 1
 
@@ -615,6 +1176,9 @@ def main():
                 "status": "NOT_AVAILABLE_NO_DIRECT_CYCLES",
                 "record_count": 0,
             }
+        summary["experience_dataset"] = _primary_experience_dataset(
+            summary.get("closed_loop_training_dataset")
+        )
         batch_dir = ROOT / "artifacts" / "batches" / summary["batch_id"]
         batch_dir.mkdir(parents=True, exist_ok=False)
         summary_path = batch_dir / "summary.json"

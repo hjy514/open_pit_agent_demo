@@ -37,8 +37,12 @@ class CarlaAdapter(EquipmentAdapter):
         self._zones_by_id: Dict[str, ZoneConfig] = {}
         self._task_targets: Dict[str, Position] = {}
         self._route_remaining_targets: Dict[str, List[Position]] = {}
+        self._production_plans: Dict[str, Dict[str, object]] = {}
+        self._production_holds: Dict[str, Dict[str, object]] = {}
+        self._mission_plans: Dict[str, Dict[str, object]] = {}
         self._takeover_routes: Dict[str, List[Position]] = {}
         self._task_speed_limits: Dict[str, float] = {}
+        self._task_arrival_tolerances: Dict[str, float] = {}
         self._takeover_task_ids = set()
         self._safe_route_plan: Optional[Dict[str, object]] = None
         self._hazard_replanned_task_ids = set()
@@ -65,6 +69,263 @@ class CarlaAdapter(EquipmentAdapter):
         self._road_segments_cache: Optional[List[Dict[str, object]]] = None
         self._map_bounds_cache: Optional[Dict[str, float]] = None
         self.spawned_actor_ids: List[int] = []
+
+    def configure_task_missions(
+        self, plans: Sequence[Dict[str, object]]
+    ) -> Dict[str, object]:
+        """Configure spawn -> service origin -> service target execution.
+
+        The task remains one business object.  Deadhead travel is an explicit
+        pre-service stage and therefore cannot be mistaken for task
+        completion when the truck only reaches its loading/patrol origin.
+        """
+        self._require_connected()
+        spawn_points = self.world.get_map().get_spawn_points()
+        configured = []
+        deadhead_count = 0
+        for raw in plans:
+            if not isinstance(raw, dict) or not raw.get("task_id"):
+                continue
+            origin_index = int(raw["service_origin_spawn_point_index"])
+            target_index = int(raw["service_target_spawn_point_index"])
+            if not (0 <= origin_index < len(spawn_points)):
+                raise CarlaAdapterError(
+                    "Mission service origin out of range: {}".format(origin_index)
+                )
+            if not (0 <= target_index < len(spawn_points)):
+                raise CarlaAdapterError(
+                    "Mission service target out of range: {}".format(target_index)
+                )
+            origin = spawn_points[origin_index].location
+            target = spawn_points[target_index].location
+            task_id = str(raw["task_id"])
+            requires_deadhead = bool(raw.get("requires_deadhead"))
+            self._mission_plans[task_id] = {
+                **dict(raw),
+                "service_origin": Position(origin.x, origin.y, origin.z),
+                "service_target": Position(target.x, target.y, target.z),
+                "phase": (
+                    "pending_deadhead" if requires_deadhead
+                    else "at_service_origin"
+                ),
+            }
+            configured.append(task_id)
+            deadhead_count += int(requires_deadhead)
+        return {
+            "status": "CONFIGURED",
+            "task_count": len(configured),
+            "deadhead_task_count": deadhead_count,
+            "task_ids": configured,
+            "execution_model": "SPAWN_TO_SERVICE_ORIGIN_TO_SERVICE_TARGET",
+        }
+
+    def configure_production_cycles(
+        self, plans: Sequence[Dict[str, object]]
+    ) -> Dict[str, object]:
+        """Configure map-anchored haul service execution for tasks.
+
+        New plans may complete after dumping because a task represents one
+        directed mission.  The legacy return behaviour remains the default for
+        callers that do not provide ``completion_after_dumping``.
+        """
+        self._require_connected()
+        spawn_points = self.world.get_map().get_spawn_points()
+        configured = []
+        for raw in plans:
+            if not isinstance(raw, dict) or not raw.get("task_id"):
+                continue
+            origin_index = int(raw["origin_spawn_point_index"])
+            if origin_index < 0 or origin_index >= len(spawn_points):
+                raise CarlaAdapterError(
+                    "Production origin spawn point out of range: {}".format(
+                        origin_index
+                    )
+                )
+            location = spawn_points[origin_index].location
+            task_id = str(raw["task_id"])
+            self._production_plans[task_id] = {
+                "task_id": task_id,
+                "origin_spawn_point_index": origin_index,
+                "return_target": Position(location.x, location.y, location.z),
+                "loading_ticks": max(0, int(raw.get("loading_ticks", 0))),
+                "dumping_ticks": max(0, int(raw.get("dumping_ticks", 0))),
+                "phase": "pending_loading",
+                "return_route_evidence": raw.get("return_route_evidence"),
+                "completion_after_dumping": bool(
+                    raw.get("completion_after_dumping", False)
+                ),
+                "task_completion_semantics": raw.get(
+                    "task_completion_semantics", "legacy_round_trip"
+                ),
+            }
+            configured.append(task_id)
+        return {
+            "status": "CONFIGURED",
+            "task_count": len(configured),
+            "task_ids": configured,
+            "service_model": "CARLA_STATIONARY_SERVICE_HOLD",
+            "completion_model": "PER_TASK_DIRECTED_MISSION",
+        }
+
+    def _begin_production_leg(
+        self, vehicle_id: str, task_id: str, target: Position,
+        phase: str, reason: str,
+    ) -> None:
+        task = self._task_objects[task_id]
+        plan = self._production_plans[task_id]
+        plan["phase"] = phase
+        self._task_targets[task_id] = target
+        self._task_ids[vehicle_id] = task_id
+        self._task_status[vehicle_id] = phase
+        task.status = "executing"
+        task.status_reason = reason
+        self._start_navigation_leg(vehicle_id, task_id, target)
+        self._emit("task_production_stage_changed", {
+            "vehicle_id": vehicle_id, "task_id": task_id,
+            "to_status": phase, "reason": reason,
+        })
+
+    def _begin_loading_hold(
+        self, vehicle_id: str, task: Task,
+        production_plan: Dict[str, object], outbound_target: Position,
+    ) -> None:
+        """Enter the loading service stage at the admitted service origin."""
+        now = utc_now()
+        task.status = "executing"
+        task.updated_at = now
+        if task.started_at is None:
+            task.started_at = now
+            task.started_tick = self._tick_index
+            task.attempt_count += 1
+        task.completed_at = None
+        task.completed_tick = None
+        task.status_reason = "loading_service_hold"
+        self._task_targets[task.task_id] = outbound_target
+        self._task_started_ticks[task.task_id] = self._tick_index
+        self._task_ids[vehicle_id] = task.task_id
+        self._task_status[vehicle_id] = "loading"
+        production_plan["phase"] = "loading"
+        loading_ticks = int(production_plan.get("loading_ticks") or 0)
+        self._production_holds[vehicle_id] = {
+            "task_id": task.task_id,
+            "until_tick": self._tick_index + loading_ticks,
+            "next_target": outbound_target,
+            "next_phase": "loaded_haul",
+            "reason": "loading_completed_loaded_haul_started",
+        }
+        self._stop_vehicle(vehicle_id, hand_brake=True)
+        self._emit("task_production_stage_changed", {
+            "vehicle_id": vehicle_id,
+            "task_id": task.task_id,
+            "from_status": "queue_loader",
+            "to_status": "loading",
+            "reason": "loader_capacity_available",
+            "service_ticks": loading_ticks,
+        })
+
+    def _advance_production_holds(self) -> None:
+        for vehicle_id, hold in list(self._production_holds.items()):
+            if vehicle_id in self._faulted or vehicle_id in self._paused:
+                continue
+            if self._tick_index < int(hold["until_tick"]):
+                self._stop_vehicle(vehicle_id, hand_brake=True)
+                continue
+            self._production_holds.pop(vehicle_id, None)
+            if hold.get("complete_task"):
+                self._complete_task(
+                    vehicle_id,
+                    str(hold["task_id"]),
+                    completion_reason=str(
+                        hold.get("reason") or "destination_service_completed"
+                    ),
+                )
+                continue
+            self._begin_production_leg(
+                vehicle_id, str(hold["task_id"]), hold["next_target"],
+                str(hold["next_phase"]), str(hold["reason"]),
+            )
+
+    def _complete_task(
+        self, vehicle_id: str, task_id: str,
+        completion_reason: str = "arrival_tolerance",
+        distance_m: Optional[float] = None,
+    ) -> None:
+        """Finish one task and consistently release all execution state."""
+        active_task_id = self._task_ids.pop(vehicle_id, None)
+        completed_task_id = active_task_id or task_id
+        completed_task = self._task_objects.get(completed_task_id)
+        production_plan = self._production_plans.get(completed_task_id)
+        if completed_task is not None:
+            now = utc_now()
+            completed_task.status = "completed"
+            completed_task.updated_at = now
+            completed_task.completed_at = now
+            completed_task.completed_tick = self._tick_index
+            completed_task.status_reason = completion_reason
+            self._vehicles_with_completed_task.add(vehicle_id)
+        self._emit("task_completed", {
+            "vehicle_id": vehicle_id,
+            "task_id": completed_task_id,
+            "completion_reason": completion_reason,
+            "distance_m": (
+                round(distance_m, 3) if distance_m is not None else None
+            ),
+        })
+        if production_plan:
+            self._emit("task_production_stage_changed", {
+                "vehicle_id": vehicle_id,
+                "task_id": completed_task_id,
+                "from_status": production_plan.get("phase"),
+                "to_status": "terminal",
+                "reason": completion_reason,
+                "return_route_evidence": production_plan.get(
+                    "return_route_evidence"
+                ),
+            })
+        mission_plan = self._mission_plans.get(completed_task_id)
+        if mission_plan:
+            previous_phase = mission_plan.get("phase")
+            mission_plan["phase"] = "terminal"
+            self._emit("task_mission_stage_changed", {
+                "vehicle_id": vehicle_id,
+                "task_id": completed_task_id,
+                "from_status": previous_phase,
+                "to_status": "terminal",
+                "reason": completion_reason,
+            })
+        if completed_task_id in self._hazard_replanned_task_ids:
+            self._emit("hazard_route_replan_completed", {
+                "vehicle_id": vehicle_id,
+                "task_id": completed_task_id,
+                "route_plan_id": (self._safe_route_plan or {}).get(
+                    "route_plan_id"
+                ),
+            })
+            self._hazard_replanned_task_ids.discard(completed_task_id)
+        queue = self._task_queues.get(vehicle_id, [])
+        self._task_queues[vehicle_id] = [
+            queued_task_id for queued_task_id in queue
+            if queued_task_id != completed_task_id
+        ]
+        self._task_targets.pop(completed_task_id, None)
+        self._route_remaining_targets.pop(completed_task_id, None)
+        self._takeover_routes.pop(completed_task_id, None)
+        self._task_speed_limits.pop(completed_task_id, None)
+        self._task_arrival_tolerances.pop(completed_task_id, None)
+        self._takeover_task_ids.discard(completed_task_id)
+        self._task_started_ticks.pop(completed_task_id, None)
+        self._production_holds.pop(vehicle_id, None)
+        self._release_agent(vehicle_id)
+        self._task_status[vehicle_id] = "completed"
+        self._start_next_task(vehicle_id)
+        if (
+            vehicle_id not in self._task_ids
+            and not self._all_tasks_terminal()
+        ):
+            self.retire_vehicle(
+                vehicle_id,
+                reason="completed_vehicle_clears_active_routes",
+            )
 
     def configure_safe_route(
         self,
@@ -245,7 +506,7 @@ class CarlaAdapter(EquipmentAdapter):
                     actor.id,
                     selected_index,
                     preferred_index,
-                )
+                ), file=sys.stderr
             )
         if spawned_count:
             try:
@@ -652,15 +913,10 @@ class CarlaAdapter(EquipmentAdapter):
                     or next_task.priority <= current_task.priority
                 ):
                     continue
-                current_task.status = "assigned"
-                current_task.updated_at = utc_now()
-                current_task.started_at = None
-                current_task.started_tick = None
-                current_task.status_reason = "preempted_by_higher_priority"
-                self._release_agent(vehicle_id)
-                self._task_ids.pop(vehicle_id, None)
-                self._route_remaining_targets.pop(current_task_id, None)
-                self._task_status[vehicle_id] = "assigned"
+                self._suspend_active_task(
+                    vehicle_id, current_task_id,
+                    reason="preempted_by_higher_priority",
+                )
                 self._emit(
                     "task_preempted",
                     {
@@ -678,7 +934,7 @@ class CarlaAdapter(EquipmentAdapter):
                         next_task_id,
                         next_task.priority,
                         current_task.priority,
-                    )
+                    ), file=sys.stderr
                 )
             elif current_task_id:
                 self._release_agent(vehicle_id)
@@ -689,6 +945,7 @@ class CarlaAdapter(EquipmentAdapter):
 
     def tick(self, timeout_seconds: float = 2.0) -> Dict[str, str]:
         self._require_connected()
+        self._advance_production_holds()
         for vehicle_id, agent in list(self._agents.items()):
             actor = self._actors[vehicle_id]
             if vehicle_id in self._faulted:
@@ -710,14 +967,33 @@ class CarlaAdapter(EquipmentAdapter):
                 ).distance_to(target)
                 if task is not None:
                     task.last_distance_m = round(distance, 3)
-            arrival_tolerance = self.config.demo.arrival_tolerance_m
+            arrival_tolerance = self._task_arrival_tolerances.get(
+                task_id or "", self.config.demo.arrival_tolerance_m
+            )
+            remaining_targets = self._route_remaining_targets.get(
+                task_id or "", []
+            )
+            if remaining_targets and task_id not in self._takeover_task_ids:
+                # RoadGraph geometry is an upper-level route description, not
+                # a centimetre-accurate CARLA control trajectory.  Give only
+                # intermediate graph checkpoints enough clearance for a full-
+                # size mine truck; the final task target keeps its P6-backed
+                # arrival tolerance below.
+                arrival_tolerance = max(arrival_tolerance, 18.0)
             if task_id in self._takeover_task_ids and self._route_remaining_targets.get(
                 task_id or ""
             ):
                 arrival_tolerance = min(arrival_tolerance, 6.0)
             arrived = (
                 distance is not None
-                and distance <= arrival_tolerance
+                and (
+                    distance <= arrival_tolerance
+                    or (
+                        callable(getattr(agent, "done", None))
+                        and agent.done()
+                        and distance <= max(arrival_tolerance, 15.0)
+                    )
+                )
             )
             started_tick = (
                 self._task_started_ticks.get(task_id, self._tick_index)
@@ -734,9 +1010,6 @@ class CarlaAdapter(EquipmentAdapter):
                     self.carla.VehicleControl(
                         throttle=0.0, brake=1.0, hand_brake=False
                     )
-                )
-                remaining_targets = self._route_remaining_targets.get(
-                    task_id or "", []
                 )
                 if task_id and remaining_targets:
                     next_target = remaining_targets.pop(0)
@@ -771,63 +1044,95 @@ class CarlaAdapter(EquipmentAdapter):
                             waypoint_event,
                         )
                     continue
-                completed_task_id = self._task_ids.pop(vehicle_id, None)
-                if completed_task_id:
-                    completed_task = self._task_objects.get(completed_task_id)
-                    if completed_task is not None:
-                        now = utc_now()
-                        completed_task.status = "completed"
-                        completed_task.updated_at = now
-                        completed_task.completed_at = now
-                        completed_task.completed_tick = self._tick_index
-                        completed_task.status_reason = "arrival_tolerance"
-                        self._vehicles_with_completed_task.add(
-                            vehicle_id
+                mission_plan = self._mission_plans.get(task_id or "")
+                if (
+                    mission_plan
+                    and mission_plan.get("phase") == "to_service_origin"
+                    and task is not None
+                ):
+                    self._release_agent(vehicle_id)
+                    mission_plan["phase"] = "at_service_origin"
+                    task.status_reason = "service_origin_reached"
+                    self._emit("task_mission_stage_changed", {
+                        "vehicle_id": vehicle_id,
+                        "task_id": task_id,
+                        "from_status": "to_service_origin",
+                        "to_status": "at_service_origin",
+                        "reason": "deadhead_service_origin_reached",
+                        "service_origin_point_id": mission_plan.get(
+                            "service_origin_point_id"
+                        ),
+                    })
+                    production_plan = self._production_plans.get(task_id)
+                    if (
+                        production_plan
+                        and production_plan.get("phase") == "pending_loading"
+                    ):
+                        self._begin_loading_hold(
+                            vehicle_id, task, production_plan,
+                            mission_plan["service_target"],
                         )
-                    self._emit(
-                        "task_completed",
-                        {
+                    else:
+                        service_target = mission_plan["service_target"]
+                        mission_plan["phase"] = "service_execution"
+                        task.status_reason = "service_route_started"
+                        self._task_targets[task_id] = service_target
+                        self._task_started_ticks[task_id] = self._tick_index
+                        self._task_status[vehicle_id] = "executing"
+                        self._start_navigation_leg(
+                            vehicle_id, task_id, service_target
+                        )
+                        self._emit("task_mission_stage_changed", {
                             "vehicle_id": vehicle_id,
-                            "task_id": completed_task_id,
-                            "completion_reason": "arrival_tolerance",
-                            "distance_m": (
-                                round(distance, 3)
-                                if distance is not None
-                                else None
+                            "task_id": task_id,
+                            "from_status": "at_service_origin",
+                            "to_status": "service_execution",
+                            "reason": "service_route_started",
+                            "service_target_point_id": mission_plan.get(
+                                "service_target_point_id"
                             ),
-                        },
+                        })
+                    continue
+                production_plan = self._production_plans.get(task_id or "")
+                if production_plan and production_plan.get("phase") == "loaded_haul":
+                    self._release_agent(vehicle_id)
+                    production_plan["phase"] = "dumping"
+                    dumping_ticks = int(production_plan.get("dumping_ticks") or 0)
+                    self._task_status[vehicle_id] = "dumping"
+                    if task is not None:
+                        task.status_reason = "dumping_service_hold"
+                    if production_plan.get("completion_after_dumping"):
+                        self._production_holds[vehicle_id] = {
+                            "task_id": task_id,
+                            "until_tick": self._tick_index + dumping_ticks,
+                            "complete_task": True,
+                            "reason": "destination_service_completed",
+                        }
+                    else:
+                        self._production_holds[vehicle_id] = {
+                            "task_id": task_id,
+                            "until_tick": self._tick_index + dumping_ticks,
+                            "next_target": production_plan["return_target"],
+                            "next_phase": "returning",
+                            "reason": "dumping_completed_return_started",
+                        }
+                    self._emit("task_production_stage_changed", {
+                        "vehicle_id": vehicle_id, "task_id": task_id,
+                        "from_status": "loaded_haul", "to_status": "dumping",
+                        "reason": "outbound_destination_reached",
+                        "service_ticks": dumping_ticks,
+                    })
+                    continue
+                completion_reason = (
+                    "production_cycle_return_completed"
+                    if production_plan
+                    and production_plan.get("phase") == "returning"
+                    else "arrival_tolerance"
+                )
+                if task_id:
+                    self._complete_task(
+                        vehicle_id, task_id, completion_reason, distance
                     )
-                    if completed_task_id in self._hazard_replanned_task_ids:
-                        self._emit(
-                            "hazard_route_replan_completed",
-                            {
-                                "vehicle_id": vehicle_id,
-                                "task_id": completed_task_id,
-                                "route_plan_id": self._safe_route_plan.get(
-                                    "route_plan_id"
-                                ),
-                            },
-                        )
-                        self._hazard_replanned_task_ids.discard(
-                            completed_task_id
-                        )
-                    queue = self._task_queues.get(vehicle_id, [])
-                    self._task_queues[vehicle_id] = [
-                        task_id
-                        for task_id in queue
-                        if task_id != completed_task_id
-                    ]
-                    self._task_targets.pop(completed_task_id, None)
-                    self._route_remaining_targets.pop(
-                        completed_task_id, None
-                    )
-                    self._takeover_routes.pop(completed_task_id, None)
-                    self._task_speed_limits.pop(completed_task_id, None)
-                    self._takeover_task_ids.discard(completed_task_id)
-                    self._task_started_ticks.pop(completed_task_id, None)
-                self._release_agent(vehicle_id)
-                self._task_status[vehicle_id] = "completed"
-                self._start_next_task(vehicle_id)
             elif timed_out:
                 actor.apply_control(
                     self.carla.VehicleControl(
@@ -940,6 +1245,13 @@ class CarlaAdapter(EquipmentAdapter):
         self._require_connected()
         actor = self._actors.get(vehicle_id)
         if actor is None:
+            retired_status = str(self._task_status.get(vehicle_id, ""))
+            if retired_status.startswith("retired_"):
+                return {
+                    "vehicle_id": vehicle_id,
+                    "status": "ALREADY_RETIRED",
+                    "task_id": None,
+                }
             raise CarlaAdapterError(
                 "Unknown CARLA vehicle: {}".format(vehicle_id)
             )
@@ -971,6 +1283,13 @@ class CarlaAdapter(EquipmentAdapter):
         self._require_connected()
         actor = self._actors.get(vehicle_id)
         if actor is None:
+            retired_status = str(self._task_status.get(vehicle_id, ""))
+            if retired_status.startswith("retired_"):
+                return {
+                    "vehicle_id": vehicle_id,
+                    "status": "ALREADY_RETIRED",
+                    "task_id": None,
+                }
             raise CarlaAdapterError(
                 "Unknown CARLA vehicle: {}".format(vehicle_id)
             )
@@ -994,6 +1313,9 @@ class CarlaAdapter(EquipmentAdapter):
             pause_duration = max(0, self._tick_index - paused_tick)
             if task_id in self._task_started_ticks:
                 self._task_started_ticks[task_id] += pause_duration
+            hold = self._production_holds.get(vehicle_id)
+            if hold is not None:
+                hold["until_tick"] = int(hold["until_tick"]) + pause_duration
 
         actor.apply_control(
             self.carla.VehicleControl(
@@ -1003,7 +1325,30 @@ class CarlaAdapter(EquipmentAdapter):
             )
         )
 
-        if task_id is not None and vehicle_id in self._agents:
+        if task_id is not None and vehicle_id in self._production_holds:
+            plan = self._production_plans.get(task_id, {})
+            self._task_status[vehicle_id] = str(
+                plan.get("phase") or "production_service_hold"
+            )
+        elif task_id is not None and vehicle_id in self._agents:
+            # A BasicAgent created before a long headway/event hold may keep
+            # stale local-planner state after the heavy truck is released
+            # from its hand brake.  Rebuild that one controller from the
+            # actor's current transform to the current leg target.  Remaining
+            # route checkpoints stay in ``_route_remaining_targets`` and are
+            # therefore not lost.
+            target = self._task_targets.get(task_id)
+            if was_stopped and target is not None:
+                self._release_agent(vehicle_id)
+                self._start_navigation_leg(vehicle_id, task_id, target)
+                self._emit(
+                    "vehicle_navigation_refreshed_after_resume",
+                    {
+                        "vehicle_id": vehicle_id,
+                        "task_id": task_id,
+                        "reason": "resume_from_pause_rebuilds_basic_agent",
+                    },
+                )
             self._task_status[vehicle_id] = "executing"
         else:
             self._task_status[vehicle_id] = "idle"
@@ -1140,8 +1485,16 @@ class CarlaAdapter(EquipmentAdapter):
         task_id: str,
         vehicle_id: str,
         speed_limit_kmh: Optional[float] = None,
+        assignment_source: str = "manual_dispatch",
     ) -> Dict[str, object]:
-        """执行人工强制改派，并让目标车辆立即重新规划。"""
+        """Put a reassigned task first in a vehicle's existing task queue.
+
+        ``manual_dispatch`` remains the backward-compatible default.  Scenario
+        execution supplies a different source so evidence can distinguish a
+        human-issued command from an approved scenario response.  In both
+        cases an interrupted current task remains queued and resumes after
+        the reassigned task reaches a terminal state.
+        """
 
         self._require_connected()
         if vehicle_id not in self._actors:
@@ -1151,6 +1504,12 @@ class CarlaAdapter(EquipmentAdapter):
         if vehicle_id in self._faulted:
             raise CarlaAdapterError(
                 "不能把任务分配给故障车辆：{}".format(vehicle_id)
+            )
+        if assignment_source not in {
+            "manual_dispatch", "scenario_event", "scenario_recovery",
+        }:
+            raise CarlaAdapterError(
+                "Unsupported reassignment source: {}".format(assignment_source)
             )
 
         task = self._task_objects.get(task_id)
@@ -1208,22 +1567,14 @@ class CarlaAdapter(EquipmentAdapter):
             self._task_ids.pop(old_vehicle_id, None)
             self._task_status[old_vehicle_id] = "idle"
 
-        # 人工改派具有抢占权：目标车辆当前任务退回assigned。
+        # A reassignment has queue-front priority: the target vehicle's
+        # current task returns to ``assigned`` but remains in its queue.
         current_target_task_id = self._task_ids.get(vehicle_id)
         if current_target_task_id and current_target_task_id != task_id:
-            current_target_task = self._task_objects.get(
-                current_target_task_id
+            self._suspend_active_task(
+                vehicle_id, current_target_task_id,
+                reason="preempted_by_{}".format(assignment_source),
             )
-            if current_target_task is not None:
-                current_target_task.status = "assigned"
-                current_target_task.updated_at = utc_now()
-                current_target_task.started_at = None
-                current_target_task.started_tick = None
-                current_target_task.status_reason = (
-                    "preempted_by_human_dispatch"
-                )
-            self._release_agent(vehicle_id)
-            self._task_ids.pop(vehicle_id, None)
 
         now = utc_now()
         task.assigned_vehicle_id = vehicle_id
@@ -1233,7 +1584,7 @@ class CarlaAdapter(EquipmentAdapter):
         task.completed_at = None
         task.started_tick = None
         task.completed_tick = None
-        task.status_reason = "assigned_by_human_operator"
+        task.status_reason = "assigned_by_{}".format(assignment_source)
         if speed_limit_kmh is not None:
             self._task_speed_limits[task_id] = float(speed_limit_kmh)
 
@@ -1244,6 +1595,17 @@ class CarlaAdapter(EquipmentAdapter):
             task.transfer_count += 1
             task.status_reason = "takeover_route_ready_after_human_approval"
 
+        mission_plan = self._mission_plans.get(task_id)
+        if mission_plan:
+            mission_plan["vehicle_id"] = vehicle_id
+            # A frozen-route takeover continues the interrupted business
+            # mission from the safe merge point.  Other reassignments first
+            # travel to the task's service origin before executing it.
+            mission_plan["phase"] = (
+                "service_execution" if takeover_route
+                else "pending_deadhead"
+            )
+
         target_queue = self._task_queues.setdefault(vehicle_id, [])
         target_queue.insert(0, task_id)
         self._task_status[vehicle_id] = "assigned"
@@ -1253,11 +1615,16 @@ class CarlaAdapter(EquipmentAdapter):
             self._start_next_task(old_vehicle_id)
 
         self._emit(
-            "task_reassigned_by_human",
+            (
+                "task_reassigned_by_human"
+                if assignment_source == "manual_dispatch"
+                else "task_reassigned_by_scenario"
+            ),
             {
                 "task_id": task_id,
                 "old_vehicle_id": old_vehicle_id,
                 "new_vehicle_id": vehicle_id,
+                "assignment_source": assignment_source,
                 "speed_limit_kmh": speed_limit_kmh,
                 "takeover_route_checkpoint_count": len(takeover_route),
                 "resumes_original_route": bool(takeover_route),
@@ -1268,7 +1635,53 @@ class CarlaAdapter(EquipmentAdapter):
             "old_vehicle_id": old_vehicle_id,
             "vehicle_id": vehicle_id,
             "status": self._task_status.get(vehicle_id, "assigned"),
+            "assignment_source": assignment_source,
         }
+
+    def _suspend_active_task(
+        self, vehicle_id: str, task_id: str, reason: str,
+    ) -> None:
+        """Suspend one current task without leaking controller/hold state."""
+        task = self._task_objects.get(task_id)
+        if task is not None:
+            task.status = "assigned"
+            task.updated_at = utc_now()
+            task.started_at = None
+            task.started_tick = None
+            task.status_reason = reason
+
+        mission_plan = self._mission_plans.get(task_id)
+        if mission_plan and mission_plan.get("phase") == "to_service_origin":
+            # The resumed vehicle must explicitly restart the access leg; it
+            # must not skip straight to the service target after preemption.
+            mission_plan["phase"] = "pending_deadhead"
+
+        hold = self._production_holds.pop(vehicle_id, None)
+        production_plan = self._production_plans.get(task_id)
+        if hold is not None and production_plan is not None:
+            suspended_hold = dict(hold)
+            suspended_hold["remaining_ticks"] = max(
+                0, int(hold.get("until_tick", self._tick_index))
+                - self._tick_index,
+            )
+            suspended_hold.pop("until_tick", None)
+            suspended_hold["task_status"] = self._task_status.get(
+                vehicle_id, str(production_plan.get("phase") or "loading")
+            )
+            production_plan["suspended_hold"] = suspended_hold
+
+        self._release_agent(vehicle_id)
+        self._task_ids.pop(vehicle_id, None)
+        self._route_remaining_targets.pop(task_id, None)
+        self._task_started_ticks.pop(task_id, None)
+        self._task_status[vehicle_id] = "assigned"
+        self._stop_vehicle(vehicle_id, hand_brake=True)
+        self._emit("task_suspended_for_preemption", {
+            "vehicle_id": vehicle_id,
+            "task_id": task_id,
+            "reason": reason,
+            "production_hold_preserved": hold is not None,
+        })
 
     def retarget_task(
         self, task_id: str, zone: ZoneConfig,
@@ -1316,6 +1729,78 @@ class CarlaAdapter(EquipmentAdapter):
         self._emit("task_retargeted_by_scenario", payload)
         return payload
 
+    def set_task_route(
+        self, task_id: str, vehicle_id: str,
+        waypoint_positions: Sequence[Dict[str, float]],
+        blocked_edge_id: Optional[str] = None,
+        route_edge_ids: Optional[Sequence[str]] = None,
+    ) -> Dict[str, object]:
+        """Execute a selected RoadGraph route as successive BasicAgent legs."""
+        self._require_connected()
+        task = self._task_objects.get(task_id)
+        actor = self._actors.get(vehicle_id)
+        if task is None:
+            raise CarlaAdapterError("Unknown task: {}".format(task_id))
+        if actor is None:
+            raise CarlaAdapterError("Unknown vehicle: {}".format(vehicle_id))
+        if task.assigned_vehicle_id != vehicle_id:
+            raise CarlaAdapterError(
+                "Task {} is not assigned to {}".format(task_id, vehicle_id)
+            )
+        positions = [
+            Position(float(item["x"]), float(item["y"]), float(item.get("z", 0.0)))
+            for item in waypoint_positions
+            if isinstance(item, dict) and "x" in item and "y" in item
+        ]
+        if not positions:
+            raise CarlaAdapterError(
+                "Task route requires at least one waypoint: {}".format(task_id)
+            )
+        location = actor.get_location()
+        current = Position(location.x, location.y, location.z)
+        nearest_index = min(
+            range(len(positions)),
+            key=lambda index: current.distance_to(positions[index]),
+        )
+        route = list(positions[nearest_index:])
+        tolerance = self._task_arrival_tolerances.get(
+            task_id, self.config.demo.arrival_tolerance_m
+        )
+        while len(route) > 1 and current.distance_to(route[0]) <= tolerance:
+            route.pop(0)
+
+        zone = self._zones_by_id.get(task.zone_id)
+        if zone is not None:
+            spawn_points = self.world.get_map().get_spawn_points()
+            target_location = spawn_points[
+                zone.target_spawn_point_index % len(spawn_points)
+            ].location
+            final_target = Position(
+                target_location.x, target_location.y, target_location.z
+            )
+            if route[-1].distance_to(final_target) > 1.0:
+                route.append(final_target)
+
+        self._release_agent(vehicle_id)
+        self._route_remaining_targets[task_id] = list(route[1:])
+        self._hazard_replanned_task_ids.add(task_id)
+        self._task_ids[vehicle_id] = task_id
+        self._task_status[vehicle_id] = "executing"
+        task.status = "executing"
+        task.status_reason = "road_graph_route_applied"
+        self._start_navigation_leg(vehicle_id, task_id, route[0])
+        payload = {
+            "task_id": task_id,
+            "vehicle_id": vehicle_id,
+            "waypoint_count": len(route),
+            "route_edge_ids": list(route_edge_ids or []),
+            "blocked_edge_id": blocked_edge_id,
+            "status": "executing",
+            "strategy": "road_graph_edges_via_basic_agent_legs",
+        }
+        self._emit("task_road_graph_route_applied", payload)
+        return payload
+
     def set_task_speed_limit(
         self, task_id: str, speed_limit_kmh: float
     ) -> Dict[str, object]:
@@ -1327,7 +1812,18 @@ class CarlaAdapter(EquipmentAdapter):
         value = max(1.0, float(speed_limit_kmh))
         self._task_speed_limits[task_id] = value
         vehicle_id = task.assigned_vehicle_id
-        if vehicle_id and self._task_ids.get(vehicle_id) == task_id:
+        # Loading/dumping are stationary production service holds.  Persist
+        # the speed cap now and let the next driving leg consume it; creating
+        # a BasicAgent during the hold would leave two planners owning the
+        # same CARLA actor when the hold expires.
+        is_production_hold = bool(
+            vehicle_id and vehicle_id in self._production_holds
+        )
+        if (
+            vehicle_id
+            and self._task_ids.get(vehicle_id) == task_id
+            and not is_production_hold
+        ):
             target = self._task_targets.get(task_id)
             self._release_agent(vehicle_id)
             if target is not None:
@@ -1339,6 +1835,131 @@ class CarlaAdapter(EquipmentAdapter):
             "speed_limit_kmh": value,
         }
         self._emit("task_speed_limit_changed", payload)
+        return payload
+
+    def recover_task_navigation(
+        self, task_id: str, forward_distance_m: float = 25.0
+    ) -> Dict[str, object]:
+        """Drive to a forward lane waypoint before retrying the current leg.
+
+        A large mine truck can stop at a tight endpoint with an orientation
+        from which rebuilding the same BasicAgent route is insufficient.  A
+        short, lane-valid forward manoeuvre gives the controller room to
+        replan without teleporting the actor or declaring the task complete.
+        """
+        self._require_connected()
+        task = self._task_objects.get(task_id)
+        vehicle_id = task.assigned_vehicle_id if task is not None else None
+        if (
+            task is None or not vehicle_id
+            or self._task_ids.get(vehicle_id) != task_id
+            or vehicle_id in self._faulted
+            or vehicle_id in self._paused
+            or vehicle_id in self._emergency_stopped
+        ):
+            return {
+                "task_id": task_id,
+                "vehicle_id": vehicle_id,
+                "status": "NOT_AVAILABLE",
+                "reason": "task_is_not_actively_navigating",
+            }
+        actor = self._actors.get(vehicle_id)
+        current_target = self._task_targets.get(task_id)
+        if actor is None or current_target is None:
+            return {
+                "task_id": task_id,
+                "vehicle_id": vehicle_id,
+                "status": "NOT_AVAILABLE",
+                "reason": "actor_or_target_missing",
+            }
+        try:
+            carla_map = self.world.get_map()
+            lane_type = getattr(
+                getattr(self.carla, "LaneType", None), "Driving", None
+            )
+            kwargs = {"project_to_road": True}
+            if lane_type is not None:
+                kwargs["lane_type"] = lane_type
+            waypoint = carla_map.get_waypoint(actor.get_location(), **kwargs)
+            candidates = list(waypoint.next(max(10.0, float(forward_distance_m)))) \
+                if waypoint is not None else []
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            candidates = []
+        if not candidates:
+            return {
+                "task_id": task_id,
+                "vehicle_id": vehicle_id,
+                "status": "NOT_AVAILABLE",
+                "reason": "no_forward_driving_waypoint",
+            }
+        actor_location = actor.get_location()
+        candidate = max(
+            candidates,
+            key=lambda item: math.hypot(
+                item.transform.location.x - actor_location.x,
+                item.transform.location.y - actor_location.y,
+            ),
+        )
+        location = candidate.transform.location
+        for other_vehicle_id, other_actor in self._actors.items():
+            if other_vehicle_id == vehicle_id:
+                continue
+            try:
+                other = other_actor.get_location()
+            except (AttributeError, RuntimeError):
+                continue
+            if math.sqrt(
+                (location.x - other.x) ** 2
+                + (location.y - other.y) ** 2
+                + (location.z - other.z) ** 2
+            ) < 20.0:
+                return {
+                    "task_id": task_id,
+                    "vehicle_id": vehicle_id,
+                    "status": "NOT_AVAILABLE",
+                    "reason": "forward_waypoint_occupied",
+                }
+
+        retry_targets = [current_target] + list(
+            self._route_remaining_targets.get(task_id, [])
+        )
+        recovery_target = Position(location.x, location.y, location.z)
+        self._route_remaining_targets[task_id] = retry_targets
+        self._release_agent(vehicle_id)
+        self._start_navigation_leg(vehicle_id, task_id, recovery_target)
+        task.status = "executing"
+        task.status_reason = "navigation_recovery_waypoint_started"
+        self._task_status[vehicle_id] = "executing"
+        payload = {
+            "task_id": task_id,
+            "vehicle_id": vehicle_id,
+            "status": "APPLIED",
+            "strategy": "FORWARD_LANE_WAYPOINT_THEN_RETRY_CURRENT_LEG",
+            "forward_distance_m": float(forward_distance_m),
+            "recovery_target": {
+                "x": recovery_target.x,
+                "y": recovery_target.y,
+                "z": recovery_target.z,
+            },
+        }
+        self._emit("task_navigation_recovery_started", payload)
+        return payload
+
+    def set_task_arrival_tolerance(
+        self, task_id: str, arrival_tolerance_m: float
+    ) -> Dict[str, object]:
+        """Apply the endpoint tolerance recorded by physical route evidence."""
+        self._require_connected()
+        if task_id not in self._task_objects:
+            raise CarlaAdapterError("Unknown task: {}".format(task_id))
+        value = max(0.5, float(arrival_tolerance_m))
+        self._task_arrival_tolerances[task_id] = value
+        payload = {
+            "task_id": task_id,
+            "arrival_tolerance_m": value,
+            "source": "P6_PHYSICAL_ROUTE_VALIDATION",
+        }
+        self._emit("task_arrival_tolerance_changed", payload)
         return payload
 
     def _build_takeover_route(
@@ -1560,8 +2181,12 @@ class CarlaAdapter(EquipmentAdapter):
         self._zones_by_id.clear()
         self._task_targets.clear()
         self._route_remaining_targets.clear()
+        self._production_plans.clear()
+        self._production_holds.clear()
+        self._mission_plans.clear()
         self._takeover_routes.clear()
         self._task_speed_limits.clear()
+        self._task_arrival_tolerances.clear()
         self._takeover_task_ids.clear()
         self._task_started_ticks.clear()
         self._spectator = None
@@ -1596,6 +2221,84 @@ class CarlaAdapter(EquipmentAdapter):
                 pass
             self._actors.pop(vehicle_id, None)
         return destroyed
+
+    def retire_vehicle(
+        self, vehicle_id: str,
+        reason: str = "runtime_route_clearance",
+    ) -> Dict[str, object]:
+        """Remove an owned idle/stuck actor while retaining factual evidence.
+
+        The current mine map has no validated parking resources.  Leaving a
+        completed full-size truck on an active road is less truthful and less
+        safe than ending that actor's participation in the finite episode.
+        Externally owned actors are never destroyed by this adapter.
+        """
+        actor = self._actors.get(vehicle_id)
+        if actor is None:
+            return {
+                "vehicle_id": vehicle_id,
+                "status": "ALREADY_ABSENT",
+                "reason": reason,
+            }
+        actor_id = getattr(actor, "id", None)
+        if actor_id not in set(self.spawned_actor_ids):
+            self._stop_vehicle(vehicle_id, hand_brake=True)
+            return {
+                "vehicle_id": vehicle_id,
+                "actor_id": actor_id,
+                "status": "NOT_OWNED_SAFE_HOLD",
+                "reason": reason,
+            }
+        location = actor.get_location()
+        self._release_agent(vehicle_id)
+        sensor = self._camera_sensors.pop(vehicle_id, None)
+        self._camera_display_names.pop(vehicle_id, None)
+        self._camera_frame_numbers.pop(vehicle_id, None)
+        if sensor is not None:
+            try:
+                sensor.stop()
+            except (AttributeError, RuntimeError):
+                pass
+            try:
+                sensor.destroy()
+            except (AttributeError, RuntimeError):
+                pass
+        try:
+            actor.destroy()
+        except (AttributeError, RuntimeError) as exc:
+            return {
+                "vehicle_id": vehicle_id,
+                "actor_id": actor_id,
+                "status": "DESTROY_FAILED_SAFE_HOLD",
+                "reason": reason,
+                "error": str(exc),
+            }
+        self._actors.pop(vehicle_id, None)
+        self._task_ids.pop(vehicle_id, None)
+        self._task_queues[vehicle_id] = []
+        self._production_holds.pop(vehicle_id, None)
+        self._paused.discard(vehicle_id)
+        self._emergency_stopped.discard(vehicle_id)
+        self._task_status[vehicle_id] = (
+            "retired_after_completion"
+            if reason == "completed_vehicle_clears_active_routes"
+            else "retired_after_execution_failure"
+        )
+        payload = {
+            "vehicle_id": vehicle_id,
+            "actor_id": actor_id,
+            "status": "RETIRED_FROM_EPISODE",
+            "reason": reason,
+            "last_position": {
+                "x": float(location.x),
+                "y": float(location.y),
+                "z": float(location.z),
+            },
+            "parking_resource_status": "NOT_AVAILABLE",
+            "task_record_retained": True,
+        }
+        self._emit("vehicle_retired_from_episode", payload)
+        return payload
 
     def _camera_wall_options(self) -> Dict[str, object]:
         options = self.config.scenario_variables.get("camera_wall", {})
@@ -1682,7 +2385,7 @@ class CarlaAdapter(EquipmentAdapter):
             print(
                 "WARNING: 多车视频监控启动失败，不影响车辆调度：{}".format(
                     exc
-                )
+                ), file=sys.stderr
             )
 
     def _overview_camera_transform(self, options: Dict[str, object]):
@@ -1935,6 +2638,91 @@ class CarlaAdapter(EquipmentAdapter):
                 for item in self.config.vehicles
                 if item.vehicle_id == vehicle_id
             )
+            production_plan = self._production_plans.get(task.task_id)
+            mission_plan = self._mission_plans.get(task.task_id)
+            suspended_hold = (
+                production_plan.pop("suspended_hold", None)
+                if production_plan else None
+            )
+            if suspended_hold is not None:
+                now = utc_now()
+                task.status = "executing"
+                task.updated_at = now
+                task.started_at = now
+                task.started_tick = self._tick_index
+                task.completed_at = None
+                task.completed_tick = None
+                task.attempt_count += 1
+                task.status_reason = "resumed_preempted_production_hold"
+                restored_hold = dict(suspended_hold)
+                restored_hold["until_tick"] = self._tick_index + int(
+                    restored_hold.pop("remaining_ticks", 0)
+                )
+                restored_status = str(
+                    restored_hold.pop("task_status", None)
+                    or production_plan.get("phase")
+                    or "production_service_hold"
+                )
+                self._production_holds[vehicle_id] = restored_hold
+                self._task_ids[vehicle_id] = task.task_id
+                self._task_status[vehicle_id] = restored_status
+                self._task_started_ticks[task.task_id] = self._tick_index
+                self._stop_vehicle(vehicle_id, hand_brake=True)
+                self._emit("task_production_hold_resumed", {
+                    "vehicle_id": vehicle_id,
+                    "task_id": task.task_id,
+                    "status": restored_status,
+                    "remaining_ticks": max(
+                        0, int(restored_hold["until_tick"]) - self._tick_index
+                    ),
+                })
+                return
+            if mission_plan and mission_plan.get("phase") == "pending_deadhead":
+                now = utc_now()
+                service_origin = mission_plan["service_origin"]
+                task.status = "executing"
+                task.updated_at = now
+                task.started_at = now
+                task.started_tick = self._tick_index
+                task.completed_at = None
+                task.completed_tick = None
+                task.attempt_count += 1
+                task.status_reason = "deadhead_to_service_origin"
+                task.last_distance_m = round(
+                    Position(
+                        actor.get_location().x,
+                        actor.get_location().y,
+                        actor.get_location().z,
+                    ).distance_to(service_origin),
+                    3,
+                )
+                mission_plan["phase"] = "to_service_origin"
+                self._task_targets[task.task_id] = service_origin
+                self._task_started_ticks[task.task_id] = self._tick_index
+                self._task_ids[vehicle_id] = task.task_id
+                self._task_status[vehicle_id] = "deadhead_to_service_origin"
+                self._start_navigation_leg(
+                    vehicle_id, task.task_id, service_origin
+                )
+                self._emit("task_mission_stage_changed", {
+                    "vehicle_id": vehicle_id,
+                    "task_id": task.task_id,
+                    "from_status": "spawned",
+                    "to_status": "to_service_origin",
+                    "reason": "admitted_deadhead_route_started",
+                    "service_origin_point_id": mission_plan.get(
+                        "service_origin_point_id"
+                    ),
+                    "deadhead_route_evidence": mission_plan.get(
+                        "deadhead_route_evidence"
+                    ),
+                })
+                return
+            if production_plan and production_plan.get("phase") == "pending_loading":
+                self._begin_loading_hold(
+                    vehicle_id, task, production_plan, target
+                )
+                return
             self._parked.discard(vehicle_id)
             actor.apply_control(
                 self.carla.VehicleControl(
@@ -1987,6 +2775,8 @@ class CarlaAdapter(EquipmentAdapter):
                 if takeover_route_applied
                 else "navigation_started"
             )
+            if mission_plan and mission_plan.get("phase") == "at_service_origin":
+                mission_plan["phase"] = "service_execution"
             self._task_targets[task.task_id] = navigation_target
             self._task_started_ticks[task.task_id] = self._tick_index
             self._task_ids[vehicle_id] = task.task_id
@@ -2031,6 +2821,12 @@ class CarlaAdapter(EquipmentAdapter):
         self, vehicle_id: str, task_id: str, target: Position
     ) -> None:
         actor = self._actors[vehicle_id]
+        # A vehicle can have only one controller owner.  CARLA 0.9.10's
+        # LocalPlanner destructor destroys its ego vehicle, so replacing an
+        # existing BasicAgent without detaching it first also destroys the
+        # shared mine-truck actor.
+        if vehicle_id in self._agents:
+            self._release_agent(vehicle_id)
         definition = next(
             item
             for item in self.config.vehicles
@@ -2039,22 +2835,37 @@ class CarlaAdapter(EquipmentAdapter):
         target_speed = self._task_speed_limits.get(
             task_id, definition.target_speed_kmh
         )
-        agent = self._basic_agent_class(actor, target_speed=target_speed)
-        agent.set_destination([target.x, target.y, target.z])
-        local_planner = None
+        agent = None
+        try:
+            agent = self._basic_agent_class(actor, target_speed=target_speed)
+            # CARLA 0.9.10 LocalPlanner.__del__ destroys its ego vehicle.
+            # Register before route construction so every failure path can
+            # safely detach that planner instead of deleting a mine truck.
+            self._agents[vehicle_id] = agent
+            agent.set_destination([target.x, target.y, target.z])
+            local_planner = self._local_planner_for(agent)
+            speed_setter = getattr(local_planner, "set_speed", None)
+            if callable(speed_setter):
+                speed_setter(float(target_speed))
+            self._task_targets[task_id] = target
+        except Exception as exc:
+            self._release_agent(vehicle_id)
+            raise CarlaAdapterError(
+                "Failed to initialize CARLA route for task {} on {}: {}"
+                .format(task_id, vehicle_id, exc)
+            ) from exc
+
+    @staticmethod
+    def _local_planner_for(agent):
         getter = getattr(agent, "get_local_planner", None)
         if callable(getter):
             try:
-                local_planner = getter()
+                planner = getter()
+                if planner is not None:
+                    return planner
             except Exception:
-                local_planner = None
-        if local_planner is None:
-            local_planner = getattr(agent, "_local_planner", None)
-        speed_setter = getattr(local_planner, "set_speed", None)
-        if callable(speed_setter):
-            speed_setter(float(target_speed))
-        self._agents[vehicle_id] = agent
-        self._task_targets[task_id] = target
+                pass
+        return getattr(agent, "_local_planner", None)
 
     def _park_vehicle_off_route(self, vehicle_id: str) -> None:
         offset = self.config.demo.idle_pull_over_offset_m
@@ -2228,7 +3039,7 @@ class CarlaAdapter(EquipmentAdapter):
         agent = self._agents.get(vehicle_id)
         if agent is None:
             return
-        local_planner = getattr(agent, "_local_planner", None)
+        local_planner = self._local_planner_for(agent)
         reset_vehicle = getattr(local_planner, "reset_vehicle", None)
         if callable(reset_vehicle):
             reset_vehicle()

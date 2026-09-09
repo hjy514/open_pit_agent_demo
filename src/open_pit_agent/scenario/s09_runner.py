@@ -5,20 +5,18 @@ from typing import Any, Dict, Optional, Set, Tuple
 
 from ..map_resources import MapResourceStore, RoadGraph, RoutePlanner
 from ..map_resources.road_graph import verified_point_anchors_from_store
-from .random_s01 import ROLE_DETAILS
+from .generator import ROLE_DETAILS, sample_event_timing
 from .s07_runner import run_random_s07_structural_mock
 
 
 POLICY_VERSION = "compound-road-fault-safe-takeover-v1"
 
 
-def _event_parameters(config: Any) -> Dict[str, int]:
-    randomization = config.scenario_variables.get("randomization", {})
-    events = randomization.get("events", []) if isinstance(randomization, dict) else []
-    raw = events[0].get("parameters", {}) if events else {}
-    road_tick = int(raw.get("road_closure_tick", 30))
-    failure_tick = int(raw.get("vehicle_failure_tick", 40))
-    recovery_tick = int(raw.get("recovery_tick", 80))
+def _event_parameters(config: Any, seed: int) -> Dict[str, int]:
+    timing = sample_event_timing(config, "s09", seed)
+    road_tick = timing["road_closure_tick"]
+    failure_tick = timing["vehicle_failure_tick"]
+    recovery_tick = timing["recovery_tick"]
     if not road_tick < failure_tick < recovery_tick:
         raise ValueError(
             "S09 requires road_closure_tick < vehicle_failure_tick < recovery_tick"
@@ -39,15 +37,29 @@ def run_random_s09_structural_mock(config: Any, seed: Optional[int] = None,
     """Resolve two ordered events against one task/fleet/map state."""
     requested_seed = config.demo.random_seed if seed is None else int(seed)
     workload_seed = requested_seed + int(_generation_attempt)
-    result = run_random_s07_structural_mock(
-        config, seed=workload_seed, vehicle_count=vehicle_count,
-        minimum_length_m=minimum_length_m,
-        maximum_length_m=maximum_length_m, scenario_key="s09",
-        eligible_pairs_override=eligible_pairs_override,
-    )
+    try:
+        result = run_random_s07_structural_mock(
+            config, seed=workload_seed, vehicle_count=vehicle_count,
+            minimum_length_m=minimum_length_m,
+            maximum_length_m=maximum_length_m, scenario_key="s09",
+            eligible_pairs_override=eligible_pairs_override,
+        )
+    except ValueError as exc:
+        if _generation_attempt < 19:
+            return run_random_s09_structural_mock(
+                config, seed=requested_seed, vehicle_count=vehicle_count,
+                minimum_length_m=minimum_length_m,
+                maximum_length_m=maximum_length_m,
+                _generation_attempt=_generation_attempt + 1,
+                eligible_pairs_override=eligible_pairs_override,
+            )
+        raise ValueError(
+            "S09 could not generate a P6-admitted selective road event after "
+            "20 deterministic attempts: {}".format(exc)
+        ) from exc
     result = deepcopy(result)
     effective_seed = int(result["seed"])
-    parameters = _event_parameters(config)
+    parameters = _event_parameters(config, requested_seed)
     binding = config.map_resource
     closed_edge_id = result["closed_edge_id"]
     road_affected_tasks = set(result.get("route_impact_task_ids", []))
@@ -84,7 +96,7 @@ def run_random_s09_structural_mock(config: Any, seed: Optional[int] = None,
             )
         }
         if eligible_pairs_override is not None:
-            eligible_pairs &= set(eligible_pairs_override)
+            eligible_pairs = set(eligible_pairs_override)
         graph = RoadGraph.from_store(store, binding.map_id,
                                      binding.resource_version)
         route_planner = RoutePlanner(graph)
@@ -248,13 +260,16 @@ def run_random_s09_structural_mock(config: Any, seed: Optional[int] = None,
             {
                 "event_type": "vehicle_failure",
                 "tick": parameters["vehicle_failure_tick"],
+                "recovery_tick": parameters["recovery_tick"],
                 "vehicle_id": failed_vehicle_id,
                 "data_origin": "PARAMETERIZED_SYNTHETIC_SCENARIO",
             },
         ],
         "compound_event_parameters": parameters,
         "failed_vehicle_id": failed_vehicle_id,
+        "closure_tick": parameters["road_closure_tick"],
         "failure_tick": parameters["vehicle_failure_tick"],
+        "recovery_tick": parameters["recovery_tick"],
         "released_task_ids": [failed_task_id],
         "reassignment_count": 1,
         "compound_failure_decisions": [takeover_decision],

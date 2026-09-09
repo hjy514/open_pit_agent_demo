@@ -12,6 +12,35 @@ from open_pit_agent.runtime_state import RuntimeState
 
 
 class RuntimeMonitoringMapTest(unittest.TestCase):
+    def test_decision_point_requires_explicit_human_resolution(self):
+        runtime = RuntimeState()
+        point = {
+            "decision_point_id": "s02-event-01",
+            "review_policy": "REQUIRED_BEFORE_EXECUTION",
+            "review_status": "PENDING_HUMAN_CONFIRMATION",
+            "action_type": "reassign_released_task",
+        }
+        runtime.sync_snapshot({
+            "decision": {
+                "status": "PENDING_HUMAN_CONFIRMATION",
+                "decision_points": [point],
+            }
+        })
+        self.assertEqual(
+            [point], runtime.get_pending_decision_points()
+        )
+        resolved = runtime.resolve_decision_point(
+            "s02-event-01", "approve"
+        )
+        self.assertEqual("APPROVED_BY_HUMAN", resolved["review_status"])
+        self.assertEqual([], runtime.get_pending_decision_points())
+        # Later runner snapshots cannot erase the recorded human response.
+        runtime.sync_snapshot({"decision": {"decision_points": [point]}})
+        self.assertEqual(
+            "approve",
+            runtime.get_decision_point("s02-event-01")["operator_response"]["action"],
+        )
+
     def test_execution_feedback_updates_tasks_vehicles_and_revision(self):
         runtime = RuntimeState()
         runtime.sync_snapshot({

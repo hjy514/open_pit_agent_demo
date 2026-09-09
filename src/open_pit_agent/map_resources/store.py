@@ -549,6 +549,27 @@ class MapResourceStore:
         ).fetchall()
         return {(str(row[0]), str(row[1])) for row in rows}
 
+    def static_inferred_conflict_pairs(
+        self, map_id: str, resource_version: str
+    ) -> Iterable[tuple]:
+        """Return conservative P4 proximity candidates for episode selection.
+
+        These are *not* physical collision results.  The scenario generator
+        may avoid them while choosing simultaneous initial spawns, which is a
+        conservative sampling rule only.  They must never be reported as
+        verified fleet-clearance evidence.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT point_a_id, point_b_id
+            FROM point_conflicts
+            WHERE map_id = ? AND resource_version = ?
+              AND validation_status = 'STATIC_INFERRED'
+            """,
+            (map_id, resource_version),
+        ).fetchall()
+        return {(str(row[0]), str(row[1])) for row in rows}
+
     def physical_route_validations(
         self, map_id: str, resource_version: str
     ) -> Iterable[Dict[str, object]]:
@@ -560,7 +581,8 @@ class MapResourceStore:
         rows = self.connection.execute(
             """
             SELECT route_id, from_point_id, to_point_id, validation_status,
-                   target_speed_kmh, duration_seconds, final_distance_m
+                   target_speed_kmh, arrival_tolerance_m,
+                   duration_seconds, final_distance_m
             FROM route_execution_validations
             WHERE map_id = ? AND resource_version = ?
             ORDER BY started_at, validation_id
@@ -574,8 +596,9 @@ class MapResourceStore:
                 "to_point_id": str(row[2]),
                 "validation_status": str(row[3]),
                 "target_speed_kmh": float(row[4]),
-                "duration_seconds": row[5],
-                "final_distance_m": row[6],
+                "arrival_tolerance_m": float(row[5]),
+                "duration_seconds": row[6],
+                "final_distance_m": row[7],
             }
             for row in rows
         ]
@@ -799,6 +822,26 @@ class MapResourceStore:
             "from_point_id": str(row[0]), "to_point_id": str(row[1]),
             "route_length_m": row[2], "endpoint_error_m": row[3],
             "junction_count": row[4], "planner_version": str(row[5]),
+        } for row in rows]
+
+    def planner_route_facts(self, map_id: str, resource_version: str):
+        """Read all P5 route facts without changing their validation meaning."""
+        rows = self.connection.execute(
+            """
+            SELECT from_point_id, to_point_id, route_length_m,
+                   endpoint_error_m, junction_count, planner_version,
+                   validation_status, reachable
+            FROM reachable_pairs
+            WHERE map_id = ? AND resource_version = ?
+            ORDER BY from_point_id, to_point_id, planner_version
+            """,
+            (map_id, resource_version),
+        ).fetchall()
+        return [{
+            "from_point_id": str(row[0]), "to_point_id": str(row[1]),
+            "route_length_m": row[2], "endpoint_error_m": row[3],
+            "junction_count": row[4], "planner_version": str(row[5]),
+            "validation_status": str(row[6]), "reachable": bool(row[7]),
         } for row in rows]
 
     def add_route_execution_validation(self, record: Dict[str, object]) -> None:
