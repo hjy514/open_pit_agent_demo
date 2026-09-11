@@ -30,10 +30,11 @@ def run_random_s04_structural_mock(config: Any, seed: Optional[int] = None,
                                    eligible_pairs_override: Optional[Set[Tuple[str, str]]] = None) -> Dict[str, Any]:
     """Reuse the road-constraint engine for a planned blast time window.
 
-    Safe graph bypasses remain assigned to the original vehicle. If S07's
-    fallback found a takeover because the original vehicle could not bypass,
-    S04 converts it to a deterministic wait: a planned blast does not justify
-    transferring the task merely to cross a temporarily controlled segment.
+    A planned blast is a short, known control window, so affected vehicles
+    hold until clearance and then continue their admitted physical mission.
+    S07 still owns long-lived road-closure detours.  Keeping the two policies
+    separate avoids replacing a short wait with a kilometre-scale topology
+    detour whose distance is not comparable with the P6 physical-route fact.
     """
     try:
         result = run_random_s07_structural_mock(
@@ -41,6 +42,7 @@ def run_random_s04_structural_mock(config: Any, seed: Optional[int] = None,
             minimum_length_m=minimum_length_m,
             maximum_length_m=maximum_length_m, scenario_key="s04",
             eligible_pairs_override=eligible_pairs_override,
+            allow_temporary_control_wait=True,
         )
     except ValueError as exc:
         raise ValueError(
@@ -67,54 +69,44 @@ def run_random_s04_structural_mock(config: Any, seed: Optional[int] = None,
     }
     for change in result.get("route_changes", []):
         task_id = str(change["task_id"])
-        if change.get("takeover_required"):
-            original_vehicle_id = change.get("original_vehicle_id")
-            original_edges = list(change.get("original_edge_ids", []))
-            change.update({
-                "action_type": "hold_until_blast_clearance",
+        original_vehicle_id = (
+            change.get("original_vehicle_id") or change.get("vehicle_id")
+        )
+        original_edges = list(change.get("original_edge_ids", []))
+        original = original_plan_by_task.get(task_id)
+        change.update({
+            "action_type": "hold_until_blast_clearance",
+            "vehicle_id": original_vehicle_id,
+            "replanned_edge_ids": original_edges,
+            "replanned_distance_m": change.get("original_distance_m"),
+            "takeover_required": False,
+            "wait_until_tick": parameters["clearance_tick"],
+            "reason": "planned_short_blast_wait_for_control_release",
+            "route_contract": dict(
+                original.get("route_contract", {}) if original else {}
+            ),
+        })
+        task = task_by_id.get(task_id)
+        if task is not None:
+            task["assigned_vehicle_id"] = original_vehicle_id
+            task["original_vehicle_id"] = None
+            task["handover_reason"] = None
+            task["handover_tick"] = None
+            task["transfer_count"] = 0
+            task["status_reason"] = "structural_mock_completion_after_blast_wait"
+        planned = planned_plan_by_task.get(task_id)
+        if planned is not None and original is not None:
+            planned.update({
                 "vehicle_id": original_vehicle_id,
-                "replanned_edge_ids": original_edges,
-                "replanned_distance_m": change.get("original_distance_m"),
-                "takeover_required": False,
-                "wait_until_tick": parameters["clearance_tick"],
-                "reason": "no_safe_bypass_wait_for_temporary_control_release",
-                "route_contract": dict(
-                    original_plan_by_task.get(task_id, {}).get(
-                        "route_contract", {}
-                    )
-                ),
+                "start_node": original.get("start_node"),
+                "goal_node": original.get("goal_node"),
+                "distance_m": original.get("distance_m"),
+                "status": "scheduled_after_blast_clearance",
+                "replan_reason": "temporary_blast_control_wait",
+                "edge_ids": list(original_edges),
+                "closed_edge_ids": [],
+                "route_contract": dict(original.get("route_contract", {})),
             })
-            task = task_by_id.get(task_id)
-            if task is not None:
-                task["assigned_vehicle_id"] = original_vehicle_id
-                task["original_vehicle_id"] = None
-                task["handover_reason"] = None
-                task["handover_tick"] = None
-                task["transfer_count"] = 0
-                task["status_reason"] = "structural_mock_completion_after_blast_wait"
-            planned = planned_plan_by_task.get(task_id)
-            original = original_plan_by_task.get(task_id)
-            if planned is not None and original is not None:
-                planned.update({
-                    "vehicle_id": original_vehicle_id,
-                    "start_node": original.get("start_node"),
-                    "goal_node": original.get("goal_node"),
-                    "distance_m": original.get("distance_m"),
-                    "status": "scheduled_after_blast_clearance",
-                    "replan_reason": "temporary_blast_control_wait",
-                    "edge_ids": list(original_edges),
-                    "closed_edge_ids": [],
-                    "route_contract": dict(original.get("route_contract", {})),
-                })
-        else:
-            change.update({
-                "action_type": "blast_zone_safe_route",
-                "wait_until_tick": None,
-                "reason": "temporary_blast_control_edge_avoided",
-            })
-            task = task_by_id.get(task_id)
-            if task is not None:
-                task["status_reason"] = "structural_mock_completion_after_blast_detour"
 
     for task in result.get("tasks", []):
         if isinstance(task, dict):

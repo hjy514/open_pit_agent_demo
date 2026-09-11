@@ -14,6 +14,8 @@ from open_pit_agent.decision_intelligence import (
     aggregate_structural_transition_datasets, build_structural_transition_dataset,
     load_structural_reward_config, write_structural_transition_dataset,
     export_closed_loop_transition_dataset,
+    load_decision_experience_reward_config,
+    export_decision_experience_transition_dataset,
 )
 from open_pit_agent.scenario import (
     SCENARIO_CATALOG, build_structural_runtime_snapshots,
@@ -25,6 +27,7 @@ from open_pit_agent.scenario.carla_execution import (
     _event_is_ready, _fleet_launch_schedule, _production_cycle_plans,
     _recently_progressing_task_ids, _reconcile_route_admission,
     _reconcile_runtime_traffic, _runtime_traffic_summary,
+    _retry_waiting_recovery_tasks,
     _recommended_execution_ticks,
     _task_execution_diagnostics, _update_progress_watchdog,
     run_carla_scenario_execution,
@@ -111,6 +114,15 @@ class RecordingScenarioAdapter:
         self.operations.append(("inject_fault", str(vehicle_id)))
         return {"vehicle_id": str(vehicle_id), "status": "fault"}
 
+    def retire_vehicle(self, vehicle_id, reason):
+        self.operations.append(("retire_vehicle", str(vehicle_id)))
+        return {
+            "vehicle_id": str(vehicle_id),
+            "status": "RETIRED_FROM_EPISODE",
+            "reason": str(reason),
+            "parking_resource_status": "NOT_AVAILABLE",
+        }
+
     def reassign_task(self, task_id, vehicle_id, speed_limit_kmh=None,
                       assignment_source="manual_dispatch"):
         task = next(item for item in self.tasks if item.task_id == task_id)
@@ -136,6 +148,17 @@ class RecordingScenarioAdapter:
         return {
             "task_id": str(task_id), "vehicle_id": str(vehicle_id),
             "waypoint_count": len(waypoint_positions), "status": "executing",
+        }
+
+    def configure_deferred_task_route(
+        self, task_id, vehicle_id, waypoint_positions,
+        blocked_edge_id=None, route_edge_ids=None,
+    ):
+        self.operations.append(("configure_deferred_task_route", str(task_id)))
+        return {
+            "task_id": str(task_id), "vehicle_id": str(vehicle_id),
+            "waypoint_count": len(waypoint_positions),
+            "status": "DEFERRED_UNTIL_TASK_RESUME",
         }
 
     def pause_vehicle(self, vehicle_id):
@@ -226,6 +249,111 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
         self.assertEqual(700, progress["task-curve"]["last_progress_tick"])
         self.assertTrue(progress["task-curve"]["motion_observed"])
 
+    def test_progress_watchdog_waits_for_measured_traffic_blockage(self):
+        task = SimpleNamespace(
+            task_id="traffic-wait", assigned_vehicle_id="truck-1",
+            status="executing", status_reason="navigation_started",
+            last_distance_m=100.0, completed_tick=None,
+        )
+
+        class TrafficBlockedAdapter:
+            def __init__(self):
+                self.events = []
+
+            def classify_navigation_blockage(self, vehicle_id):
+                return {
+                    "category": "TRAFFIC_BLOCKED",
+                    "vehicle_id": vehicle_id,
+                    "blocker_vehicle_id": "truck-2",
+                    "surface_gap_m": 6.0,
+                }
+
+            def set_task_speed_limit(self, task_id, speed_limit_kmh):
+                raise AssertionError("traffic wait must not restart navigation")
+
+            def _emit(self, event_type, payload):
+                self.events.append((event_type, payload))
+
+        progress = {
+            "traffic-wait": {
+                "initial_distance_m": 100.0,
+                "best_distance_m": 100.0,
+                "last_progress_tick": 0,
+                "progress_m": 0.0,
+                "restart_count": 0,
+                "progress_phase": ("truck-1", "navigation_started"),
+            },
+        }
+        adapter = TrafficBlockedAdapter()
+
+        controls = _update_progress_watchdog(
+            [task], 700, adapter, progress, {}, [], {"truck-1": 0.0}, {}
+        )
+
+        self.assertEqual("executing", task.status)
+        self.assertEqual("TRAFFIC_WAIT", controls[0]["status"])
+        self.assertEqual(
+            "wait_for_detected_vehicle_blockage", controls[0]["action"]
+        )
+        self.assertEqual(700, progress["traffic-wait"]["last_progress_tick"])
+        self.assertEqual("truck-2", progress["traffic-wait"]["blocker_vehicle_id"])
+        self.assertEqual(
+            "vehicle_navigation_waiting_for_traffic", adapter.events[0][0]
+        )
+
+    def test_progress_watchdog_escalates_persistent_traffic_wait(self):
+        task = SimpleNamespace(
+            task_id="persistent-traffic", assigned_vehicle_id="truck-1",
+            status="executing", status_reason="navigation_started",
+            last_distance_m=100.0,
+            completed_tick=None,
+        )
+
+        class PersistentBlockAdapter:
+            def __init__(self):
+                self.restarts = []
+
+            def classify_navigation_blockage(self, vehicle_id):
+                return {
+                    "category": "TRAFFIC_BLOCKED",
+                    "vehicle_id": vehicle_id,
+                    "blocker_vehicle_id": "truck-2",
+                }
+
+            def set_task_speed_limit(self, task_id, speed_limit_kmh):
+                self.restarts.append(task_id)
+                return {
+                    "task_id": task_id,
+                    "speed_limit_kmh": speed_limit_kmh,
+                }
+
+            def _emit(self, event_type, payload):
+                return None
+
+        progress = {
+            "persistent-traffic": {
+                "initial_distance_m": 100.0,
+                "best_distance_m": 100.0,
+                "last_progress_tick": 0,
+                "progress_m": 0.0,
+                "restart_count": 0,
+                "progress_phase": ("truck-1", "navigation_started"),
+                "traffic_wait_started_tick": 100,
+            },
+        }
+        adapter = PersistentBlockAdapter()
+
+        controls = _update_progress_watchdog(
+            [task], 1300, adapter, progress, {}, [], {"truck-1": 0.0}, {}
+        )
+
+        self.assertEqual(["persistent-traffic"], adapter.restarts)
+        self.assertEqual(
+            ["escalate_persistent_vehicle_blockage",
+             "restart_stalled_navigation"],
+            [item["action"] for item in controls],
+        )
+
     def test_progress_watchdog_ignores_preempted_queued_task(self):
         task = SimpleNamespace(
             task_id="queued-task", assigned_vehicle_id="truck-1",
@@ -297,11 +425,18 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
                 self.events = []
 
             def list_states(self):
-                return [SimpleNamespace(
-                    vehicle_id="truck-2", capabilities=["haul"],
-                    available=True, health="healthy",
-                    task_status="executing",
-                )]
+                return [
+                    SimpleNamespace(
+                        vehicle_id="truck-2", capabilities=["haul"],
+                        available=True, health="healthy",
+                        task_status="executing",
+                    ),
+                    SimpleNamespace(
+                        vehicle_id="truck-3", capabilities=["haul"],
+                        available=True, health="healthy",
+                        task_status="idle",
+                    ),
+                ]
 
             def retire_vehicle(self, vehicle_id, reason):
                 self.retired.append((vehicle_id, reason))
@@ -340,10 +475,10 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual("executing", stalled.status)
-        self.assertEqual("truck-2", stalled.assigned_vehicle_id)
+        self.assertEqual("truck-3", stalled.assigned_vehicle_id)
         self.assertEqual({"stalled-task": 1}, recovery_attempts)
         self.assertEqual(
-            [("stalled-task", "truck-2", "scenario_recovery")],
+            [("stalled-task", "truck-3", "scenario_recovery")],
             adapter.reassigned,
         )
         self.assertIn(
@@ -351,6 +486,67 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
             [item["action"] for item in controls],
         )
         self.assertNotIn("stalled-task", progress)
+
+    def test_exhausted_recovery_detaches_only_stalled_preemption(self):
+        stalled = SimpleNamespace(
+            task_id="stalled-task", assigned_vehicle_id="truck-2",
+            status="executing", status_reason="navigation_started",
+            last_distance_m=100.0, completed_tick=None, priority=50,
+            required_capabilities=["haul"], original_vehicle_id="truck-1",
+            handover_reason=None, handover_tick=None,
+        )
+        queued = SimpleNamespace(
+            task_id="queued-task", assigned_vehicle_id="truck-2",
+            status="assigned", priority=40, last_distance_m=80.0,
+        )
+
+        class QueueOwnerAdapter:
+            def __init__(self):
+                self.detached = []
+                self.retired = []
+
+            def detach_terminal_task_and_resume_vehicle(self, task_id,
+                                                        reason):
+                self.detached.append((task_id, reason))
+                return {
+                    "task_id": task_id, "vehicle_id": "truck-2",
+                    "status": "TERMINAL_TASK_DETACHED",
+                    "next_task_id": "queued-task", "vehicle_retained": True,
+                }
+
+            def retire_vehicle(self, vehicle_id, reason):
+                self.retired.append((vehicle_id, reason))
+                return {"vehicle_id": vehicle_id, "status": "RETIRED"}
+
+        adapter = QueueOwnerAdapter()
+        progress = {
+            "stalled-task": {
+                "initial_distance_m": 100.0,
+                "best_distance_m": 100.0,
+                "last_progress_tick": 0,
+                "progress_m": 0.0,
+                "restart_count": 1,
+                "progress_phase": ("truck-2", "navigation_started"),
+            },
+            "__navigation_recovery_attempts__": {"stalled-task": 1},
+        }
+        controls = _update_progress_watchdog(
+            [stalled, queued], 700, adapter, progress, {}, [],
+            {"truck-2": 0.0}, {"stalled-task": 1},
+        )
+
+        self.assertEqual("stuck", stalled.status)
+        self.assertEqual("assigned", queued.status)
+        self.assertEqual([], adapter.retired)
+        self.assertEqual(
+            [("stalled-task",
+              "terminal_stalled_task_releases_vehicle_queue")],
+            adapter.detached,
+        )
+        self.assertEqual(
+            "TERMINAL_TASK_DETACHED",
+            controls[-1]["vehicle_clearance"]["status"],
+        )
 
     def test_progress_watchdog_uses_forward_lane_recovery_before_reassignment(self):
         task = SimpleNamespace(
@@ -879,7 +1075,7 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
             schedule[0]["physical_concurrent_route_capacity"]
         )
         self.assertEqual(
-            "TOPOLOGY_CONFLICT_SERIALIZED_WITH_HEADWAY",
+            "STAGGERED_HEADWAY_WITH_RUNTIME_RIGHT_OF_WAY",
             schedule[0]["runtime_admission_strategy"],
         )
 
@@ -929,7 +1125,7 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
             ["task-1", "task-2"], state["active_task_ids"]
         )
 
-    def test_route_admission_holds_shared_edge_until_predecessor_finishes(self):
+    def test_route_admission_releases_shared_edge_after_headway(self):
         class Adapter:
             def __init__(self):
                 self.paused = []
@@ -961,15 +1157,82 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
         state = {"held_vehicle_ids": []}
 
         _reconcile_route_admission(
-            [first, second], adapter, schedule, state, tick_index=100
+            [first, second], adapter, schedule, state, tick_index=0
         )
         self.assertEqual(["truck-2"], state["held_vehicle_ids"])
-        first.status = "completed"
         _reconcile_route_admission(
-            [first, second], adapter, schedule, state, tick_index=101
+            [first, second], adapter, schedule, state, tick_index=100
         )
         self.assertEqual([], state["held_vehicle_ids"])
         self.assertEqual(["truck-2"], adapter.resumed)
+
+    def test_waiting_recovery_task_is_reassigned_when_capacity_is_idle(self):
+        waiting = SimpleNamespace(
+            task_id="waiting-task", assigned_vehicle_id=None,
+            status="waiting_recovery_capacity", priority=80,
+            required_capabilities=["haul"], original_vehicle_id="truck-1",
+            recovery_wait_started_tick=700,
+        )
+
+        class RecoveryCapacityAdapter:
+            def __init__(self):
+                self.reassigned = []
+                self.events = []
+
+            def list_states(self):
+                return [SimpleNamespace(
+                    vehicle_id="truck-2", capabilities=["haul"],
+                    available=True, health="healthy", task_status="idle",
+                )]
+
+            def reassign_task(self, task_id, vehicle_id,
+                              assignment_source="manual_dispatch"):
+                waiting.assigned_vehicle_id = vehicle_id
+                waiting.status = "executing"
+                self.reassigned.append(
+                    (task_id, vehicle_id, assignment_source)
+                )
+                return {
+                    "task_id": task_id, "vehicle_id": vehicle_id,
+                    "status": "executing",
+                }
+
+            def _emit(self, event_type, payload):
+                self.events.append((event_type, payload))
+
+        adapter = RecoveryCapacityAdapter()
+        attempts = {}
+        decisions = []
+        controls = _retry_waiting_recovery_tasks(
+            [waiting], 900, adapter, {}, attempts,
+            decision_points=decisions, scenario_key="s02",
+            policy_version="MultiObjectiveCostModel-V1",
+        )
+
+        self.assertEqual("executing", waiting.status)
+        self.assertEqual("truck-2", waiting.assigned_vehicle_id)
+        self.assertEqual({"waiting-task": 1}, attempts)
+        self.assertEqual(
+            [("waiting-task", "truck-2", "scenario_recovery_capacity")],
+            adapter.reassigned,
+        )
+        self.assertEqual(200, controls[0]["recovery_wait_ticks"])
+        self.assertEqual(1, len(decisions))
+        self.assertEqual("s02", decisions[0]["scenario_key"])
+        self.assertEqual(
+            "MultiObjectiveCostModel-V1", decisions[0]["policy_version"]
+        )
+        self.assertEqual(
+            "APPROVED", decisions[0]["safety_review"]["status"]
+        )
+        self.assertEqual(
+            "truck-2", decisions[0]["recommended_vehicle_id"]
+        )
+        self.assertEqual("EXECUTING", decisions[0]["execution_status"])
+        self.assertEqual(
+            "runtime_recovery_capacity_became_available",
+            adapter.events[0][0],
+        )
 
     def test_runtime_traffic_holds_rear_vehicle_then_releases_it(self):
         class Adapter:
@@ -1343,6 +1606,17 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
             item["measurement_status"] == "CARLA_MEASURED"
             for item in result["execution_feedback"]
         ))
+        self.assertEqual(
+            "openpit.decision-experience.v1",
+            result["data_contract"]["decision_experience"],
+        )
+        self.assertEqual(1, len(result["decision_experiences"]))
+        experience = result["decision_experiences"][0]
+        self.assertEqual("initial_dispatch", experience["transition_kind"])
+        self.assertEqual("CARLA_MEASURED", experience["measurement_status"])
+        self.assertEqual("NOT_AVAILABLE_NO_REWARD_MODEL", experience["reward_status"])
+        self.assertIsNone(experience["reward"])
+        self.assertEqual(6, len(experience["route_context"]))
         self.assertTrue(FakeExecutionAdapter.last_instance.destroyed)
         self.assertTrue(FakeExecutionAdapter.last_instance.closed)
 
@@ -1384,16 +1658,59 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
                         adapter_factory=CheckOnlyAdapter,
                     )
 
+    def test_carla_interruption_returns_partial_evidence_and_cleans_up(self):
+        class InterruptedAdapter(RecordingScenarioAdapter):
+            last_instance = None
+
+            def __init__(self, config, load_map=False):
+                super().__init__(config, load_map=load_map)
+                InterruptedAdapter.last_instance = self
+
+            def tick(self):
+                self.tick_count += 1
+                if self.tick_count >= 2:
+                    raise KeyboardInterrupt()
+                return super().tick()
+
+        config = load_config(ROOT / "configs" / "s01_normal_6v.json")
+
+        result = run_carla_scenario_execution(
+            "s01", config, seed=202601, vehicle_count=6, ticks=10,
+            physical_route_pairs=physical_pairs_for_fake_carla(config),
+            adapter_factory=InterruptedAdapter,
+        )
+
+        self.assertEqual("INTERRUPTED", result["status"])
+        self.assertTrue(result["interrupted"])
+        self.assertEqual("operator_interrupted_run", result["interruption_reason"])
+        self.assertTrue(all(
+            item["status"] in {"completed", "cancelled"}
+            for item in result["tasks"]
+        ))
+        self.assertIn(
+            ("destroy_spawned_vehicles", None),
+            InterruptedAdapter.last_instance.operations,
+        )
+        self.assertIn(
+            ("close", None), InterruptedAdapter.last_instance.operations
+        )
+
     def test_all_unified_scenarios_execute_their_carla_adapter_contract(self):
         expected_operations = {
             "s01": set(),
+            # S02 has a configured 12 m pull-over and therefore keeps its
+            # faulted actor; S09 has no validated parking resource and uses
+            # the common finite-episode retirement fallback.
             "s02": {"inject_fault", "reassign_task"},
             "s03": {"retarget_task", "set_task_route"},
             "s04": {"pause_vehicle", "resume_vehicle"},
             "s05": {"set_task_speed_limit", "set_task_route"},
             "s06": {"pause_vehicle", "resume_vehicle"},
-            "s07": {"reassign_task", "set_task_route"},
-            "s09": {"inject_fault", "reassign_task", "set_task_route"},
+            "s07": {"pause_vehicle", "resume_vehicle"},
+            "s09": {
+                "inject_fault", "retire_vehicle", "reassign_task",
+                "set_task_route",
+            },
         }
         for scenario_key, required_operations in expected_operations.items():
             with self.subTest(scenario=scenario_key):
@@ -1420,6 +1737,25 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
                 }
                 self.assertEqual("PASS", result["status"], scenario_key)
                 self.assertEqual(6, result["completed_task_count"], scenario_key)
+                self.assertTrue(all(
+                    not item["requires_deadhead"]
+                    and item["vehicle_spawn_point_id"]
+                    == item["service_origin_point_id"]
+                    for item in result["task_mission_plans"]
+                ), scenario_key)
+                if scenario_key in {"s07", "s09"}:
+                    self.assertTrue(any(
+                        item.get("action")
+                        == "hold_for_unvalidated_temporary_detour"
+                        for item in result["runtime_controls"]
+                    ), scenario_key)
+                if scenario_key == "s09":
+                    self.assertTrue(result["road_clearance_applied"])
+                    self.assertTrue(any(
+                        item.get("action")
+                        == "resume_p6_route_after_road_reopen"
+                        for item in result["runtime_controls"]
+                    ))
                 task_types = {
                     item["task_id"]: item["task_type"]
                     for item in result["tasks"]
@@ -1551,13 +1887,59 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
             for item in snapshots
         ))
         self.assertEqual("APPROVED_BY_HUMAN", result["operator_review_status"])
+        event_experience = next(
+            item for item in result["decision_experiences"]
+            if item["transition_kind"] == "scenario_event_response"
+        )
+        self.assertEqual(result["event_tick"], event_experience["decision_tick"])
+        self.assertEqual(
+            "APPROVED_BY_HUMAN",
+            event_experience["action"]["operator_review_status"],
+        )
         self.assertEqual("SUCCEEDED", result["closed_loop_cycle"]["status"])
+        persisted_command = result["closed_loop_cycle"]["stage_results"][
+            "scheduling"
+        ]["command"]
+        self.assertEqual("openpit.execution-command.v1", persisted_command["schema_version"])
+        self.assertEqual("dispatch_tasks", persisted_command["action_type"])
+        self.assertEqual(6, len(persisted_command["assignments"]))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorder = EvidenceRecorder(
+                root / "artifacts" / "runs", "s02-physical-cycle-export-test"
+            )
+            try:
+                result["run_id"] = recorder.run_id
+                self.assertEqual(1, recorder.record_closed_loop_cycle(result))
+                summary = dict(result)
+                summary["scenario_seed"] = result["seed"]
+                summary["scenario_mode"] = "seeded_random_map"
+                recorder.store.update_from_summary(recorder.run_id, summary)
+            finally:
+                recorder.close()
+            manifest = export_closed_loop_transition_dataset(
+                root / "data" / "database" / "openpit.db",
+                root / "datasets", "s02-physical-cycle-export-test",
+                run_ids=[result["run_id"]],
+            )
+        self.assertEqual(1, manifest["learning_readiness"]["physical_record_count"])
+        self.assertEqual(
+            1,
+            manifest["learning_readiness"][
+                "offline_optimization_analysis_record_count"
+            ],
+        )
+        self.assertEqual(
+            "READY_FOR_OFFLINE_ANALYSIS",
+            manifest["learning_readiness"]["offline_analysis_status"],
+        )
 
     def test_carla_bridge_publishes_live_runtime_contract(self):
         class FakeRuntimeAdapter:
             def __init__(self, config, load_map=False):
                 self.config = config
                 self.tasks = []
+                self.tick_count = 0
 
             def connect(self):
                 pass
@@ -1574,8 +1956,10 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
                     task.status = "executing"
 
             def tick(self):
-                for task in self.tasks:
-                    task.status = "completed"
+                self.tick_count += 1
+                if self.tick_count >= 12:
+                    for task in self.tasks:
+                        task.status = "completed"
 
             def drain_events(self):
                 return []
@@ -1596,7 +1980,7 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
         snapshots = []
         config = load_config(ROOT / "configs" / "s01_normal_6v.json")
         result = run_carla_scenario_execution(
-            "s01", config, seed=202601, vehicle_count=6, ticks=2,
+            "s01", config, seed=202601, vehicle_count=6, ticks=20,
             physical_route_pairs=planner_pairs_for_fake_carla(config),
             adapter_factory=FakeRuntimeAdapter,
             runtime_publisher=snapshots.append,
@@ -1608,6 +1992,14 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
         ))
         self.assertEqual(6, len(snapshots[-1]["world_state"]["vehicles"]))
         self.assertEqual("finish", snapshots[-1]["execution"]["phase"])
+        execute_ticks = [
+            item["execution"]["tick"] for item in snapshots
+            if item["execution"]["phase"] == "execute"
+        ]
+        self.assertIn(10, execute_ticks)
+        self.assertLess(
+            len(result["runtime_telemetry"]), len(execute_ticks)
+        )
 
     def test_runtime_execution_events_use_common_evidence_store(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1655,6 +2047,307 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
                 )
             finally:
                 recorder.close()
+
+    def test_carla_runtime_plan_indexes_common_decisions_and_routes(self):
+        with tempfile.TemporaryDirectory() as td:
+            recorder = EvidenceRecorder(
+                Path(td) / "artifacts" / "runs", "s04-carla-plan-test"
+            )
+            try:
+                counts = recorder.record_unified_runtime_plan({
+                    "decisions": [{
+                        "schema_version": "openpit.decision-record.v1",
+                        "decision_id": "decision-1",
+                        "decision_type": "blast_response",
+                        "action_type": "hold_until_blast_clearance",
+                        "task_id": "task-1",
+                        "selected_vehicle_id": "truck-1",
+                        "score": 2.5,
+                        "policy_version": "planned-blast-road-control-v1",
+                        "constraint_results": {"closed_road_avoided": True},
+                        "candidate_evaluations": [],
+                    }],
+                    "route_plans": [{
+                        "route_plan_id": "task-1:replanned",
+                        "vehicle_id": "truck-1", "task_id": "task-1",
+                        "planner_version": "RoadGraph-Dijkstra-Topology-V1",
+                        "start_node": "point-1", "goal_node": "point-2",
+                        "distance_m": 120.0, "status": "PLANNED",
+                    }],
+                    "task_mission_plans": [{
+                        "task_id": "task-1", "vehicle_id": "truck-1",
+                        "vehicle_spawn_point_id": "point-0",
+                        "service_origin_point_id": "point-1",
+                        "service_target_point_id": "point-2",
+                        "deadhead_route_length_m": 30.0,
+                        "mission_route_length_m": 120.0,
+                        "mission_route_evidence": "P6_PHYSICAL_REACHED",
+                    }],
+                })
+                decision = recorder.store.connection.execute(
+                    "SELECT context,task_id,vehicle_id,score,policy_version "
+                    "FROM decisions WHERE run_id=?",
+                    (recorder.run_id,),
+                ).fetchone()
+                routes = recorder.store.connection.execute(
+                    "SELECT route_plan_id,distance_m,status FROM route_plans "
+                    "WHERE run_id=? ORDER BY route_plan_id",
+                    (recorder.run_id,),
+                ).fetchall()
+                experience_count = recorder.record_decision_experiences({
+                    "decision_experiences": [{
+                        "schema_version": "openpit.decision-experience.v1",
+                        "experience_id": "s04:event:20:1",
+                        "scenario_key": "s04",
+                        "transition_kind": "scenario_event_response",
+                        "decision_tick": 20,
+                        "measurement_status": "CARLA_MEASURED",
+                        "state_before": {"tick": 20, "tasks": []},
+                        "action": {"action_type": "hold_for_blast"},
+                        "route_context": [],
+                        "state_after": {"tick": 20, "tasks": []},
+                        "reward": None,
+                        "reward_status": "NOT_AVAILABLE_NO_REWARD_MODEL",
+                        "done": False,
+                    }],
+                })
+                experience_event = recorder.store.connection.execute(
+                    "SELECT payload_json FROM events WHERE run_id=? "
+                    "AND event_type='decision_experience_captured'",
+                    (recorder.run_id,),
+                ).fetchone()
+                experience_artifact = (
+                    recorder.run_dir / "decision_experiences.jsonl"
+                ).exists()
+            finally:
+                recorder.close()
+
+        self.assertEqual({
+            "decision_count": 1,
+            "route_plan_count": 1,
+            "task_mission_plan_count": 1,
+        }, counts)
+        self.assertEqual(
+            ("blast_response", "task-1", "truck-1", 2.5,
+             "planned-blast-road-control-v1"),
+            decision,
+        )
+        self.assertEqual([
+            ("task-1:carla-mission", 150.0, "CARLA_MISSION_CONFIGURED"),
+            ("task-1:replanned", 120.0, "PLANNED"),
+        ], routes)
+        self.assertEqual(1, experience_count)
+        self.assertTrue(experience_artifact)
+        self.assertEqual(
+            "s04:event:20:1", json.loads(experience_event[0])["experience_id"]
+        )
+
+    def test_decision_experience_export_builds_observed_reward_intervals(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            recorder = EvidenceRecorder(
+                root / "artifacts" / "runs", "decision-reward-test"
+            )
+            run_id = recorder.run_id
+            experiences = []
+            for index, (kind, tick, status) in enumerate((
+                ("initial_dispatch", 0, "assigned"),
+                ("scenario_event_response", 10, "executing"),
+            ), 1):
+                experiences.append({
+                    "schema_version": "openpit.decision-experience.v1",
+                    "experience_id": "s02:{}:{}:{}".format(kind, tick, index),
+                    "scenario_key": "s02", "transition_kind": kind,
+                    "decision_tick": tick, "tick": tick,
+                    "measurement_status": "CARLA_MEASURED",
+                    "state_before": {"tick": tick, "tasks": [{
+                        "task_id": "task-1", "status": status,
+                        "assigned_vehicle_id": "truck-1",
+                    }]},
+                    "action": {
+                        "action_type": "dispatch_tasks" if index == 1
+                        else "apply_scenario_event_response",
+                        "safety_gate_status": "APPROVED",
+                    },
+                    "route_context": [],
+                    "state_after": {"tick": tick, "tasks": [{
+                        "task_id": "task-1", "status": "executing",
+                        "assigned_vehicle_id": "truck-1",
+                    }]},
+                    "reward": None,
+                    "reward_status": "NOT_AVAILABLE_NO_REWARD_MODEL",
+                    "done": False,
+                })
+            try:
+                self.assertEqual(
+                    2, recorder.record_decision_experiences({
+                        "decision_experiences": experiences,
+                    })
+                )
+                recorder.store.update_from_summary(run_id, {
+                    "status": "PASS", "scenario_seed": 202604,
+                    "scenario_mode": "seeded_random_map",
+                    "mode": "carla_multi_scenario_execution",
+                    "task_count": 1, "completed_task_count": 1,
+                    "ticks_executed": 20, "effective_execution_ticks": 100,
+                    "tasks": [{
+                        "task_id": "task-1", "status": "completed",
+                        "assigned_vehicle_id": "truck-1",
+                    }],
+                    "final_vehicle_states": [{
+                        "vehicle_id": "truck-1", "task_status": "completed",
+                    }],
+                })
+            finally:
+                recorder.close()
+            manifest = export_decision_experience_transition_dataset(
+                root / "data" / "database" / "openpit.db",
+                root / "data" / "datasets", "reward-v1-test",
+                load_decision_experience_reward_config(
+                    ROOT / "configs" / "dispatch_cost_v1.json"
+                ), run_ids=[run_id],
+            )
+            records = [
+                json.loads(line) for line in Path(
+                    manifest["transitions_path"]
+                ).read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual("DATASET_QUALITY_PASS", manifest["dataset_quality"]["status"])
+        self.assertEqual(2, manifest["record_count"])
+        self.assertEqual(1, manifest["terminal_record_count"])
+        self.assertEqual(0, manifest["ppo_eligible_record_count"])
+        self.assertEqual(
+            {"s02": 1}, manifest["coverage"]["scenario_run_counts"]
+        )
+        self.assertEqual(
+            {"initial_dispatch": 1, "scenario_event_response": 1},
+            manifest["coverage"]["transition_kind_counts"],
+        )
+        self.assertEqual(
+            "BASELINE_DATA_AVAILABLE_MORE_SEEDS_REQUIRED",
+            manifest["learning_readiness"]["status"],
+        )
+        self.assertEqual(
+            "DISABLED_BY_DESIGN",
+            manifest["learning_readiness"]["automatic_policy_update"],
+        )
+        self.assertFalse(records[0]["done"])
+        self.assertTrue(records[1]["done"])
+        self.assertTrue(all(item["reward"] is not None for item in records))
+        self.assertEqual(
+            "initial_equal_engineering_weights_not_validated_as_optimal",
+            records[0]["reward_detail"]["weight_status"],
+        )
+
+    def test_s02_carla_database_validation_uses_runtime_event_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            recorder = EvidenceRecorder(
+                Path(td) / "artifacts" / "runs", "s02-carla-test"
+            )
+            result = {
+                "mode": "carla_multi_scenario_execution",
+                "status": "PASS", "task_count": 1,
+                "completed_task_count": 1, "reassignment_count": 1,
+                "tasks": [{
+                    "task_id": "task-1", "zone_id": "zone-1",
+                    "task_type": "slope_inspection", "priority": 50,
+                    "status": "completed", "assigned_vehicle_id": "truck-2",
+                    "completed_tick": 100,
+                }],
+            }
+            try:
+                recorder.record_runtime_events({
+                    "mode": result["mode"],
+                    "events": [{"event_type": name, "payload": {}}
+                    for name in (
+                        "vehicle_fault_applied",
+                        "task_suspended_for_preemption",
+                        "task_reassigned_by_scenario",
+                        "task_completed",
+                    )],
+                })
+                recorder.store.update_from_summary(recorder.run_id, result)
+                validation = recorder.store.validate_closed_loop_evidence(
+                    recorder.run_id, "s02", result
+                )
+            finally:
+                recorder.close()
+
+        self.assertEqual("EVIDENCE_PASS", validation["status"])
+        self.assertEqual([], validation["failed_checks"])
+
+    def test_s04_s09_carla_database_validation_uses_unified_runtime_facts(self):
+        cases = {
+            "s04": (
+                "scenario_control_applied",
+                "scenario_control_recovered",
+                "task_completed",
+            ),
+            "s09": (
+                "scenario_control_applied",
+                "vehicle_fault_applied",
+                "task_suspended_for_preemption",
+                "task_reassigned_by_scenario",
+                "scenario_control_recovered",
+                "task_completed",
+            ),
+        }
+        for scenario_key, event_types in cases.items():
+            with self.subTest(scenario_key=scenario_key):
+                with tempfile.TemporaryDirectory() as td:
+                    recorder = EvidenceRecorder(
+                        Path(td) / "artifacts" / "runs",
+                        "{}-carla-test".format(scenario_key),
+                    )
+                    result = {
+                        "mode": "carla_multi_scenario_execution",
+                        "status": "PASS", "task_count": 1,
+                        "completed_task_count": 1,
+                        "tasks": [{
+                            "task_id": "task-1", "status": "completed",
+                            "assigned_vehicle_id": "truck-1",
+                        }],
+                        "decisions": [{
+                            "decision_id": "decision-1",
+                            "decision_type": "event_response",
+                            "action_type": "hold",
+                            "task_id": "task-1",
+                            "selected_vehicle_id": "truck-1",
+                        }],
+                        "route_plans": [{
+                            "route_plan_id": "route-1", "task_id": "task-1",
+                            "vehicle_id": "truck-1", "distance_m": 100.0,
+                            "status": "PLANNED",
+                        }],
+                        "task_mission_plans": [{
+                            "task_id": "task-1", "vehicle_id": "truck-1",
+                            "vehicle_spawn_point_id": "point-1",
+                            "service_target_point_id": "point-2",
+                            "mission_route_length_m": 100.0,
+                        }],
+                    }
+                    try:
+                        recorder.record_unified_runtime_plan(result)
+                        recorder.record_runtime_events({
+                            "mode": result["mode"],
+                            "events": [
+                                {"event_type": item, "payload": {}}
+                                for item in event_types
+                            ],
+                        })
+                        recorder.store.update_from_summary(
+                            recorder.run_id, result
+                        )
+                        validation = (
+                            recorder.store.validate_closed_loop_evidence(
+                                recorder.run_id, scenario_key, result
+                            )
+                        )
+                    finally:
+                        recorder.close()
+                self.assertEqual("EVIDENCE_PASS", validation["status"])
+                self.assertEqual([], validation["failed_checks"])
 
     def test_closed_loop_validator_rejects_count_only_false_pass(self):
         result = validate_structural_closed_loop({
@@ -2259,6 +2952,11 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
         self.assertEqual("NOT_AVAILABLE_NO_REWARD_MODEL", record["reward_status"])
         self.assertTrue(record["done"])
         self.assertFalse(record["data_quality"]["eligible_for_ppo_training"])
+        readiness = manifest["learning_readiness"]
+        self.assertEqual("STRUCTURAL_DATA_ONLY", readiness["collection_status"])
+        self.assertEqual(1, readiness["successful_cycle_record_count"])
+        self.assertEqual(0, readiness["physical_record_count"])
+        self.assertEqual("DISABLED_BY_DESIGN", readiness["automatic_policy_update"])
 
     def test_auto_policy_runs_all_scenarios_with_direct_cycles(self):
         completed = subprocess.run(
@@ -2461,15 +3159,31 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
         self.assertGreater(result["affected_task_count"], 0)
         self.assertGreater(result["unaffected_task_count"], 0)
         self.assertEqual(0, result["takeover_count"])
+        self.assertEqual(0, result["safe_detour_count"])
+        self.assertEqual(
+            result["affected_task_count"],
+            result["wait_for_clearance_count"],
+        )
         for decision in result["blast_decisions"]:
-            self.assertIn(decision["action_type"], {
-                "blast_zone_safe_route", "hold_until_blast_clearance",
-            })
-            if decision["action_type"] == "blast_zone_safe_route":
-                self.assertNotIn(
-                    result["restricted_edge_id"],
-                    decision["replanned_edge_ids"],
-                )
+            self.assertEqual(
+                "hold_until_blast_clearance", decision["action_type"]
+            )
+            self.assertEqual(
+                result["blast_event"]["clearance_tick"],
+                decision["wait_until_tick"],
+            )
+            self.assertEqual(
+                decision["vehicle_id"], decision["original_vehicle_id"]
+            )
+
+        p6_wait_result = run_structural_scenario(
+            "s04", config, seed=202604, random_map=True, vehicle_count=6,
+            eligible_pairs=physical_pairs_for_fake_carla(config),
+            minimum_length_m=100.0, maximum_length_m=1000.0,
+        )
+        self.assertEqual("PASS", p6_wait_result["status"])
+        self.assertGreater(p6_wait_result["wait_for_clearance_count"], 0)
+        self.assertEqual(0, p6_wait_result["safe_detour_count"])
 
         wait_result = run_structural_scenario(
             # This seed is intentionally a distinct admitted layout that has
@@ -2523,6 +3237,24 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
             result["closed_edge_id"], decision["route_edge_ids"]
         )
         self.assertTrue(all(decision["constraint_results"].values()))
+        displaced = decision.get(
+            "displaced_task_recovery_route_contract"
+        )
+        if decision.get("selected_vehicle_current_task_id"):
+            self.assertIsNone(displaced)
+            self.assertEqual(
+                decision["goal_point_id"],
+                decision["displaced_task_goal_point_id"],
+            )
+            self.assertTrue(decision["constraint_results"][
+                "displaced_task_recovery_reachable"
+            ])
+            self.assertTrue(decision["constraint_results"][
+                "candidate_route_aligned_with_failed_goal"
+            ])
+            self.assertEqual(
+                decision["displaced_task_recovery_distance_m"], 0.0
+            )
         failed_states = [
             item for item in result["final_vehicle_states"]
             if item["vehicle_id"] == result["failed_vehicle_id"]

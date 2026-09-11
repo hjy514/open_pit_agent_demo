@@ -76,11 +76,24 @@ class FakeMap:
 
 
 class FakeWorld:
+    def __init__(self):
+        self.settings = type(
+            "FakeWorldSettings", (), {"fixed_delta_seconds": None}
+        )()
+        self.applied_fixed_deltas = []
+
     def get_map(self):
         return FakeMap()
 
     def wait_for_tick(self, timeout_seconds):
         return object()
+
+    def get_settings(self):
+        return self.settings
+
+    def apply_settings(self, settings):
+        self.settings = settings
+        self.applied_fixed_deltas.append(settings.fixed_delta_seconds)
 
 
 class FakeSpectator:
@@ -92,10 +105,17 @@ class FakeSpectator:
 
 
 class FakeActor:
-    def __init__(self, actor_id=1):
+    def __init__(self, actor_id=1, x=1.0, y=2.0, z=3.0, yaw=0.0,
+                 speed_mps=0.0):
         self.id = actor_id
         self.destroyed = False
-        self.location = FakeLocation()
+        self.location = FakeLocation(x, y, z)
+        self.yaw = yaw
+        self.velocity = FakeLocation(speed_mps, 0.0, 0.0)
+        self.bounding_box = type(
+            "FakeBoundingBox", (),
+            {"extent": FakeLocation(4.5, 2.5, 2.5)},
+        )()
         self.last_control = None
         self.physics_enabled = True
         self.target_velocity = None
@@ -108,7 +128,10 @@ class FakeActor:
         self.last_control = control
 
     def get_transform(self):
-        return FakeTransform(self.location)
+        return FakeTransform(self.location, FakeRotation(yaw=self.yaw))
+
+    def get_velocity(self):
+        return self.velocity
 
     def set_transform(self, transform):
         self.location = transform.location
@@ -150,6 +173,70 @@ class FakeCarla:
 
 
 class CarlaAdapterLifecycleTest(unittest.TestCase):
+    def test_core_competition_scenarios_enable_selectable_camera_streams(self):
+        for filename in (
+            "s01_normal_6v.json",
+            "s02_vehicle_failure_6v.json",
+            "s04_blasting_control_6v.json",
+            "s09_compound_road_fault_6v.json",
+        ):
+            with self.subTest(config=filename):
+                config = load_config(PROJECT_ROOT / "configs" / filename)
+                options = CarlaAdapter(config)._camera_wall_options()
+                self.assertTrue(options["enabled"])
+                self.assertNotIn("vehicle_ids", options)
+                self.assertEqual(480, options["image_width"])
+                self.assertGreaterEqual(options["sensor_tick_seconds"], 0.5)
+
+    def test_fixed_time_step_is_applied_and_restored_on_close(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        world = FakeWorld()
+        adapter.world = world
+
+        result = adapter.configure_fixed_time_step(0.05)
+
+        self.assertEqual("APPLIED", result["status"])
+        self.assertEqual(0.05, world.settings.fixed_delta_seconds)
+        adapter.close()
+        self.assertIsNone(world.applied_fixed_deltas[-1])
+
+    def test_navigation_blockage_classifies_vehicle_ahead(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter._actors = {
+            "truck-1": FakeActor(actor_id=1, x=0.0, y=0.0, yaw=0.0),
+            "truck-2": FakeActor(actor_id=2, x=18.0, y=0.0, yaw=0.0,
+                                 speed_mps=2.0),
+        }
+        adapter._task_status.update({
+            "truck-1": "executing", "truck-2": "executing",
+        })
+
+        result = adapter.classify_navigation_blockage("truck-1")
+
+        self.assertEqual("TRAFFIC_BLOCKED", result["category"])
+        self.assertEqual("truck-2", result["blocker_vehicle_id"])
+        self.assertLess(result["surface_gap_m"], result["lookahead_m"])
+
+    def test_navigation_blockage_classifies_stopped_idle_actor_as_route_block(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter._actors = {
+            "truck-1": FakeActor(actor_id=1, x=0.0, y=0.0, yaw=0.0),
+            "truck-2": FakeActor(actor_id=2, x=18.0, y=0.0, yaw=0.0),
+        }
+        adapter._task_status.update({
+            "truck-1": "executing", "truck-2": "idle",
+        })
+
+        result = adapter.classify_navigation_blockage("truck-1")
+
+        self.assertEqual("ROUTE_BLOCKED", result["category"])
+        self.assertEqual("truck-2", result["blocker_vehicle_id"])
+
     def test_pause_and_resume_ignore_vehicle_already_retired_from_episode(self):
         config = load_config(PROJECT_ROOT / "configs" / "town03.json")
         adapter = CarlaAdapter(config)
@@ -199,6 +286,31 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
             [item["event_type"] for item in adapter.drain_events()],
         )
 
+    def test_short_traffic_resume_keeps_existing_navigation_controller(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter.carla = FakeCarla()
+        adapter._basic_agent_class = FakeAgent
+        vehicle_id = "inspection_vehicle_02"
+        adapter._actors[vehicle_id] = FakeActor()
+        task = Task(
+            task_id="traffic-resume-task", zone_id="inspection_zone_02",
+            priority=50, required_capabilities=["inspection"],
+            status="assigned", assigned_vehicle_id=vehicle_id,
+        )
+        adapter.dispatch([task], config.zones)
+        original_agent = adapter._agents[vehicle_id]
+        adapter.pause_vehicle(vehicle_id)
+
+        result = adapter.resume_vehicle(
+            vehicle_id, refresh_navigation=False
+        )
+
+        self.assertEqual("executing", result["status"])
+        self.assertIs(original_agent, adapter._agents[vehicle_id])
+        self.assertFalse(original_agent._local_planner.reset_called)
+
     def test_completed_owned_vehicle_retires_while_other_tasks_are_active(self):
         config = load_config(PROJECT_ROOT / "configs" / "town03.json")
         adapter = CarlaAdapter(config)
@@ -236,6 +348,88 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
         self.assertEqual(
             "RETIRED_FROM_EPISODE", retirement["payload"]["status"]
         )
+
+    def test_completed_compatible_vehicle_waits_for_recovery_task(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter.carla = FakeCarla()
+        vehicle_id = "inspection_vehicle_02"
+        actor = FakeActor(actor_id=503)
+        adapter._actors[vehicle_id] = actor
+        adapter.spawned_actor_ids = [503]
+        completed = Task(
+            task_id="completed-task", zone_id="inspection_zone_02",
+            priority=50, required_capabilities=["inspection"],
+            status="executing", assigned_vehicle_id=vehicle_id,
+        )
+        waiting = Task(
+            task_id="waiting-recovery", zone_id="inspection_zone_01",
+            priority=80, required_capabilities=["inspection"],
+            status="waiting_recovery_capacity", assigned_vehicle_id=None,
+        )
+        adapter._task_objects = {
+            completed.task_id: completed, waiting.task_id: waiting,
+        }
+        adapter._task_ids[vehicle_id] = completed.task_id
+        adapter._task_queues[vehicle_id] = [completed.task_id]
+
+        adapter._complete_task(vehicle_id, completed.task_id)
+
+        self.assertFalse(actor.destroyed)
+        self.assertIn(vehicle_id, adapter._actors)
+        self.assertEqual("idle", adapter._task_status[vehicle_id])
+        events = adapter.drain_events()
+        retained = next(
+            item for item in events
+            if item["event_type"] == "vehicle_retained_for_recovery_capacity"
+        )
+        self.assertEqual(
+            waiting.task_id, retained["payload"]["waiting_task_id"]
+        )
+
+    def test_terminal_recovery_task_detaches_and_resumes_queued_work(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter.carla = FakeCarla()
+        adapter._basic_agent_class = FakeAgent
+        adapter._zones_by_id = {
+            item.zone_id: item for item in config.zones
+        }
+        vehicle_id = "inspection_vehicle_02"
+        actor = FakeActor(actor_id=502)
+        adapter._actors[vehicle_id] = actor
+        stalled = Task(
+            task_id="stalled-recovery", zone_id="inspection_zone_02",
+            priority=100, required_capabilities=["inspection"],
+            status="stuck", assigned_vehicle_id=vehicle_id,
+        )
+        queued = Task(
+            task_id="queued-original", zone_id="inspection_zone_01",
+            priority=50, required_capabilities=["inspection"],
+            status="assigned", assigned_vehicle_id=vehicle_id,
+        )
+        adapter._task_objects = {
+            stalled.task_id: stalled, queued.task_id: queued,
+        }
+        adapter._task_ids[vehicle_id] = stalled.task_id
+        adapter._task_queues[vehicle_id] = [
+            stalled.task_id, queued.task_id,
+        ]
+        adapter._agents[vehicle_id] = FakeAgent(actor=actor)
+
+        result = adapter.detach_terminal_task_and_resume_vehicle(
+            stalled.task_id,
+            reason="terminal_stalled_task_releases_vehicle_queue",
+        )
+
+        self.assertEqual("TERMINAL_TASK_DETACHED", result["status"])
+        self.assertTrue(result["vehicle_retained"])
+        self.assertFalse(actor.destroyed)
+        self.assertEqual(queued.task_id, adapter._task_ids[vehicle_id])
+        self.assertEqual("executing", queued.status)
+        self.assertEqual([queued.task_id], adapter._task_queues[vehicle_id])
 
     def test_task_mission_requires_deadhead_before_service_completion(self):
         config = load_config(PROJECT_ROOT / "configs" / "town03.json")
@@ -531,6 +725,51 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
                          adapter._agents[vehicle_id].destination)
         self.assertEqual("road_graph_route_applied", task.status_reason)
 
+    def test_deferred_route_waits_for_displaced_task_to_resume(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter.carla = FakeCarla()
+        adapter._basic_agent_class = FakeAgent
+        vehicle_id = "inspection_vehicle_02"
+        task_id = "displaced-inspection-task"
+        adapter._actors[vehicle_id] = FakeActor(x=1.0, y=2.0, z=3.0)
+        task = Task(
+            task_id=task_id, zone_id="inspection_zone_03",
+            priority=50, required_capabilities=["inspection"],
+            status="assigned", assigned_vehicle_id=vehicle_id,
+        )
+        adapter._task_objects[task_id] = task
+        adapter._zones_by_id = {
+            zone.zone_id: zone for zone in config.zones
+        }
+        adapter._task_queues[vehicle_id] = [task_id]
+
+        response = adapter.configure_deferred_task_route(
+            task_id, vehicle_id,
+            [{"x": 10.0, "y": 0.0, "z": 0.0},
+             {"x": 20.0, "y": 0.0, "z": 0.0}],
+            blocked_edge_id="closed-edge",
+            route_edge_ids=["safe-edge-1", "safe-edge-2"],
+        )
+
+        self.assertEqual("DEFERRED_UNTIL_TASK_RESUME", response["status"])
+        self.assertNotIn(vehicle_id, adapter._agents)
+
+        adapter._start_next_task(vehicle_id)
+
+        self.assertEqual("executing", task.status)
+        self.assertEqual(
+            "displaced_task_recovery_route_started", task.status_reason
+        )
+        self.assertEqual([10.0, 0.0, 0.0],
+                         adapter._agents[vehicle_id].destination)
+        started = next(
+            item for item in adapter.drain_events()
+            if item["event_type"] == "task_started"
+        )
+        self.assertTrue(started["payload"]["deferred_route_applied"])
+
     def test_road_graph_intermediate_checkpoint_uses_truck_clearance_tolerance(self):
         config = load_config(PROJECT_ROOT / "configs" / "town03.json")
         adapter = CarlaAdapter(config)
@@ -702,6 +941,145 @@ class CarlaAdapterLifecycleTest(unittest.TestCase):
             if item["event_type"] == "task_reassigned_by_scenario"
         )
         self.assertEqual("scenario_event", reassignment["payload"]["assignment_source"])
+
+    def test_aligned_service_target_takeover_skips_false_deadhead(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter.carla = FakeCarla()
+        adapter._basic_agent_class = FakeAgent
+        vehicle_id = "inspection_vehicle_02"
+        adapter._actors[vehicle_id] = FakeActor()
+        own_task = Task(
+            task_id="aligned-own-task", zone_id="inspection_zone_03",
+            priority=50, required_capabilities=["inspection"],
+            status="executing", assigned_vehicle_id=vehicle_id,
+        )
+        failed_task = Task(
+            task_id="aligned-failed-task", zone_id="inspection_zone_02",
+            priority=100, required_capabilities=["inspection"],
+            status="released", original_vehicle_id="inspection_vehicle_01",
+        )
+        adapter._task_objects = {
+            own_task.task_id: own_task, failed_task.task_id: failed_task,
+        }
+        adapter._task_ids[vehicle_id] = own_task.task_id
+        adapter._task_queues[vehicle_id] = [own_task.task_id]
+        adapter._agents[vehicle_id] = FakeAgent()
+        adapter._zones_by_id = {
+            zone.zone_id: zone for zone in config.zones
+        }
+        shared_target = Position(30.0, 2.0, 3.0)
+        adapter._mission_plans = {
+            own_task.task_id: {
+                "phase": "service_execution",
+                "service_target_point_id": "carla-spawn:30",
+                "service_target": shared_target,
+            },
+            failed_task.task_id: {
+                "phase": "pending_deadhead",
+                "service_origin_point_id": "carla-spawn:10",
+                "service_target_point_id": "carla-spawn:30",
+                "service_origin": Position(10.0, 2.0, 3.0),
+                "service_target": shared_target,
+            },
+        }
+
+        result = adapter.reassign_task(
+            failed_task.task_id, vehicle_id,
+            assignment_source="scenario_event",
+        )
+
+        self.assertTrue(result["aligned_service_target_takeover"])
+        self.assertEqual(
+            "service_execution",
+            adapter._mission_plans[failed_task.task_id]["phase"],
+        )
+        self.assertEqual("executing", failed_task.status)
+        self.assertNotEqual(
+            "deadhead_to_service_origin", failed_task.status_reason
+        )
+
+    def test_stopped_p6_truck_inside_service_zone_completes_after_dwell(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter.carla = FakeCarla()
+        vehicle_id = "inspection_vehicle_02"
+        task_id = "p6-footprint-arrival"
+        actor = FakeActor(x=24.0, y=2.0, z=3.0, speed_mps=0.0)
+        adapter._actors[vehicle_id] = actor
+        task = Task(
+            task_id=task_id, zone_id="inspection_zone_02",
+            priority=50, required_capabilities=["inspection"],
+            status="executing", assigned_vehicle_id=vehicle_id,
+        )
+        adapter._task_objects[task_id] = task
+        adapter._task_ids[vehicle_id] = task_id
+        adapter._task_queues[vehicle_id] = [task_id]
+        adapter._task_targets[task_id] = Position(1.0, 2.0, 3.0)
+        adapter._task_arrival_tolerances[task_id] = 12.0
+        adapter._agents[vehicle_id] = FakeAgent(done=False)
+
+        for _ in range(20):
+            adapter.tick()
+
+        self.assertEqual("executing", task.status)
+        adapter.tick()
+
+        self.assertEqual("completed", task.status)
+        self.assertEqual(
+            "p6_stationary_service_zone_arrival", task.status_reason
+        )
+
+    def test_stopped_recovery_checkpoint_resumes_original_leg_after_dwell(self):
+        config = load_config(PROJECT_ROOT / "configs" / "town03.json")
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter.carla = FakeCarla()
+        adapter._basic_agent_class = FakeAgent
+        vehicle_id = "inspection_vehicle_02"
+        task_id = "p6-recovery-checkpoint-task"
+        adapter._actors[vehicle_id] = FakeActor(x=24.0, speed_mps=0.0)
+        task = Task(
+            task_id=task_id, zone_id="inspection_zone_02",
+            priority=50, required_capabilities=["inspection"],
+            status="executing", assigned_vehicle_id=vehicle_id,
+        )
+        original_target = Position(100.0, 2.0, 3.0)
+        adapter._task_objects[task_id] = task
+        adapter._task_ids[vehicle_id] = task_id
+        adapter._task_queues[vehicle_id] = [task_id]
+        adapter._task_targets[task_id] = Position(1.0, 2.0, 3.0)
+        adapter._route_remaining_targets[task_id] = [original_target]
+        adapter._navigation_recovery_task_ids.add(task_id)
+        adapter._task_arrival_tolerances[task_id] = 12.0
+        adapter._agents[vehicle_id] = FakeAgent(done=False)
+
+        for _ in range(21):
+            adapter.tick()
+
+        self.assertEqual("executing", task.status)
+        self.assertEqual(original_target, adapter._task_targets[task_id])
+        self.assertNotIn(task_id, adapter._navigation_recovery_task_ids)
+        self.assertEqual([], adapter._route_remaining_targets[task_id])
+
+    def test_capacity_recovery_is_an_allowed_reassignment_source(self):
+        config = load_config(
+            PROJECT_ROOT / "configs" / "mine_competition_demo.json"
+        )
+        adapter = CarlaAdapter(config)
+        adapter.world = FakeWorld()
+        adapter._actors["inspection_vehicle_02"] = FakeActor()
+
+        with self.assertRaises(CarlaAdapterError) as raised:
+            adapter.reassign_task(
+                "missing-task", "inspection_vehicle_02",
+                assignment_source="scenario_recovery_capacity",
+            )
+
+        self.assertIn("Unknown task", str(raised.exception))
+        self.assertNotIn("Unsupported reassignment source", str(raised.exception))
 
     def test_initially_idle_vehicle_stays_at_configured_spawn(self):
         config = load_config(

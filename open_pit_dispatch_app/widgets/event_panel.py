@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
 )
 
 from windows.event_center_window import EventCenterWindow
+from ui.vehicle_labels import event_type_label
 
 
 API_BASE_URL = "http://127.0.0.1:8000"
@@ -132,7 +133,7 @@ class EventPanel(QFrame):
 
         return (
             f"{timestamp} "
-            f"{event_type} "
+            f"{event_type_label(event_type)} "
             f"{message}"
         ).strip()
 

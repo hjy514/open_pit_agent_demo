@@ -113,6 +113,9 @@ class UnifiedScenarioControlTest(unittest.TestCase):
         self.assertIn("--random-map", command)
         self.assertIn("--ui-sync", command)
         self.assertIn("--playback-delay-seconds", command)
+        self.assertEqual(
+            "2.0", command[command.index("--playback-delay-seconds") + 1]
+        )
 
     def test_s08_keeps_fixed_golden_adapter_behind_unified_entry(self):
         command = self.manager.command_for({
@@ -133,6 +136,9 @@ class UnifiedScenarioControlTest(unittest.TestCase):
         self.assertNotIn("--playback-delay-seconds", command)
         self.assertIn("--operator-review", command)
         self.assertIn("--load-map", command)
+        self.assertEqual(
+            "0.8", command[command.index("--display-speed-scale") + 1]
+        )
 
     def test_random_seed_is_resolved_once_and_exposed_for_replay(self):
         resolved = self.manager._validate_request({

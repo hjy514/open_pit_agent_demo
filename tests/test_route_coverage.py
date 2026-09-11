@@ -77,6 +77,58 @@ class RouteCoverageTests(unittest.TestCase):
         self.assertTrue(first[0]["requires_deadhead"])
         self.assertEqual(240.0, first[0]["deadhead_route_length_m"])
 
+    def test_support_response_stages_at_seeded_service_origin(self):
+        tasks = [
+            {
+                "task_id": "haul-task", "vehicle_id": "haul-1",
+                "vehicle_role": "haul", "task_type": "haul_transport",
+                "from_point_id": "load-a", "to_point_id": "dump-a",
+            },
+            {
+                "task_id": "support-task", "vehicle_id": "support-1",
+                "vehicle_role": "support",
+                "task_type": "equipment_support",
+                "from_point_id": "support-a", "to_point_id": "repair-a",
+            },
+        ]
+        routes = [
+            {
+                "from_point_id": "staging-haul", "to_point_id": "load-a",
+                "route_length_m": 240.0,
+                "validation_status": "PHYSICAL_REACHED",
+            },
+            {
+                "from_point_id": "staging-support",
+                "to_point_id": "support-a", "route_length_m": 180.0,
+                "validation_status": "PHYSICAL_REACHED",
+            },
+        ]
+        points = {
+            point_id: {"point_id": point_id}
+            for point_id in (
+                "staging-haul", "load-a", "dump-a",
+                "staging-support", "support-a", "repair-a",
+            )
+        }
+
+        result = _assign_deadhead_staging_points(
+            tasks, routes, points, set(), seed=202601,
+        )
+
+        self.assertEqual("staging-haul", result[0]["spawn_point_id"])
+        self.assertTrue(result[0]["requires_deadhead"])
+        self.assertEqual("support-a", result[1]["spawn_point_id"])
+        self.assertFalse(result[1]["requires_deadhead"])
+        self.assertEqual(0.0, result[1]["deadhead_route_length_m"])
+        self.assertEqual(
+            "SUPPORT_READY_AT_SERVICE_ORIGIN",
+            result[1]["staging_policy"],
+        )
+        self.assertEqual(
+            "COMMON_SUPPORT_STAGING_POLICY_V1",
+            result[1]["deadhead_route_source"],
+        )
+
     def test_semantic_sampler_selects_missions_before_routes(self):
         roles = ["haul", "haul", "haul", "inspection", "inspection", "support"]
         pairs = [
@@ -176,7 +228,7 @@ class RouteCoverageTests(unittest.TestCase):
         self.assertFalse({"p0", "p1"}.issubset(origins))
 
     def test_s02_generator_reserves_a_route_level_takeover_candidate(self):
-        pairs = [("a", "t"), ("b", "t"), ("b", "d"), ("c", "e"),
+        pairs = [("a", "t"), ("b", "t"), ("c", "e"),
                  ("f", "g"), ("h", "i"), ("j", "k")]
         routes = [{"from_point_id": source, "to_point_id": target,
                    "route_length_m": 800, "planner_version": "test"}
@@ -188,11 +240,30 @@ class RouteCoverageTests(unittest.TestCase):
         self.assertEqual(6, len(tasks))
         self.assertEqual("inspection", tasks[0]["vehicle_role"])
         self.assertEqual("inspection", tasks[1]["vehicle_role"])
-        self.assertEqual(tasks[0]["vehicle_id"], metadata["failed_vehicle_id"])
-        self.assertEqual(tasks[1]["vehicle_id"], metadata["takeover_candidate_vehicle_ids"][0])
+        self.assertIn(
+            metadata["failed_vehicle_id"],
+            {tasks[0]["vehicle_id"], tasks[1]["vehicle_id"]},
+        )
+        self.assertIn(
+            metadata["takeover_candidate_vehicle_ids"][0],
+            {tasks[0]["vehicle_id"], tasks[1]["vehicle_id"]},
+        )
+        self.assertNotEqual(
+            metadata["failed_vehicle_id"],
+            metadata["takeover_candidate_vehicle_ids"][0],
+        )
         self.assertEqual(tasks[0]["to_point_id"], metadata["fallback_route"]["to_point_id"])
-        self.assertEqual(tasks[1]["from_point_id"], metadata["fallback_route"]["from_point_id"])
-        self.assertNotEqual(tasks[1]["to_point_id"], tasks[0]["to_point_id"])
+        candidate_task = next(
+            item for item in tasks
+            if item["vehicle_id"]
+            == metadata["takeover_candidate_vehicle_ids"][0]
+        )
+        self.assertEqual(
+            candidate_task["from_point_id"],
+            metadata["fallback_route"]["from_point_id"],
+        )
+        self.assertEqual(tasks[1]["to_point_id"], tasks[0]["to_point_id"])
+        self.assertEqual("SHARED_SERVICE_TARGET", metadata["candidate_alignment"])
 
     def test_s02_generator_fails_closed_without_a_takeover_route(self):
         routes = [{"from_point_id": "p{}".format(index),
@@ -208,7 +279,7 @@ class RouteCoverageTests(unittest.TestCase):
     def test_s02_semantic_generator_keeps_takeover_and_role_areas(self):
         pairs = [
             ("a", "inspect-a"), ("b", "inspect-a"),
-            ("b", "inspect-b"), ("load-a", "dump-a"),
+            ("load-a", "dump-a"),
             ("load-b", "dump-b"), ("load-c", "dump-c"),
             ("support-start", "support-a"),
         ]

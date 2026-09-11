@@ -16,7 +16,9 @@ from open_pit_agent.decision_intelligence import (
     build_experience_dataset,
     build_risk_guidance,
     load_imitation_memory,
+    register_offline_policy_candidate,
 )
+from open_pit_agent.sqlite_store import SqliteRunStore
 from open_pit_agent.risk import (
     RuleBasedRiskEngine,
     load_risk_scenario,
@@ -189,6 +191,36 @@ class DecisionIntelligenceTest(unittest.TestCase):
         self.assertFalse(
             metadata["safety_constraints_overridable"]
         )
+
+    def test_offline_candidate_registration_never_promotes_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteRunStore(Path(temp_dir) / "openpit.db")
+            try:
+                lifecycle = register_offline_policy_candidate(store, {
+                    "model_version": "bc-shadow-test",
+                    "policy_version": "behavior-cloning-candidate-ranker-v1",
+                    "dataset_version": "dataset-test",
+                    "status": "TRAINED_OFFLINE_SHADOW_ONLY",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "model_path": "model.json",
+                    "training_report_path": "training_report.json",
+                    "metrics": {"test": {
+                        "evaluable_choice_count": 5,
+                        "infeasible_candidate_selected_count": 0,
+                        "fallback_count": 0,
+                    }},
+                }, "candidate")
+                row = store.connection.execute(
+                    "SELECT status,execution_authority FROM policy_versions "
+                    "WHERE model_version='bc-shadow-test'"
+                ).fetchone()
+            finally:
+                store.close()
+        self.assertEqual("OFFLINE_EVALUATED_SHADOW_ONLY", lifecycle["status"])
+        self.assertEqual(
+            ("OFFLINE_EVALUATED_SHADOW_ONLY", "shadow_only"), row
+        )
+        self.assertEqual("NOT_PROMOTED", lifecycle["promotion_status"])
 
 
 if __name__ == "__main__":

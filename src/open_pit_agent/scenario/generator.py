@@ -20,7 +20,14 @@ from .models import ConcreteEpisodeV2
 ROLE_DETAILS = {
     "haul": ("运输车", "haul_truck", ["haul", "inspection"], ["haul"]),
     "inspection": ("巡检车", "inspection_vehicle", ["inspection", "slope_monitoring"], ["inspection", "slope_monitoring"]),
-    "support": ("保障车", "support_vehicle", ["inspection", "emergency_support"], ["emergency_support"]),
+    # The common fleet keeps one multi-role response truck.  Its portable
+    # monitoring capability provides capability-safe recovery capacity after
+    # an inspection truck fails; it does not bypass scheduler constraints.
+    "support": (
+        "保障车", "support_vehicle",
+        ["inspection", "slope_monitoring", "emergency_support"],
+        ["emergency_support"],
+    ),
 }
 
 
@@ -315,6 +322,33 @@ def _assign_deadhead_staging_points(
     randomizer = Random(int(seed) + 18181)
     for item in result:
         service_origin = str(item["from_point_id"])
+        # A support-response truck is operationally staged at its selected
+        # service origin.  Chaining an independently selected deadhead leg
+        # into a directed support route can leave the truck facing the wrong
+        # branch at the transfer point on the custom mine road network.  The
+        # service origin/target pair remains seed-selected from admitted map
+        # routes; only the response truck's initial standby position is bound
+        # to that origin.  Haul and inspection vehicles retain seeded
+        # deadhead starts.
+        if (str(item.get("vehicle_role")) == "support"
+                or str(item.get("task_type")) == "equipment_support"):
+            spawn_point_id = service_origin
+            selected_spawns.add(spawn_point_id)
+            item.update({
+                "spawn_point_id": spawn_point_id,
+                "service_origin_point_id": service_origin,
+                "service_target_point_id": str(item["to_point_id"]),
+                "deadhead_route_length_m": 0.0,
+                "deadhead_validation_status": (
+                    "ROLE_ALIGNED_SERVICE_ORIGIN"
+                ),
+                "deadhead_route_source": (
+                    "COMMON_SUPPORT_STAGING_POLICY_V1"
+                ),
+                "requires_deadhead": False,
+                "staging_policy": "SUPPORT_READY_AT_SERVICE_ORIGIN",
+            })
+            continue
         candidates = [
             route for route in incoming.get(service_origin, [])
             if str(route["from_point_id"]) not in occupied
@@ -980,12 +1014,14 @@ def build_s02_recoverable_task_drafts(routes: Iterable[Dict[str, Any]], blocked_
                                       operating_areas=None,
                                       scenario_key: str = "s02",
                                       ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Construct a failure scenario around a route-level takeover alternative.
+    """Construct a failure scenario around an aligned takeover candidate.
 
-    The failing truck A has A->T.  A different inspection truck B starts with
-    B->D and is also known to have B->T.  The latter is retained as an
-    admitted fallback route, while the scheduler still makes the final
-    selection among all feasible candidates.
+    The failing truck A has A->T and a different inspection truck B has B->T.
+    Giving both trucks independent work in the same service area is a useful
+    mine-operation pattern: B can take over A's released work without first
+    abandoning an unrelated destination.  It also keeps every CARLA leg
+    inside the supplied execution-evidence set instead of inventing a later
+    T->D recovery leg that has never been physically validated.
     """
     eligible = [dict(item) for item in routes
                 if _within_window(item, minimum_length_m, maximum_length_m)]
@@ -1017,68 +1053,65 @@ def build_s02_recoverable_task_drafts(routes: Iterable[Dict[str, Any]], blocked_
         randomizer.shuffle(fallback_options)
         for fallback in fallback_options:
             origin_b = str(fallback["from_point_id"])
-            standby_initial_options = [item for item in eligible
-                                       if str(item["from_point_id"]) == origin_b
-                                       and str(item["to_point_id"]) != target
-                                       and str(item["to_point_id"]) != origin_a
-                                       and (not semantic or _route_matches_mission(
-                                           item, "inspection", indexed
-                                       ))]
-            randomizer.shuffle(standby_initial_options)
-            for standby_initial in standby_initial_options:
-                destination_b = str(standby_initial["to_point_id"])
-                selected = [primary, standby_initial]
-                origins, destinations = {origin_a, origin_b}, {target, destination_b}
-                if origins & destinations:
-                    continue
-                for role in roles[2:]:
-                    pool = [
-                        item for item in eligible
-                        if not semantic or _route_matches_mission(item, role, indexed)
-                    ]
-                    randomizer.shuffle(pool)
-                    route = next((
-                        item for item in pool
-                        if str(item["from_point_id"]) not in origins
-                        and str(item["to_point_id"]) not in destinations
-                        and str(item["from_point_id"]) not in destinations
-                        and str(item["to_point_id"]) not in origins
-                        and not _blocked(
-                            str(item["from_point_id"]), origins, blocked
-                        )
-                    ), None)
-                    if route is None:
-                        break
-                    origin = str(route["from_point_id"])
-                    destination = str(route["to_point_id"])
-                    selected.append(route)
-                    origins.add(origin)
-                    destinations.add(destination)
-                if len(selected) != int(vehicle_count):
-                    continue
-                drafts = []
-                for index, route in enumerate(selected):
-                    role = roles[index]
-                    drafts.append({
-                        "task_id": "{}-seed-{}-task-{:02d}".format(
-                            str(scenario_key).lower(), seed, index + 1
-                        ),
-                        "vehicle_id": "{}_vehicle_{:02d}".format(role, index + 1),
-                        "vehicle_role": role, "vehicle_slot": index + 1,
-                        **route,
-                    })
-                return drafts, {
-                    "failed_vehicle_id": drafts[0]["vehicle_id"],
-                    "failed_task_id": drafts[0]["task_id"],
-                    "takeover_candidate_vehicle_ids": [drafts[1]["vehicle_id"]],
-                    "fallback_route": {
-                        "from_point_id": origin_b, "to_point_id": target,
-                        "route_length_m": fallback.get("route_length_m"),
-                        "planner_version": fallback.get("planner_version"),
-                    },
-                }
+            selected = [primary, fallback]
+            origins, destinations = {origin_a, origin_b}, {target}
+            if origins & destinations:
+                continue
+            for role in roles[2:]:
+                pool = [
+                    item for item in eligible
+                    if not semantic or _route_matches_mission(item, role, indexed)
+                ]
+                randomizer.shuffle(pool)
+                route = next((
+                    item for item in pool
+                    if str(item["from_point_id"]) not in origins
+                    and str(item["to_point_id"]) not in destinations
+                    and str(item["from_point_id"]) not in destinations
+                    and str(item["to_point_id"]) not in origins
+                    and not _blocked(
+                        str(item["from_point_id"]), origins, blocked
+                    )
+                ), None)
+                if route is None:
+                    break
+                origin = str(route["from_point_id"])
+                destination = str(route["to_point_id"])
+                selected.append(route)
+                origins.add(origin)
+                destinations.add(destination)
+            if len(selected) != int(vehicle_count):
+                continue
+            drafts = []
+            for index, route in enumerate(selected):
+                role = roles[index]
+                drafts.append({
+                    "task_id": "{}-seed-{}-task-{:02d}".format(
+                        str(scenario_key).lower(), seed, index + 1
+                    ),
+                    "vehicle_id": "{}_vehicle_{:02d}".format(role, index + 1),
+                    "vehicle_role": role, "vehicle_slot": index + 1,
+                    **route,
+                })
+            failed_index = randomizer.randrange(2)
+            candidate_index = 1 - failed_index
+            candidate_route = selected[candidate_index]
+            return drafts, {
+                "failed_vehicle_id": drafts[failed_index]["vehicle_id"],
+                "failed_task_id": drafts[failed_index]["task_id"],
+                "takeover_candidate_vehicle_ids": [
+                    drafts[candidate_index]["vehicle_id"]
+                ],
+                "candidate_alignment": "SHARED_SERVICE_TARGET",
+                "fallback_route": {
+                    "from_point_id": candidate_route["from_point_id"],
+                    "to_point_id": target,
+                    "route_length_m": candidate_route.get("route_length_m"),
+                    "planner_version": candidate_route.get("planner_version"),
+                },
+            }
     raise EpisodeGenerationError(
-        "NO_TAKEOVER_CANDIDATE: no seeded S02 primary/standby route triple satisfies hard map constraints"
+        "NO_TAKEOVER_CANDIDATE: no seeded S02 aligned primary/takeover route set satisfies hard map constraints"
     )
 
 
@@ -1289,11 +1322,29 @@ def generate_map_constrained_workload(config: Any, seed: Optional[int] = None,
         avoid_pairs=static_avoid_pairs,
     )
     if eligible_pairs is not None or deadhead_eligible_pairs is not None:
-        # P6 evidence currently validates a task together with its selected
-        # physical start.  Until cross-vehicle deadhead pairs are validated,
-        # bind the initial CARLA assignment to that admitted vehicle instead
-        # of silently creating an unverified cross-map approach route.
+        # P6 proves one directed service route at a time.  It does not prove
+        # that an independently selected incoming route can be chained into
+        # that service route with a valid lane/heading transition.  CARLA
+        # episodes therefore stage every vehicle at its seed-selected service
+        # origin and execute only the admitted P6 pair.  Randomness remains in
+        # the origin, destination, role allocation and events; structural-only
+        # episodes may still exercise the separate deadhead abstraction.
         for item in tasks:
+            service_origin = str(item["from_point_id"])
+            item.update({
+                "spawn_point_id": service_origin,
+                "service_origin_point_id": service_origin,
+                "service_target_point_id": str(item["to_point_id"]),
+                "deadhead_route_length_m": 0.0,
+                "deadhead_validation_status": (
+                    "NOT_REQUIRED_ALREADY_AT_SERVICE_ORIGIN"
+                ),
+                "deadhead_route_source": (
+                    "P6_SINGLE_LEG_PHYSICAL_ADMISSION"
+                ),
+                "requires_deadhead": False,
+                "staging_policy": "P6_SERVICE_ORIGIN_STAGING",
+            })
             item["preferred_vehicle_id"] = item["vehicle_id"]
             item["execution_vehicle_binding"] = (
                 "P6_INITIAL_ROUTE_ADMISSION"

@@ -64,6 +64,9 @@ OpenPit统一场景入口
   ./run_scenario.sh --scenario s08 --mode carla [--check-only]
   ./run_scenario.sh --list-scenarios
   ./run_scenario.sh --database-health [--stale-hours 24]
+  ./run_scenario.sh --learning-status [--minimum-valid-runs 20]
+  ./run_scenario.sh --export-decision-dataset --dataset-version NAME [--scenario s02]
+  ./run_scenario.sh --prepare-policy-candidate --dataset-version DATASET --model-version MODEL
 
 当前可运行：
   structural : s01正常生产、s02车辆故障、s03设备故障、s04爆破管控、s05极端天气、s06道路拥堵、s07道路中断、s09复合扰动、all批量
@@ -72,10 +75,19 @@ OpenPit统一场景入口
 常用参数：
   --seed N --vehicle-count 6|8 --random-map --runs N
   --policy heuristic|multi-objective|auto
+  --display-speed-scale 0.5..1.0：CARLA展示速度系数（界面启动默认0.8）
   --compare-policies：对S01或S02的同一组Seed执行V0/V1配对对照
 
 数据库治理：
   --database-health只读报告；--repair-stale-runs显式修复旧的未结束Run，不删数据。
+
+数据导出：
+  --export-decision-dataset从openpit.db导出CARLA决策级(s,a,r,s',done)。
+
+学习优化：
+  --learning-status查看有效CARLA运行、决策经验和策略版本。
+  --prepare-policy-candidate只训练、离线评估并登记Shadow候选策略。
+  Reward V1只用已记录事实；候选策略不会自动替换当前正式策略。
 
 批量采集推荐--policy auto：S01/S02使用多目标调度，其余场景使用原生安全策略。
 边界：multi-objective实际执行目前支持structural随机地图S01/S02；

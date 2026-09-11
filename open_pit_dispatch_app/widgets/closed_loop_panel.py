@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ui.vehicle_labels import VEHICLE_NAME_FALLBACKS
+from ui.vehicle_labels import VEHICLE_NAME_FALLBACKS, vehicle_id_label
 
 
 API_BASE_URL = "http://127.0.0.1:8000"
@@ -64,7 +64,7 @@ class ClosedLoopPanel(QFrame):
         root.setSpacing(6)
 
         header = QHBoxLayout()
-        title = QLabel("监测—预警—调度—反馈安全闭环")
+        title = QLabel("实时执行闭环：监测—预警—调度—执行—反馈")
         title.setStyleSheet("font-size:20px;font-weight:bold;color:white;")
         header.addWidget(title)
         self.connection_label = QLabel("正在连接实时数据……")
@@ -95,6 +95,16 @@ class ClosedLoopPanel(QFrame):
         )
         root.addWidget(self.event_label)
 
+        self.learning_label = QLabel(
+            "学习数据闭环：运行中持续记录状态、决策、代价与反馈；"
+            "当前为数据积累与离线评估阶段，不会自动替换正式策略。"
+        )
+        self.learning_label.setWordWrap(True)
+        self.learning_label.setStyleSheet(
+            "color:#8fd3ff;background:#0c141b;padding:5px;"
+        )
+        root.addWidget(self.learning_label)
+
     @staticmethod
     def _metric_label():
         label = QLabel()
@@ -114,6 +124,16 @@ class ClosedLoopPanel(QFrame):
             data = response.json()
             if not isinstance(data, dict):
                 raise ValueError("/monitoring返回数据不是对象")
+            try:
+                learning_response = requests.get(
+                    API_BASE_URL + "/learning/status", timeout=1.2
+                )
+                learning_response.raise_for_status()
+                learning_status = learning_response.json()
+                if isinstance(learning_status, dict):
+                    data["learning_policy_status"] = learning_status
+            except (requests.RequestException, ValueError):
+                pass
             return data
         except requests.HTTPError as error:
             status_code = getattr(error.response, "status_code", None)
@@ -447,14 +467,15 @@ class ClosedLoopPanel(QFrame):
                 or data.get("takeover_recommended_vehicle_id")
             )
             selected_name = VEHICLE_NAME_FALLBACKS.get(
-                str(selected_id), str(selected_id or "等待推荐")
+                str(selected_id),
+                vehicle_id_label(selected_id) if selected_id else "等待推荐",
             )
             self.order_label.setText(
                 "<b>动态任务接管</b><br>"
                 "状态：{}<br>"
                 "推荐/执行：{}<br>"
                 "候选车辆：{} 辆".format(
-                    data.get("takeover_status", "AI正在评估"),
+                    data.get("takeover_status", "智能体正在评估"),
                     selected_name,
                     int(data.get("takeover_candidate_count", 0)),
                 )
@@ -481,3 +502,66 @@ class ClosedLoopPanel(QFrame):
                 data.get("latest_event") or "等待场景运行"
             )
         )
+        learning = data.get("learning_policy_status")
+        if isinstance(learning, dict) and learning.get("formal_policy"):
+            formal = learning.get("formal_policy") or {}
+            candidate = learning.get("candidate_policy") or {}
+            evaluation = learning.get("latest_candidate_evaluation") or {}
+            valid_runs = int(learning.get("valid_carla_run_count") or 0)
+            total_runs = int(
+                learning.get("valid_carla_run_count_total") or valid_runs
+            )
+            required_runs = int(learning.get("minimum_valid_carla_runs") or 20)
+            experience_total = int(
+                learning.get("decision_experience_count_total")
+                or learning.get("decision_experience_count")
+                or 0
+            )
+            stage = (
+                "已达到更新检查门槛"
+                if learning.get("status") == "UPDATE_CHECK_DUE"
+                else "正在积累有效运行"
+            )
+            candidate_text = (
+                "{}（仅影子评估）".format(candidate.get("model_version"))
+                if candidate else "暂无"
+            )
+            evaluation_names = {
+                "OFFLINE_EVALUATED_SHADOW_ONLY": "离线评估完成（待CARLA A/B）",
+                "OFFLINE_EVALUATION_FAILED": "离线评估未通过",
+            }
+            evaluation_text = evaluation_names.get(
+                evaluation.get("status"),
+                "尚未进行候选策略评估",
+            )
+            status_color = (
+                "#ffd60a"
+                if learning.get("status") == "UPDATE_CHECK_DUE"
+                else "#64d2ff"
+            )
+            self.learning_label.setStyleSheet(
+                "color:{};background:#0c141b;padding:7px;".format(
+                    status_color
+                )
+            )
+            self.learning_label.setText(
+                "<b>学习优化慢闭环</b>　{}：本轮 {} / {} 次；"
+                "历史有效运行 {} 次，决策经验 {} 条。<br>"
+                "正式策略：{}　|　候选策略：{}　|　{}<br>"
+                "安全边界：Shadow候选不会自动替换正式策略。".format(
+                    stage, valid_runs, required_runs, total_runs,
+                    experience_total,
+                    formal.get("model_version", "未登记"), candidate_text,
+                    evaluation_text,
+                )
+            )
+        elif complete:
+            self.learning_label.setText(
+                "学习数据闭环：本轮执行已形成状态—决策—反馈经验，"
+                "由后端写入运行证据和数据库；策略需离线评估后才能晋级。"
+            )
+        else:
+            self.learning_label.setText(
+                "学习数据闭环：正在积累状态、决策、代价与执行反馈；"
+                "当前不进行未验证的在线模型替换。"
+            )

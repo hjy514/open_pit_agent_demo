@@ -30,5 +30,19 @@
     "normalization": "weighted_mean_of_available_components",
     "notes": "Only observed structural terminal facts are scored. Missing time, energy, collision and CARLA physical metrics remain unavailable."
   },
+  "decision_experience_reward": {
+    "reward_version": "carla-decision-experience-reward-v1",
+    "weight_status": "initial_equal_engineering_weights_not_validated_as_optimal",
+    "weights": {
+      "task_completion_progress": 1.0,
+      "terminal_success": 1.0,
+      "elapsed_time_cost": 1.0,
+      "terminal_failure_cost": 1.0,
+      "task_switch_cost": 1.0,
+      "safety_violation_cost": 1.0
+    },
+    "normalization": "weighted_mean_of_available_components_each_component_bounded_minus1_to_1",
+    "notes": "Offline reward derived only from recorded CARLA decision intervals and terminal outcomes. Equal weights are an auditable baseline, not optimal values. Missing observations remain unavailable and are excluded from the weighted mean."
+  },
   "notes": "Equal non-optimal interface weights. Missing objectives are excluded, not replaced with fabricated zero values. Tune only by fixed-scenario sensitivity or Pareto analysis."
 }

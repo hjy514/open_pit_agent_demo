@@ -909,6 +909,66 @@ class SqliteEvidenceStoreTest(unittest.TestCase):
             )
             store.close()
 
+    def test_learning_status_and_shadow_policy_registry_are_separate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "openpit.db"
+            store = SqliteRunStore(database_path)
+            try:
+                for scenario_key in ("s01", "s02", "s04", "s09"):
+                    run_id = "{}-6v-seed-101-run".format(scenario_key)
+                    store.start_run(run_id, "{}-6v-seed-101".format(scenario_key))
+                    store.connection.execute(
+                        "UPDATE scenario_runs SET status='PASS', "
+                        "scenario_seed=101, simulator_mode="
+                        "'carla_multi_scenario_execution' WHERE run_id=?",
+                        (run_id,),
+                    )
+                    store.connection.execute(
+                        "INSERT INTO events(run_id,timestamp,tick,event_type,payload_json) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (run_id, "2026-01-01T00:00:00+00:00", 1,
+                         "decision_experience_captured", "{}"),
+                    )
+                store.connection.commit()
+                collecting = store.learning_status_report(5)
+                self.assertEqual("COLLECTING_DATA", collecting["status"])
+                self.assertEqual(4, collecting["valid_carla_run_count"])
+                self.assertEqual(4, collecting["decision_experience_count"])
+                ready = store.learning_status_report(4)
+                self.assertEqual("UPDATE_CHECK_DUE", ready["status"])
+                store.register_policy_version(
+                    "bc-test-v1", "behavior-cloning-candidate-ranker-v1",
+                    "OFFLINE_EVALUATED_SHADOW_ONLY", "shadow_only",
+                    dataset_version="dataset-test-v1",
+                    model_path="models/bc-test-v1/model.json",
+                )
+                store.record_training_run(
+                    "training-test-v1", "bc-test-v1", "dataset-test-v1",
+                    "candidate", "TRAINED_OFFLINE_SHADOW_ONLY",
+                    "models/bc-test-v1/training_report.json", {},
+                )
+                store.record_policy_evaluation(
+                    "evaluation-test-v1", "bc-test-v1", "offline_holdout",
+                    "OFFLINE_EVALUATED_SHADOW_ONLY", {"record_count": 10},
+                )
+                after_training = store.learning_status_report(4)
+                self.assertEqual("COLLECTING_DATA", after_training["status"])
+                self.assertEqual(0, after_training["valid_carla_run_count"])
+                self.assertEqual(
+                    "multi-objective-cost-v1",
+                    after_training["formal_policy"]["model_version"],
+                )
+                self.assertEqual(
+                    "bc-test-v1",
+                    after_training["candidate_policy"]["model_version"],
+                )
+                self.assertEqual(
+                    "shadow_only",
+                    after_training["candidate_policy"]["execution_authority"],
+                )
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

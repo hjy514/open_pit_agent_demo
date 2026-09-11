@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 
 def _utc_now() -> str:
@@ -282,13 +282,72 @@ class SqliteRunStore:
             );
             CREATE INDEX IF NOT EXISTS idx_closed_loop_cycles_run_revision
                 ON closed_loop_cycles(run_id, revision_before, revision_after);
+
+            CREATE TABLE IF NOT EXISTS training_runs (
+                training_run_id TEXT PRIMARY KEY,
+                model_version TEXT NOT NULL,
+                dataset_version TEXT NOT NULL,
+                policy_scope TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                report_path TEXT,
+                summary_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS policy_versions (
+                model_version TEXT PRIMARY KEY,
+                policy_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                execution_authority TEXT NOT NULL,
+                dataset_version TEXT,
+                model_path TEXT,
+                created_at TEXT NOT NULL,
+                promoted_at TEXT,
+                summary_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS policy_evaluations (
+                evaluation_id TEXT PRIMARY KEY,
+                model_version TEXT NOT NULL,
+                evaluation_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(model_version) REFERENCES policy_versions(model_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_policy_evaluations_model_created
+                ON policy_evaluations(model_version, created_at);
             """
         )
         self._ensure_v2_columns()
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
             "VALUES (?, ?)",
+            ("3", _utc_now()),
+        )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+            "VALUES (?, ?)",
             (SCHEMA_VERSION, _utc_now()),
+        )
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO policy_versions(
+                model_version, policy_name, status, execution_authority,
+                dataset_version, model_path, created_at, promoted_at,
+                summary_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "multi-objective-cost-v1", "MultiObjectiveCostModel",
+                "ACTIVE_BASELINE", "carla_formal", None, None,
+                _utc_now(), None, _json({
+                    "source": "built_in_rule_and_cost_baseline",
+                    "learning_model": False,
+                    "safety_shield_required": True,
+                }),
+            ),
         )
         self.connection.commit()
 
@@ -447,6 +506,279 @@ class SqliteRunStore:
                 "stale_repair_available": True,
                 "event_retention_change_applied": False,
             },
+        }
+
+    def register_policy_version(
+        self,
+        model_version: str,
+        policy_name: str,
+        status: str,
+        execution_authority: str,
+        dataset_version: Optional[str] = None,
+        model_path: Optional[str] = None,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Register policy metadata without granting execution authority."""
+
+        existing = self.connection.execute(
+            "SELECT 1 FROM policy_versions WHERE model_version=?",
+            (str(model_version),),
+        ).fetchone()
+        if existing:
+            self.connection.execute(
+                """
+                UPDATE policy_versions
+                SET policy_name=?, status=?, execution_authority=?,
+                    dataset_version=?, model_path=?, summary_json=?
+                WHERE model_version=?
+                """,
+                (
+                    str(policy_name), str(status), str(execution_authority),
+                    dataset_version, model_path, _json(summary or {}),
+                    str(model_version),
+                ),
+            )
+        else:
+            self.connection.execute(
+                """
+                INSERT INTO policy_versions(
+                    model_version, policy_name, status, execution_authority,
+                    dataset_version, model_path, created_at, promoted_at,
+                    summary_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(model_version), str(policy_name), str(status),
+                    str(execution_authority), dataset_version, model_path,
+                    _utc_now(), None, _json(summary or {}),
+                ),
+            )
+        self.connection.commit()
+
+    def record_training_run(
+        self,
+        training_run_id: str,
+        model_version: str,
+        dataset_version: str,
+        policy_scope: str,
+        status: str,
+        report_path: Optional[str],
+        summary: Dict[str, Any],
+        started_at: Optional[str] = None,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO training_runs(
+                training_run_id, model_version, dataset_version, policy_scope,
+                status, started_at, ended_at, report_path, summary_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(training_run_id), str(model_version), str(dataset_version),
+                str(policy_scope), str(status), started_at or _utc_now(),
+                _utc_now(), report_path, _json(summary),
+            ),
+        )
+        self.connection.commit()
+
+    def record_policy_evaluation(
+        self,
+        evaluation_id: str,
+        model_version: str,
+        evaluation_type: str,
+        status: str,
+        metrics: Dict[str, Any],
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO policy_evaluations(
+                evaluation_id, model_version, evaluation_type, status,
+                metrics_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(evaluation_id), str(model_version), str(evaluation_type),
+                str(status), _json(metrics), _utc_now(),
+            ),
+        )
+        self.connection.commit()
+
+    def learning_status_report(
+        self,
+        minimum_valid_carla_runs: int = 20,
+        core_scenarios: Sequence[str] = ("s01", "s02", "s04", "s09"),
+    ) -> Dict[str, Any]:
+        """Summarize the guarded slow learning loop from recorded facts."""
+
+        minimum_runs = max(1, int(minimum_valid_carla_runs))
+        scenario_keys = tuple(str(item).lower() for item in core_scenarios)
+        latest_training = self.connection.execute(
+            """
+            SELECT training_run_id, model_version, dataset_version,
+                   policy_scope, status, ended_at, report_path
+            FROM training_runs ORDER BY ended_at DESC LIMIT 1
+            """
+        ).fetchone()
+        training_cutoff = latest_training[5] if latest_training else None
+        per_scenario = {}
+        for scenario_key in scenario_keys:
+            row = self.connection.execute(
+                """
+                SELECT count(*), count(DISTINCT scenario_seed)
+                FROM scenario_runs
+                WHERE lower(status)='pass'
+                  AND lower(simulator_mode) LIKE 'carla%'
+                  AND lower(scenario_id) LIKE ?
+                  AND (? IS NULL OR started_at>?)
+                """,
+                (scenario_key + "-%", training_cutoff, training_cutoff),
+            ).fetchone()
+            per_scenario[scenario_key] = {
+                "valid_run_count": int(row[0]),
+                "unique_seed_count": int(row[1]),
+            }
+        valid_runs_since_training = sum(
+            item["valid_run_count"] for item in per_scenario.values()
+        )
+        total_valid_runs = int(self.connection.execute(
+            """
+            SELECT count(*) FROM scenario_runs
+            WHERE lower(status)='pass'
+              AND lower(simulator_mode) LIKE 'carla%'
+              AND (
+                lower(scenario_id) LIKE 's01-%'
+                OR lower(scenario_id) LIKE 's02-%'
+                OR lower(scenario_id) LIKE 's04-%'
+                OR lower(scenario_id) LIKE 's09-%'
+              )
+            """
+        ).fetchone()[0])
+        decision_row = self.connection.execute(
+            """
+            SELECT count(*), count(DISTINCT e.run_id)
+            FROM events AS e
+            JOIN scenario_runs AS r ON r.run_id=e.run_id
+            WHERE e.event_type='decision_experience_captured'
+              AND lower(r.status)='pass'
+              AND lower(r.simulator_mode) LIKE 'carla%'
+              AND (? IS NULL OR r.started_at>?)
+            """,
+            (training_cutoff, training_cutoff),
+        ).fetchone()
+        total_decision_row = self.connection.execute(
+            """
+            SELECT count(*), count(DISTINCT e.run_id)
+            FROM events AS e
+            JOIN scenario_runs AS r ON r.run_id=e.run_id
+            WHERE e.event_type='decision_experience_captured'
+              AND lower(r.status)='pass'
+              AND lower(r.simulator_mode) LIKE 'carla%'
+            """
+        ).fetchone()
+        policies = [
+            {
+                "model_version": str(row[0]), "policy_name": str(row[1]),
+                "status": str(row[2]), "execution_authority": str(row[3]),
+                "dataset_version": row[4], "model_path": row[5],
+                "created_at": row[6],
+                "summary": json.loads(row[7] or "{}"),
+            }
+            for row in self.connection.execute(
+                """
+                SELECT model_version, policy_name, status,
+                       execution_authority, dataset_version, model_path,
+                       created_at, summary_json
+                FROM policy_versions ORDER BY created_at DESC
+                """
+            ).fetchall()
+        ]
+        coverage_ready = all(
+            per_scenario[key]["valid_run_count"] > 0
+            for key in scenario_keys
+        )
+        update_due = (
+            coverage_ready and valid_runs_since_training >= minimum_runs
+        )
+        formal = next(
+            (
+                item for item in policies
+                if item["execution_authority"] == "carla_formal"
+            ),
+            {
+                "model_version": "multi-objective-cost-v1",
+                "policy_name": "MultiObjectiveCostModel",
+                "status": "ACTIVE_BASELINE",
+                "execution_authority": "carla_formal",
+            },
+        )
+        candidate = next(
+            (
+                item for item in policies
+                if item["execution_authority"] == "shadow_only"
+            ), None,
+        )
+        latest_evaluation = None
+        if candidate:
+            evaluation = self.connection.execute(
+                """
+                SELECT evaluation_id, evaluation_type, status, metrics_json,
+                       created_at
+                FROM policy_evaluations
+                WHERE model_version=? ORDER BY created_at DESC LIMIT 1
+                """,
+                (candidate["model_version"],),
+            ).fetchone()
+            if evaluation:
+                latest_evaluation = {
+                    "evaluation_id": evaluation[0],
+                    "evaluation_type": evaluation[1],
+                    "status": evaluation[2],
+                    "metrics": json.loads(evaluation[3] or "{}"),
+                    "created_at": evaluation[4],
+                }
+        return {
+            "schema_version": "openpit.learning-status.v1",
+            "status": (
+                "UPDATE_CHECK_DUE" if update_due else "COLLECTING_DATA"
+            ),
+            "automatic_online_update": False,
+            "automatic_promotion": False,
+            "minimum_valid_carla_runs": minimum_runs,
+            "valid_carla_run_count": valid_runs_since_training,
+            "valid_carla_run_count_total": total_valid_runs,
+            "valid_carla_runs_since_latest_training": (
+                valid_runs_since_training
+            ),
+            "remaining_valid_run_count": max(
+                0, minimum_runs - valid_runs_since_training
+            ),
+            "core_scenario_coverage_ready": coverage_ready,
+            "scenario_coverage": per_scenario,
+            "decision_experience_count": int(decision_row[0]),
+            "decision_experience_run_count": int(decision_row[1]),
+            "decision_experience_count_total": int(total_decision_row[0]),
+            "decision_experience_run_count_total": int(total_decision_row[1]),
+            "formal_policy": formal,
+            "candidate_policy": candidate,
+            "latest_candidate_evaluation": latest_evaluation,
+            "latest_training": ({
+                "training_run_id": latest_training[0],
+                "model_version": latest_training[1],
+                "dataset_version": latest_training[2],
+                "policy_scope": latest_training[3],
+                "status": latest_training[4],
+                "ended_at": latest_training[5],
+                "report_path": latest_training[6],
+            } if latest_training else None),
+            "next_stage": (
+                "manual_candidate_training_and_offline_evaluation"
+                if update_due else "collect_valid_core_scenario_carla_runs"
+            ),
+            "boundary": (
+                "CARLA records gate evaluation; current BC trainer uses only "
+                "versioned structural teacher data. Promotion always requires "
+                "manual review and later CARLA A/B validation."
+            ),
         }
 
     def record_episode(
@@ -1039,6 +1371,9 @@ class SqliteRunStore:
             return True
 
         scenario_key = str(scenario_key)
+        physical_runtime = str(expected.get("mode") or "").startswith(
+            "carla"
+        ) and "check" not in str(expected.get("mode") or "")
         if scenario_key == "s01":
             decisions = self.connection.execute(
                 "SELECT count(*) FROM decisions WHERE run_id=?", (run_id,)
@@ -1046,13 +1381,39 @@ class SqliteRunStore:
             check("db_s01_decisions_present", decisions >= expected_tasks,
                   decisions)
         elif scenario_key == "s02":
-            check("db_s02_event_order", ordered([
-                "vehicle_fault", "task_released", "task_reassigned",
-                "task_completed", "run_completed",
-            ]), event_types)
-            check("db_s02_reassignment_count", event_types.count("task_reassigned") == int(
-                expected.get("reassignment_count") or 0
-            ), event_types.count("task_reassigned"))
+            if physical_runtime:
+                # CARLA persists measured adapter events.  Do not require the
+                # structural Mock aliases (or manufacture a run_completed
+                # event) when the authoritative run/task rows above already
+                # prove terminal success.
+                check("db_s02_runtime_event_order", ordered([
+                    "vehicle_fault_applied",
+                    "task_suspended_for_preemption",
+                    "task_reassigned_by_scenario",
+                    "task_completed",
+                ]), event_types)
+                actual_reassignments = event_types.count(
+                    "task_reassigned_by_scenario"
+                )
+                check(
+                    "db_s02_runtime_reassignment_count",
+                    actual_reassignments == int(
+                        expected.get("reassignment_count") or 0
+                    ),
+                    actual_reassignments,
+                )
+            else:
+                check("db_s02_event_order", ordered([
+                    "vehicle_fault", "task_released", "task_reassigned",
+                    "task_completed", "run_completed",
+                ]), event_types)
+                check(
+                    "db_s02_reassignment_count",
+                    event_types.count("task_reassigned") == int(
+                        expected.get("reassignment_count") or 0
+                    ),
+                    event_types.count("task_reassigned"),
+                )
         elif scenario_key == "s03":
             check("db_s03_event_order", ordered([
                 "equipment_fault", "task_paused", "agent_decision",
@@ -1076,6 +1437,40 @@ class SqliteRunStore:
             check("db_s03_route_plan_count", route_count == expected_tasks + affected,
                   "{} expected {}".format(route_count, expected_tasks + affected))
         elif scenario_key == "s04":
+            if physical_runtime:
+                check("db_s04_runtime_event_order", ordered([
+                    "scenario_control_applied", "scenario_control_recovered",
+                    "task_completed",
+                ]), event_types)
+                expected_decisions = len(expected.get("decisions") or [])
+                decisions = self.connection.execute(
+                    "SELECT count(*) FROM decisions WHERE run_id=?", (run_id,)
+                ).fetchone()[0]
+                check(
+                    "db_s04_runtime_decisions_present",
+                    decisions >= expected_decisions > 0,
+                    "{} expected at least {}".format(
+                        decisions, expected_decisions
+                    ),
+                )
+                expected_routes = (
+                    len(expected.get("route_plans") or [])
+                    + len(expected.get("task_mission_plans") or [])
+                )
+                route_count = self.connection.execute(
+                    "SELECT count(*) FROM route_plans WHERE run_id=?", (run_id,)
+                ).fetchone()[0]
+                check(
+                    "db_s04_runtime_routes_present",
+                    route_count == expected_routes and expected_routes > 0,
+                    "{} expected {}".format(route_count, expected_routes),
+                )
+                failed = [
+                    item["check"] for item in checks if not item["passed"]
+                ]
+                return self._store_closed_loop_validation(
+                    run_id, scenario_key, checks, failed
+                )
             check("db_s04_event_order", ordered([
                 "blast_announced", "blast_control_activated", "agent_decision",
                 "task_completed", "blast_area_cleared", "road_reopened",
@@ -1161,6 +1556,42 @@ class SqliteRunStore:
                 expected.get("takeover_count") or 0
             ), event_types.count("task_reassigned"))
         elif scenario_key == "s09":
+            if physical_runtime:
+                check("db_s09_runtime_event_order", ordered([
+                    "scenario_control_applied", "vehicle_fault_applied",
+                    "task_suspended_for_preemption",
+                    "task_reassigned_by_scenario",
+                    "scenario_control_recovered", "task_completed",
+                ]), event_types)
+                expected_decisions = len(expected.get("decisions") or [])
+                decisions = self.connection.execute(
+                    "SELECT count(*) FROM decisions WHERE run_id=?", (run_id,)
+                ).fetchone()[0]
+                check(
+                    "db_s09_runtime_decisions_present",
+                    decisions >= expected_decisions > 0,
+                    "{} expected at least {}".format(
+                        decisions, expected_decisions
+                    ),
+                )
+                expected_routes = (
+                    len(expected.get("route_plans") or [])
+                    + len(expected.get("task_mission_plans") or [])
+                )
+                route_count = self.connection.execute(
+                    "SELECT count(*) FROM route_plans WHERE run_id=?", (run_id,)
+                ).fetchone()[0]
+                check(
+                    "db_s09_runtime_routes_present",
+                    route_count == expected_routes and expected_routes > 0,
+                    "{} expected {}".format(route_count, expected_routes),
+                )
+                failed = [
+                    item["check"] for item in checks if not item["passed"]
+                ]
+                return self._store_closed_loop_validation(
+                    run_id, scenario_key, checks, failed
+                )
             check("db_s09_event_order", ordered([
                 "road_closed", "agent_decision", "route_replanned",
                 "vehicle_fault", "task_released", "agent_decision",
@@ -1192,7 +1623,16 @@ class SqliteRunStore:
             check("db_s09_route_plan_count", route_count == expected_routes,
                   "{} expected {}".format(route_count, expected_routes))
 
-        failed = [item["check"] for item in checks if not item["passed"]]
+        return self._store_closed_loop_validation(
+            run_id, scenario_key, checks,
+            [item["check"] for item in checks if not item["passed"]],
+        )
+
+    def _store_closed_loop_validation(
+        self, run_id: str, scenario_key: str,
+        checks: List[Dict[str, Any]], failed: List[str],
+    ) -> Dict[str, Any]:
+        """Store one validation result without duplicating metric semantics."""
         result = {
             "status": "EVIDENCE_PASS" if not failed else "EVIDENCE_FAIL",
             "run_id": run_id,

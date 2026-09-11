@@ -17,6 +17,9 @@ from open_pit_agent.config import load_config
 from open_pit_agent.decision_intelligence import (
     aggregate_structural_transition_datasets, load_structural_reward_config,
     write_structural_transition_dataset, export_closed_loop_transition_dataset,
+    load_decision_experience_reward_config,
+    export_decision_experience_transition_dataset,
+    register_offline_policy_candidate,
 )
 from open_pit_agent.decision import (
     train_and_save_behavior_cloning_policy,
@@ -545,6 +548,12 @@ def _record_result(result, config_path, random_map):
         if result.get("mode") in {
             "carla_multi_vehicle_execution", "carla_multi_scenario_execution"
         }:
+            result["runtime_plan_record_counts"] = (
+                recorder.record_unified_runtime_plan(result)
+            )
+            result["decision_experience_record_count"] = (
+                recorder.record_decision_experiences(result)
+            )
             result["runtime_event_record_count"] = (
                 recorder.record_runtime_events(result)
             )
@@ -613,10 +622,11 @@ def _run_one(scenario, config_path, seed, random_map, vehicle_count, no_record,
     return _record_result(result, config_path, random_map)
 
 
-def _record_failed_batch_run(scenario, config_path, seed, error):
+def _record_failed_batch_run(scenario, config_path, seed, error,
+                             mode="mock_structural", status="FAIL"):
     config = load_config(config_path)
     result = {
-        "status": "FAIL", "mode": "mock_structural",
+        "status": str(status), "mode": str(mode),
         "scenario_id": config.scenario_id, "scenario_key": scenario,
         "seed": seed, "task_count": 0, "completed_task_count": 0,
         "error": "{}: {}".format(type(error).__name__, error),
@@ -627,7 +637,10 @@ def _record_failed_batch_run(scenario, config_path, seed, error):
         result["run_id"] = recorder.run_id
         result["run_directory"] = str(recorder.run_dir)
         result["database_path"] = str(recorder.database_path)
-        recorder.record("run_failed", {"seed": seed, "error": result["error"]})
+        recorder.record("run_failed", {
+            "seed": seed, "error": result["error"],
+            "mode": str(mode), "status": str(status),
+        })
         recorder.write_json(
             "summary.json", _summary_for_storage(result, config_path, True)
         )
@@ -654,6 +667,7 @@ def _primary_experience_dataset(manifest=None):
             "learning_status": "offline_analysis_only",
         }
     quality = manifest.get("dataset_quality", {})
+    readiness = manifest.get("learning_readiness", {})
     return {
         "status": quality.get("status", "DATASET_QUALITY_WARN"),
         "schema_version": manifest.get("schema_version"),
@@ -668,6 +682,15 @@ def _primary_experience_dataset(manifest=None):
             "behavior_cloning_preparation_eligible_count", 0
         ),
         "ppo_eligible_record_count": manifest.get("ppo_eligible_record_count", 0),
+        "closed_loop_collection_status": readiness.get("collection_status"),
+        "offline_analysis_status": readiness.get("offline_analysis_status"),
+        "physical_success_record_count": readiness.get(
+            "physical_success_record_count", 0
+        ),
+        "physical_failure_record_count": readiness.get(
+            "physical_failure_record_count", 0
+        ),
+        "policy_promotion_status": readiness.get("policy_promotion_status"),
         "learning_status": "offline_analysis_only_no_online_policy_update",
         "boundary": (
             "Synthetic scenario records are not real mine data; reward stays "
@@ -806,14 +829,21 @@ def main():
                         help="Aggregate quality-passed batches without running a scenario")
     parser.add_argument("--export-cycle-dataset", action="store_true",
                         help="Export direct V3 closed-loop DB cycles without running a scenario")
+    parser.add_argument("--export-decision-dataset", action="store_true",
+                        help="Export measured CARLA decision intervals with Reward V1")
     parser.add_argument("--database-health", action="store_true",
                         help="Report openpit.db lifecycle and data volume without running a scenario")
+    parser.add_argument("--learning-status", action="store_true",
+                        help="Report guarded data/training/policy-update status")
     parser.add_argument("--repair-stale-runs", action="store_true",
                         help="Mark old running/planned rows INCOMPLETE; never deletes evidence")
     parser.add_argument("--stale-hours", type=float, default=24.0,
                         help="Age threshold for database health/repair (default: 24)")
-    parser.add_argument("--train-bc", action="store_true",
-                        help="Train the offline shadow BC candidate ranker")
+    parser.add_argument("--train-bc", "--prepare-policy-candidate",
+                        dest="train_bc", action="store_true",
+                        help="Train, evaluate and register an offline shadow BC candidate")
+    parser.add_argument("--minimum-valid-runs", type=int, default=20,
+                        help="Valid core-scenario CARLA runs required before candidate training")
     parser.add_argument("--dataset-version",
                         help="Immutable name used with dataset export/aggregation")
     parser.add_argument(
@@ -856,6 +886,11 @@ def main():
                         help="Safe-hold timeout for --operator-review (default: 120)")
     parser.add_argument("--playback-delay-seconds", type=float, default=1.0,
                         help="Delay between structural UI stages (default: 1.0)")
+    parser.add_argument(
+        "--display-speed-scale", type=float, default=1.0,
+        help=("CARLA presentation speed multiplier (0.5-1.0; default: 1.0). "
+              "The dispatch UI uses 0.8 for the four competition scenarios."),
+    )
     parser.add_argument("--runtime-api-url", default=DEFAULT_RUNTIME_SYNC_URL,
                         help="Runtime sync endpoint used with --ui-sync")
     parser.add_argument("--ticks", type=int, default=1000,
@@ -869,9 +904,23 @@ def main():
         print(json.dumps(SCENARIO_CATALOG, ensure_ascii=False, indent=2,
                          sort_keys=True))
         return 0
+    if args.learning_status:
+        if args.scenario or args.aggregate_datasets or args.train_bc \
+                or args.export_cycle_dataset or args.export_decision_dataset \
+                or args.database_health or args.repair_stale_runs:
+            parser.error("--learning-status cannot be combined with other actions")
+        if not args.database.is_file():
+            parser.error("database does not exist: {}".format(args.database))
+        store = SqliteRunStore(args.database)
+        try:
+            report = store.learning_status_report(args.minimum_valid_runs)
+        finally:
+            store.close()
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     if args.database_health or args.repair_stale_runs:
         if args.scenario or args.aggregate_datasets or args.train_bc \
-                or args.export_cycle_dataset:
+                or args.export_cycle_dataset or args.export_decision_dataset:
             parser.error("database health/repair cannot be combined with scenario/data actions")
         if not args.database.is_file():
             parser.error("database does not exist: {}".format(args.database))
@@ -892,7 +941,7 @@ def main():
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.export_cycle_dataset:
-        if args.aggregate_datasets or args.train_bc:
+        if args.aggregate_datasets or args.train_bc or args.export_decision_dataset:
             parser.error("--export-cycle-dataset cannot be combined with aggregation/training")
         if not args.dataset_version:
             parser.error("--dataset-version is required with --export-cycle-dataset")
@@ -905,6 +954,23 @@ def main():
         )
         print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if manifest["dataset_quality"]["status"] == "DATASET_QUALITY_PASS" else 1
+    if args.export_decision_dataset:
+        if args.aggregate_datasets or args.train_bc:
+            parser.error(
+                "--export-decision-dataset cannot be combined with aggregation/training"
+            )
+        if not args.dataset_version:
+            parser.error("--dataset-version is required with --export-decision-dataset")
+        scenario_filter = None
+        if args.scenario and args.scenario != "all":
+            scenario_filter = [args.scenario]
+        manifest = export_decision_experience_transition_dataset(
+            args.database, ROOT / "data" / "datasets", args.dataset_version,
+            load_decision_experience_reward_config(DECISION_CONFIG),
+            scenario_keys=scenario_filter,
+        )
+        print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if manifest["dataset_quality"]["status"] == "DATASET_QUALITY_PASS" else 1
     reward_config = load_structural_reward_config(DECISION_CONFIG)
     if args.train_bc:
         if args.scenario or args.aggregate_datasets:
@@ -913,6 +979,22 @@ def main():
             parser.error("--dataset-version and --model-version are required with --train-bc")
         if args.epochs < 1:
             parser.error("--epochs must be at least 1")
+        if not args.database.is_file():
+            parser.error("database does not exist: {}".format(args.database))
+        store = SqliteRunStore(args.database)
+        try:
+            learning_status = store.learning_status_report(
+                args.minimum_valid_runs
+            )
+        finally:
+            store.close()
+        if learning_status["status"] != "UPDATE_CHECK_DUE":
+            print(json.dumps({
+                "status": "CANDIDATE_TRAINING_BLOCKED",
+                "reason": "minimum_valid_core_scenario_carla_runs_not_met",
+                "learning_status": learning_status,
+            }, ensure_ascii=False, indent=2, sort_keys=True))
+            return 1
         dataset_manifest = (
             ROOT / "data" / "datasets" / "openpit-structural-transition-v1"
             / "versions" / args.dataset_version / "manifest.json"
@@ -924,6 +1006,23 @@ def main():
         )
         report = trainer(dataset_manifest, ROOT / "data" / "models",
                          args.model_version, epochs=args.epochs)
+        store = SqliteRunStore(args.database)
+        try:
+            lifecycle = register_offline_policy_candidate(
+                store, report, args.policy_scope
+            )
+            report["candidate_lifecycle"] = lifecycle
+            report["learning_status_after_registration"] = (
+                store.learning_status_report(args.minimum_valid_runs)
+            )
+        finally:
+            store.close()
+        report_path = Path(report["training_report_path"])
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.aggregate_datasets:
@@ -946,6 +1045,8 @@ def main():
             )
         except ValueError as exc:
             parser.error(str(exc))
+    if args.display_speed_scale < 0.5 or args.display_speed_scale > 1.0:
+        parser.error("--display-speed-scale must be between 0.5 and 1.0")
     if args.mode == "carla":
         if args.runs != 1:
             parser.error("CARLA execution currently requires --runs 1")
@@ -986,16 +1087,64 @@ def main():
                 vehicle_count=args.vehicle_count, ticks=args.ticks,
                 load_map=args.load_map, check_only=args.check_only,
                 execution_policy=args.policy,
+                display_speed_scale=args.display_speed_scale,
                 runtime_publisher=runtime_publisher,
                 operator_reviewer=operator_reviewer,
                 control_state_reader=process_control_state,
             )
+        except KeyboardInterrupt as exc:
+            interrupted = {
+                "status": "INTERRUPTED",
+                "mode": "carla_multi_scenario_execution",
+                "scenario_key": args.scenario,
+                "scenario_id": config.scenario_id,
+                "seed": args.seed,
+                "task_count": 0,
+                "completed_task_count": 0,
+                "closed_loop_status": "FAILED",
+                "error": "KeyboardInterrupt: operator_interrupted_run",
+                "simulation_claim": "interrupted_before_terminal_feedback",
+            }
+            if not args.no_record:
+                interrupted = _record_failed_batch_run(
+                    args.scenario, config_path, args.seed, exc,
+                    mode="carla_multi_scenario_execution",
+                    status="INTERRUPTED",
+                )
+            print(json.dumps(
+                interrupted, ensure_ascii=False, indent=2, sort_keys=True
+            ))
+            print(
+                "场景已中断，已保存INTERRUPTED结果。",
+                file=sys.stderr,
+            )
+            return 130
         except (CarlaAdapterError, ValueError, RuntimeError) as exc:
             print("ERROR: CARLA执行准备失败：{}".format(exc), file=sys.stderr)
             if isinstance(exc, CarlaAdapterError):
                 print("请确认CARLA已启动且地图已完全加载。", file=sys.stderr)
             else:
                 print("请按上述资源准入提示处理后重试。", file=sys.stderr)
+            failed = {
+                "status": "FAIL",
+                "mode": "carla_multi_scenario_execution",
+                "scenario_key": args.scenario,
+                "scenario_id": config.scenario_id,
+                "seed": args.seed,
+                "task_count": 0,
+                "completed_task_count": 0,
+                "closed_loop_status": "FAILED",
+                "error": "{}: {}".format(type(exc).__name__, exc),
+                "simulation_claim": "failed_before_terminal_feedback",
+            }
+            if not args.no_record and not args.check_only:
+                failed = _record_failed_batch_run(
+                    args.scenario, config_path, args.seed, exc,
+                    mode="carla_multi_scenario_execution", status="FAIL",
+                )
+            print(json.dumps(
+                failed, ensure_ascii=False, indent=2, sort_keys=True
+            ))
             return 2
         if not args.check_only:
             result = _attach_common_monitoring(result)

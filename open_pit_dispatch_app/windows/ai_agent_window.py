@@ -26,7 +26,7 @@ class AIAgentWindow(QDialog):
         super().__init__()
 
         self.setWindowTitle(
-            "AI Agent决策中心"
+            "智能体决策中心"
         )
         self.resize(900, 700)
 
@@ -43,7 +43,7 @@ class AIAgentWindow(QDialog):
         layout = QVBoxLayout()
 
         title = QLabel(
-            "AI Agent决策中心"
+            "智能体决策中心"
         )
         title.setStyleSheet(
             "font-size:28px;"
@@ -52,7 +52,7 @@ class AIAgentWindow(QDialog):
         layout.addWidget(title)
 
         self.connection_label = QLabel(
-            "Agent API：正在连接"
+            "智能体服务：正在连接"
         )
         layout.addWidget(
             self.connection_label
@@ -99,18 +99,18 @@ class AIAgentWindow(QDialog):
             data = self.fetch_data()
 
             self.connection_label.setText(
-                "Agent API：已连接"
+                "智能体服务：已连接"
             )
 
             self.set_content(self.build_content(data))
 
         except Exception as error:
             self.connection_label.setText(
-                "Agent API：连接失败"
+                "智能体服务：连接失败"
             )
 
             self.set_content(
-                "无法获取 Agent 状态。\n\n"
+                "无法获取智能体状态。\n\n"
                 f"错误信息：{error}"
             )
 
@@ -131,7 +131,7 @@ class AIAgentWindow(QDialog):
 
         if not agents:
             lines.append(
-                "当前没有Agent状态数据"
+                "当前没有智能体状态数据"
             )
         else:
             for agent in agents:
@@ -273,7 +273,7 @@ class AIAgentWindow(QDialog):
         lines.extend(
             [
                 "",
-                "【AI任务决策】",
+                "【智能任务决策】",
                 "",
             ]
         )
@@ -290,9 +290,9 @@ class AIAgentWindow(QDialog):
         else:
             decision_status = {
                 "PASS": "暂无新调度动作",
-                "SCHEDULED": "AI已完成任务分配",
-                "APPROVED_BY_HUMAN": "调度员已接受AI方案",
-                "REJECTED_BY_HUMAN": "调度员已驳回AI方案",
+                "SCHEDULED": "智能体已完成任务分配",
+                "APPROVED_BY_HUMAN": "调度员已接受智能方案",
+                "REJECTED_BY_HUMAN": "调度员已驳回智能方案",
             }.get(
                 str(decision.get("status", "")),
                 status_label(decision.get("status", "-")),

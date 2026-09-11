@@ -14,8 +14,10 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.vehicle_labels import (
+    communication_label,
     health_label,
     status_label,
+    source_label,
     task_label,
     type_label,
     vehicle_name,
@@ -41,7 +43,7 @@ class VehicleManagementWindow(QDialog):
         # 打开窗口时立即请求一次数据
         self.refresh_data()
 
-        # 每2秒从Agent API获取一次最新车辆状态
+        # 每2秒从智能体服务获取一次最新车辆状态
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_data)
         self.refresh_timer.start(2000)
@@ -57,7 +59,7 @@ class VehicleManagementWindow(QDialog):
             "font-weight:bold;"
         )
 
-        self.connection_label = QLabel("Agent API：正在连接")
+        self.connection_label = QLabel("智能体服务：正在连接")
         self.connection_label.setStyleSheet(
             "font-size:14px;"
             "padding:6px 12px;"
@@ -129,7 +131,7 @@ class VehicleManagementWindow(QDialog):
             """
 历史任务：
 
-等待 Agent 系统返回任务执行记录。
+等待智能体系统返回任务执行记录。
 """
         )
         layout.addWidget(self.history_label)
@@ -189,7 +191,7 @@ class VehicleManagementWindow(QDialog):
             self.vehicle_data = self.fetch_vehicle_data()
 
             self.connection_label.setText(
-                "Agent API：已连接"
+                "智能体服务：已连接"
             )
             self.connection_label.setStyleSheet(
                 "font-size:14px;"
@@ -203,7 +205,7 @@ class VehicleManagementWindow(QDialog):
 
         except Exception as error:
             self.connection_label.setText(
-                "Agent API：连接失败"
+                "智能体服务：连接失败"
             )
             self.connection_label.setStyleSheet(
                 "font-size:14px;"
@@ -212,7 +214,7 @@ class VehicleManagementWindow(QDialog):
             )
 
             self.detail.setText(
-                "无法连接 Agent API。\n\n"
+                "无法连接智能体服务。\n\n"
                 f"接口地址：{API_BASE_URL}/vehicles\n\n"
                 f"错误信息：{error}\n\n"
                 "请确认 open_pit_agent_demo 的 API 服务正在运行。"
@@ -284,8 +286,8 @@ class VehicleManagementWindow(QDialog):
                 vehicle.get("position", "-"),
                 task_label(vehicle.get("task")),
                 health_label(vehicle.get("health", "-")),
-                vehicle.get("communication", "-"),
-                vehicle.get("source", "-"),
+                communication_label(vehicle.get("communication", "-")),
+                source_label(vehicle.get("source", "-")),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -359,10 +361,10 @@ class VehicleManagementWindow(QDialog):
 {health_label(vehicle.get('health', '-'))}
 
 通信状态：
-{vehicle.get('communication', '-')}
+{communication_label(vehicle.get('communication', '-'))}
 
 任务来源：
-{vehicle.get('source', '-')}
+{source_label(vehicle.get('source', '-'))}
 """
         if self.detail.toPlainText() == content:
             return

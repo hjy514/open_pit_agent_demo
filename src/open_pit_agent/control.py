@@ -432,11 +432,12 @@ class UnifiedScenarioControlManager:
             # PyQt launcher never needs a separate execution path.
             if resolved["mode"] == "structural":
                 command.extend([
-                    "--ui-sync", "--playback-delay-seconds", "1.0",
+                    "--ui-sync", "--playback-delay-seconds", "2.0",
                 ])
             else:
                 command.extend([
                     "--ui-sync",
+                    "--display-speed-scale", "0.8",
                     "--operator-review",
                     "--operator-review-timeout-seconds", "120",
                     "--load-map",

@@ -104,6 +104,11 @@ def run_random_s09_structural_mock(config: Any, seed: Optional[int] = None,
         feasible_failures = []
         for task_id in sorted(tasks):
             task = tasks[task_id]
+            # Keep the two incident stages distinct.  The vehicle-failure
+            # stage must not target work that the preceding road closure has
+            # already rerouted or transferred.
+            if task_id in road_affected_tasks:
+                continue
             failed_vehicle_id = str(task.get("assigned_vehicle_id") or "")
             if not failed_vehicle_id or failed_vehicle_id not in vehicle_origins:
                 continue
@@ -128,6 +133,14 @@ def run_random_s09_structural_mock(config: Any, seed: Optional[int] = None,
                     "candidate_not_held_by_road_event": (
                         candidate_task not in road_affected_tasks
                     ),
+                    # The response vehicle is selected from work already
+                    # heading to the same service target.  Its original task
+                    # therefore remains valid after the urgent takeover and
+                    # no unvalidated cross-map recovery leg is invented.
+                    "candidate_route_aligned_with_failed_goal": (
+                        bool(candidate_task)
+                        and task_targets.get(candidate_task) == goal_id
+                    ),
                     "p5_pair_available": (start_id, goal_id) in eligible_pairs,
                     "closed_edge_avoided": False,
                 }
@@ -145,6 +158,31 @@ def run_random_s09_structural_mock(config: Any, seed: Optional[int] = None,
                 )
                 if not all(constraints.values()):
                     continue
+                # The aligned candidate's original task has the same service
+                # goal, so completing the takeover also places it at its own
+                # destination.  Record that zero-length recovery explicitly;
+                # it is not a fabricated physical route.
+                displaced_task_goal_id = task_targets.get(candidate_task)
+                displaced_route = None
+                displaced_reachable = (
+                    bool(candidate_task)
+                    and displaced_task_goal_id == goal_id
+                )
+                displaced_avoids_closure = displaced_reachable
+                constraints.update({
+                    "displaced_task_recovery_reachable": (
+                        displaced_reachable
+                    ),
+                    "displaced_route_avoids_closure": (
+                        displaced_avoids_closure
+                    ),
+                })
+                if not all(constraints.values()):
+                    continue
+                takeover_distance = float(route["distance_m"])
+                displaced_distance = float(
+                    displaced_route.get("distance_m") or 0.0
+                ) if displaced_route else 0.0
                 candidates.append({
                     "vehicle_id": candidate_id,
                     "candidate_current_task_id": candidate_task,
@@ -154,8 +192,25 @@ def run_random_s09_structural_mock(config: Any, seed: Optional[int] = None,
                     "route_edge_ids": list(route["edge_ids"]),
                     "route_contract": route,
                     "constraint_results": constraints,
-                    "score": float(route["distance_m"]),
-                    "score_source": "safe_topology_route_length_baseline",
+                    "displaced_task_goal_point_id": (
+                        displaced_task_goal_id
+                    ),
+                    "displaced_task_recovery_route_contract": (
+                        displaced_route
+                    ),
+                    "displaced_task_recovery_distance_m": (
+                        displaced_distance
+                    ),
+                    "score": takeover_distance + displaced_distance,
+                    "cost_components": {
+                        "takeover_route_distance_m": takeover_distance,
+                        "displaced_task_recovery_distance_m": (
+                            displaced_distance
+                        ),
+                    },
+                    "score_source": (
+                        "safe_aligned_route_takeover"
+                    ),
                 })
             candidates.sort(key=lambda item: (item["score"], item["vehicle_id"]))
             if candidates:
@@ -217,6 +272,16 @@ def run_random_s09_structural_mock(config: Any, seed: Optional[int] = None,
         "route_distance_m": selected["route_distance_m"],
         "route_edge_ids": selected["route_edge_ids"],
         "route_contract": selected["route_contract"],
+        "displaced_task_goal_point_id": selected.get(
+            "displaced_task_goal_point_id"
+        ),
+        "displaced_task_recovery_route_contract": selected.get(
+            "displaced_task_recovery_route_contract"
+        ),
+        "displaced_task_recovery_distance_m": selected.get(
+            "displaced_task_recovery_distance_m"
+        ),
+        "cost_components": selected.get("cost_components", {}),
         "closed_edge_id": closed_edge_id,
         "candidate_evaluations": failure["candidates"],
         "constraint_results": selected["constraint_results"],

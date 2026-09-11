@@ -246,6 +246,24 @@ class EvidenceRecorder:
             count += 1
         return count
 
+    def record_decision_experiences(self, result: Dict[str, Any]) -> int:
+        """Persist measured decision-boundary samples without inventing reward.
+
+        The compact JSONL artifact is the future dataset source. The same
+        payload is indexed in the existing event stream, so this first data
+        contract needs neither a new database table nor a schema migration.
+        """
+        experiences = [
+            dict(item) for item in result.get("decision_experiences", [])
+            if isinstance(item, dict) and item.get("experience_id")
+        ]
+        if not experiences:
+            return 0
+        self.write_jsonl("decision_experiences.jsonl", experiences)
+        for item in experiences:
+            self.record("decision_experience_captured", item)
+        return len(experiences)
+
     def record_closed_loop_cycle(self, result: Dict[str, Any]) -> int:
         """Save the common cycle as JSON evidence and a queryable DB row."""
         cycle = result.get("closed_loop_cycle")
@@ -359,6 +377,90 @@ class EvidenceRecorder:
             )
             record_count += 1
         return record_count
+
+    def record_unified_runtime_plan(self, result: Dict[str, Any]) -> Dict[str, int]:
+        """Persist normalized decisions and CAR/route plans from CARLA runs.
+
+        The unified scenario runner already returns simulator-neutral
+        ``decisions`` and structural ``route_plans``.  CARLA additionally
+        returns one ``task_mission_plan`` per vehicle.  This method indexes
+        those existing facts; it neither creates a decision nor changes a
+        route used by the simulator.
+        """
+
+        decision_count = 0
+        for decision in result.get("decisions", []):
+            if not isinstance(decision, dict) or not decision.get("decision_id"):
+                continue
+            self.record("agent_decision", {
+                "decision_id": str(decision["decision_id"]),
+                "context": str(
+                    decision.get("decision_type") or "unified_scenario_decision"
+                ),
+                "task_id": decision.get("task_id"),
+                "tick": decision.get("tick"),
+                "source": "openpit.decision-record.v1",
+                "scheduler_agent_action": {
+                    "action_type": decision.get("action_type"),
+                    "assigned_vehicle_id": decision.get("selected_vehicle_id"),
+                    "score": decision.get("score"),
+                    "policy_version": decision.get("policy_version"),
+                    "reason": decision.get("reason"),
+                },
+                "candidate_evaluations": decision.get(
+                    "candidate_evaluations", []
+                ),
+                "constraint_results": decision.get("constraint_results", {}),
+                "safety_review": decision.get("safety_review"),
+                "route_contract": decision.get("route_contract"),
+                "native_payload": decision.get("native_payload"),
+            })
+            decision_count += 1
+
+        route_count = 0
+        for route_plan in result.get("route_plans", []):
+            if not isinstance(route_plan, dict) or not route_plan.get(
+                "route_plan_id"
+            ):
+                continue
+            self._store(
+                lambda store, item=dict(route_plan): store.record_route_plan(
+                    self.run_id, item
+                )
+            )
+            route_count += 1
+
+        mission_count = 0
+        for mission in result.get("task_mission_plans", []):
+            if not isinstance(mission, dict) or not mission.get("task_id"):
+                continue
+            task_id = str(mission["task_id"])
+            route_record = dict(mission)
+            route_record.update({
+                "route_plan_id": "{}:carla-mission".format(task_id),
+                "planner_version": "CARLA_BASIC_AGENT_EXECUTION_BRIDGE_V1",
+                "start_node": mission.get("vehicle_spawn_point_id"),
+                "goal_node": mission.get("service_target_point_id"),
+                "distance_m": (
+                    float(mission.get("deadhead_route_length_m") or 0.0)
+                    + float(mission.get("mission_route_length_m") or 0.0)
+                ),
+                "status": "CARLA_MISSION_CONFIGURED",
+                "route_record_type": "task_mission_plan",
+                "validation_status": mission.get("mission_route_evidence"),
+            })
+            self._store(
+                lambda store, item=route_record: store.record_route_plan(
+                    self.run_id, item
+                )
+            )
+            mission_count += 1
+
+        return {
+            "decision_count": decision_count,
+            "route_plan_count": route_count,
+            "task_mission_plan_count": mission_count,
+        }
 
     def record_structural_events(self, result: Dict[str, Any]) -> int:
         """Persist explicit structural facts already present in a run result."""

@@ -22,20 +22,20 @@ class EventCenterWindow(QDialog):
 实时事件时间线
 
 10:20:01
-[环境感知Agent]
+[环境感知智能体]
 检测到大风环境
 
 10:21:20
-[Risk Agent]
+[风险分析智能体]
 边坡风险 GREEN -> ORANGE
 
 10:22:05
-[Scheduler Agent]
+[任务调度智能体]
 重新分配任务:
-vehicle_02执行风险复核
+矿卡02执行风险复核
 
 10:25:10
-[Vehicle Agent]
+[车辆执行智能体]
 任务完成
 
 

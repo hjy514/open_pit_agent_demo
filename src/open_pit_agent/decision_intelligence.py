@@ -18,11 +18,98 @@ GUIDANCE_VERSION = "slope-risk-guidance-demo-v1"
 EXPERIENCE_SCHEMA_VERSION = "1.0"
 STRUCTURAL_TRANSITION_SCHEMA_VERSION = "openpit-structural-transition-v1"
 CLOSED_LOOP_TRANSITION_SCHEMA_VERSION = "openpit-closed-loop-transition-v1"
+DECISION_EXPERIENCE_TRANSITION_SCHEMA_VERSION = (
+    "openpit-decision-experience-transition-v1"
+)
 WORLD_STATE_SCHEMA_VERSION = "openpit.world-state.v1"
 DECISION_ACTION_SCHEMA_VERSION = "openpit.decision-action.v1"
 EXECUTION_FEEDBACK_SCHEMA_VERSION = "openpit.execution-feedback.v1"
 GLOBAL_ASSIGNMENT_SCHEMA_VERSION = "openpit-global-assignment-v2"
 MAX_IMITATION_BONUS_M = 2.0
+
+
+def register_offline_policy_candidate(
+    store: SqliteRunStore,
+    training_report: Dict[str, Any],
+    policy_scope: str,
+) -> Dict[str, Any]:
+    """Evaluate and register a trained candidate without promoting it."""
+
+    model_version = str(training_report.get("model_version") or "").strip()
+    dataset_version = str(training_report.get("dataset_version") or "").strip()
+    if not model_version or not dataset_version:
+        raise ValueError("training report requires model_version and dataset_version")
+    test_metrics = dict(training_report.get("metrics", {}).get("test") or {})
+    evaluated_count = int(
+        test_metrics.get("evaluable_choice_count")
+        or test_metrics.get("episode_count")
+        or 0
+    )
+    infeasible_count = int(
+        test_metrics.get("infeasible_candidate_selected_count") or 0
+    )
+    fallback_count = int(test_metrics.get("fallback_count") or 0)
+    safety_gate_passed = bool(
+        evaluated_count > 0 and infeasible_count == 0
+    )
+    evaluation_status = (
+        "OFFLINE_EVALUATED_SHADOW_ONLY"
+        if safety_gate_passed else "OFFLINE_EVALUATION_FAILED"
+    )
+    timestamp = datetime.now(timezone.utc).isoformat()
+    training_run_id = "training:{}:{}".format(
+        model_version, timestamp.replace(":", "").replace("+", "_")
+    )
+    evaluation_id = "offline:{}:{}".format(
+        model_version, timestamp.replace(":", "").replace("+", "_")
+    )
+    lifecycle = {
+        "schema_version": "openpit.policy-candidate-lifecycle.v1",
+        "status": evaluation_status,
+        "model_version": model_version,
+        "policy_name": training_report.get("policy_version"),
+        "policy_scope": str(policy_scope),
+        "dataset_version": dataset_version,
+        "dataset_source": "versioned_structural_teacher_data",
+        "carla_decision_data_used_for_training": False,
+        "evaluated_record_count": evaluated_count,
+        "infeasible_candidate_selected_count": infeasible_count,
+        "fallback_count": fallback_count,
+        "safety_gate_passed": safety_gate_passed,
+        "execution_authority": "shadow_only",
+        "promotion_status": "NOT_PROMOTED",
+        "next_stage": (
+            "manual_review_then_carla_ab_validation"
+            if safety_gate_passed else "repair_training_or_dataset"
+        ),
+    }
+    store.register_policy_version(
+        model_version=model_version,
+        policy_name=str(training_report.get("policy_version") or model_version),
+        status=evaluation_status,
+        execution_authority="shadow_only",
+        dataset_version=dataset_version,
+        model_path=training_report.get("model_path"),
+        summary=lifecycle,
+    )
+    store.record_training_run(
+        training_run_id=training_run_id,
+        model_version=model_version,
+        dataset_version=dataset_version,
+        policy_scope=str(policy_scope),
+        status=str(training_report.get("status") or "TRAINED"),
+        report_path=training_report.get("training_report_path"),
+        summary=training_report,
+        started_at=training_report.get("created_at"),
+    )
+    store.record_policy_evaluation(
+        evaluation_id=evaluation_id,
+        model_version=model_version,
+        evaluation_type="offline_holdout",
+        status=evaluation_status,
+        metrics={"test": test_metrics, "lifecycle": lifecycle},
+    )
+    return lifecycle
 
 
 def _closed_loop_done(next_state: Dict[str, Any]) -> Tuple[Optional[bool], str]:
@@ -145,11 +232,120 @@ def _build_closed_loop_transition(row: Dict[str, Any]) -> Tuple[Optional[Dict[st
                 and row.get("status") == "SUCCEEDED"
                 and safety_status in ("APPROVED", "MODIFIED", "PASS")
             ),
+            "eligible_for_offline_optimization_analysis": bool(
+                action_type and feedback_schemas_valid
+                and row.get("physical_execution")
+                and row.get("measurement_status") == "CARLA_MEASURED"
+            ),
             "compatible_with_current_task_level_bc_trainer": False,
             "eligible_for_ppo_training": False,
         },
     }
     return record, []
+
+
+def _closed_loop_learning_readiness(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Describe what stored cycles can honestly support today.
+
+    Failed physical runs are valuable failure-analysis samples, so they remain
+    in the dataset.  They are kept separate from successful demonstrations and
+    never make a dataset look ready for automatic policy promotion.
+    """
+
+    def counts(values):
+        result = {}
+        for value in values:
+            key = str(value if value is not None else "NOT_AVAILABLE")
+            result[key] = result.get(key, 0) + 1
+        return dict(sorted(result.items()))
+
+    physical = [
+        item for item in records
+        if bool(item.get("result", {}).get("physical_execution"))
+    ]
+    successful = [
+        item for item in records
+        if item.get("episode", {}).get("run_status") == "PASS"
+        and item.get("cycle", {}).get("status") == "SUCCEEDED"
+    ]
+    physical_successful = [item for item in successful if item in physical]
+    physical_failures = [item for item in physical if item not in physical_successful]
+    demonstrations = [
+        item for item in records
+        if item.get("data_quality", {}).get(
+            "eligible_for_behavior_cloning_preparation"
+        )
+    ]
+    optimization_records = [
+        item for item in records
+        if item.get("data_quality", {}).get(
+            "eligible_for_offline_optimization_analysis"
+        )
+    ]
+
+    physical_policy_groups: Dict[Tuple[str, Any], set] = {}
+    for item in physical:
+        policy = item.get("policy_version")
+        episode = item.get("episode", {})
+        if not policy:
+            continue
+        key = (str(episode.get("scenario_key")), episode.get("seed"))
+        physical_policy_groups.setdefault(key, set()).add(str(policy))
+    comparable_groups = [
+        {
+            "scenario_key": key[0],
+            "seed": key[1],
+            "policy_versions": sorted(policies),
+        }
+        for key, policies in sorted(
+            physical_policy_groups.items(), key=lambda item: str(item[0])
+        )
+        if len(policies) >= 2
+    ]
+
+    if not records:
+        collection_status = "NO_CLOSED_LOOP_DATA"
+    elif not physical:
+        collection_status = "STRUCTURAL_DATA_ONLY"
+    else:
+        collection_status = "PHYSICAL_CLOSED_LOOP_DATA_AVAILABLE"
+    if not optimization_records:
+        analysis_status = "NOT_READY_NO_CARLA_MEASURED_CYCLES"
+    else:
+        analysis_status = "READY_FOR_OFFLINE_ANALYSIS"
+
+    return {
+        "collection_status": collection_status,
+        "offline_analysis_status": analysis_status,
+        "automatic_policy_update": "DISABLED_BY_DESIGN",
+        "policy_promotion_status": (
+            "NOT_READY_NO_VALIDATED_REWARD_OR_PHYSICAL_AB"
+            if not comparable_groups
+            else "PHYSICAL_AB_DATA_AVAILABLE_REVIEW_REQUIRED"
+        ),
+        "record_count": len(records),
+        "successful_cycle_record_count": len(successful),
+        "failure_or_partial_cycle_record_count": len(records) - len(successful),
+        "physical_record_count": len(physical),
+        "physical_success_record_count": len(physical_successful),
+        "physical_failure_record_count": len(physical_failures),
+        "structural_record_count": len(records) - len(physical),
+        "successful_demonstration_count": len(demonstrations),
+        "offline_optimization_analysis_record_count": len(optimization_records),
+        "scenario_counts": counts(
+            item.get("episode", {}).get("scenario_key") for item in records
+        ),
+        "policy_counts": counts(item.get("policy_version") for item in records),
+        "physical_comparable_scenario_seed_count": len(comparable_groups),
+        "physical_comparable_scenario_seeds": comparable_groups,
+        "next_required_step": (
+            "RUN_FIXED_SEED_PHYSICAL_POLICY_AB_AND_DEFINE_VALIDATED_METRICS"
+        ),
+        "boundary": (
+            "CARLA measured success and failure cycles support offline analysis; "
+            "they do not authorize automatic training or policy promotion."
+        ),
+    }
 
 
 def export_closed_loop_transition_dataset(
@@ -206,9 +402,12 @@ def export_closed_loop_transition_dataset(
         {"check": "experience_ids_unique",
          "passed": len(experience_ids) == len(set(experience_ids)),
          "detail": len(experience_ids) - len(set(experience_ids))},
-        {"check": "source_runs_passed", "passed": all(
-            item["episode"].get("run_status") == "PASS" for item in records
+        {"check": "source_run_status_present", "passed": all(
+            bool(item["episode"].get("run_status")) for item in records
         ), "detail": counts(item["episode"].get("run_status") for item in records)},
+        {"check": "cycle_status_present", "passed": all(
+            bool(item["cycle"].get("status")) for item in records
+        ), "detail": counts(item["cycle"].get("status") for item in records)},
     ]
     quality_status = (
         "DATASET_QUALITY_PASS" if all(item["passed"] for item in checks)
@@ -253,6 +452,7 @@ def export_closed_loop_transition_dataset(
             )) for item in records
         ),
         "ppo_eligible_record_count": 0,
+        "learning_readiness": _closed_loop_learning_readiness(records),
         "dataset_quality": {"status": quality_status, "checks": checks},
         "transition_contract": {
             "state": WORLD_STATE_SCHEMA_VERSION,
@@ -296,6 +496,490 @@ def load_structural_reward_config(path: Path) -> Dict[str, Any]:
         "normalization": str(config.get("normalization")),
         "weights": normalized,
     }
+
+
+def load_decision_experience_reward_config(path: Path) -> Dict[str, Any]:
+    """Load explicit, non-optimal weights for measured CARLA decisions."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    config = payload.get("decision_experience_reward")
+    if not isinstance(config, dict):
+        raise ValueError("decision config requires decision_experience_reward")
+    weights = config.get("weights")
+    if not isinstance(weights, dict) or not weights:
+        raise ValueError("decision_experience_reward requires non-empty weights")
+    normalized = {str(name): float(value) for name, value in weights.items()}
+    if any(value < 0 for value in normalized.values()) or not any(
+        normalized.values()
+    ):
+        raise ValueError(
+            "decision experience reward weights must be non-negative and not all zero"
+        )
+    return {
+        "reward_version": str(config.get("reward_version")),
+        "weight_status": str(config.get("weight_status")),
+        "normalization": str(config.get("normalization")),
+        "weights": normalized,
+    }
+
+
+def _terminal_decision_state(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Project recorded terminal task/vehicle facts without reconstruction."""
+    vehicles = {
+        str(item.get("vehicle_id")): dict(item)
+        for item in summary.get("final_vehicle_states", [])
+        if isinstance(item, dict) and item.get("vehicle_id")
+    }
+    return {
+        "tick": summary.get("ticks_executed"),
+        "tasks": [{
+            "task_id": item.get("task_id"),
+            "assigned_vehicle_id": item.get("assigned_vehicle_id"),
+            "status": item.get("status"),
+            "last_distance_m": item.get("last_distance_m"),
+            "vehicle": vehicles.get(str(item.get("assigned_vehicle_id"))),
+        } for item in summary.get("tasks", []) if isinstance(item, dict)],
+    }
+
+
+def _task_status_counts(state: Dict[str, Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in state.get("tasks", []) if isinstance(state, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "unknown").lower()
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _explicit_safety_statuses(action: Dict[str, Any]) -> List[str]:
+    statuses = []
+    for key in ("safety_gate_status", "safety_status"):
+        if action.get(key) is not None:
+            statuses.append(str(action[key]).upper())
+    for point in action.get("decision_points", []):
+        if not isinstance(point, dict):
+            continue
+        review = point.get("safety_review")
+        if isinstance(review, dict) and review.get("status") is not None:
+            statuses.append(str(review["status"]).upper())
+    return statuses
+
+
+def _decision_interval_reward(
+    state: Dict[str, Any], action: Dict[str, Any], next_state: Dict[str, Any],
+    done: bool, summary: Dict[str, Any], config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Score one observed decision interval; never infer missing mine facts."""
+    before = _task_status_counts(state)
+    after = _task_status_counts(next_state)
+    task_count = int(summary.get("task_count") or sum(after.values()) or 0)
+    denominator = float(task_count) if task_count > 0 else None
+
+    before_tick = state.get("tick") if isinstance(state, dict) else None
+    after_tick = next_state.get("tick") if isinstance(next_state, dict) else None
+    budget = int(summary.get("effective_execution_ticks") or 0)
+    elapsed = (
+        max(0, int(after_tick) - int(before_tick))
+        if before_tick is not None and after_tick is not None else None
+    )
+    bad_statuses = ("failed", "stuck", "timed_out", "cancelled")
+    new_failures = sum(
+        max(0, after.get(name, 0) - before.get(name, 0))
+        for name in bad_statuses
+    )
+    switch_actions = {
+        "reassign_task", "reassign_released_task",
+        "reassign_waiting_task_after_capacity_available",
+        "runtime_task_recovery", "task_takeover_during_road_closure",
+    }
+    controls = [
+        item for item in action.get("controls", []) if isinstance(item, dict)
+    ]
+    switch_count = sum(
+        str(item.get("action_type") or item.get("action")) in switch_actions
+        or "reassign" in str(item.get("action_type") or item.get("action") or "")
+        for item in controls
+    )
+    safety_statuses = _explicit_safety_statuses(action)
+    rejected = sum(
+        item in {"REJECTED", "BLOCKED", "DENIED", "UNSAFE"}
+        for item in safety_statuses
+    )
+
+    components = {
+        "task_completion_progress": {
+            "value": (
+                min(1.0, max(0.0, (
+                    after.get("completed", 0) - before.get("completed", 0)
+                ) / denominator)) if denominator else None
+            ),
+            "availability": "available" if denominator else "not_available",
+            "source": "state.tasks.status_delta",
+        },
+        "terminal_success": {
+            "value": (
+                1.0 if done and summary.get("status") == "PASS"
+                else -1.0 if done else 0.0
+            ),
+            "availability": "available",
+            "source": "scenario_runs.status_and_terminal_task_state",
+        },
+        "elapsed_time_cost": {
+            "value": (
+                -min(1.0, float(elapsed) / float(budget))
+                if elapsed is not None and budget > 0 else None
+            ),
+            "availability": (
+                "available" if elapsed is not None and budget > 0
+                else "not_available"
+            ),
+            "source": "decision_tick_interval_over_effective_execution_ticks",
+            "raw_elapsed_ticks": elapsed,
+            "normalization_ticks": budget or None,
+        },
+        "terminal_failure_cost": {
+            "value": -min(1.0, new_failures / denominator) if denominator else None,
+            "availability": "available" if denominator else "not_available",
+            "source": "state.tasks.failure_status_delta",
+        },
+        "task_switch_cost": {
+            "value": -min(1.0, switch_count / denominator) if denominator else None,
+            "availability": "available" if denominator else "not_available",
+            "source": "executed_reassignment_controls",
+            "observed_switch_count": switch_count,
+        },
+        "safety_violation_cost": {
+            "value": (
+                -min(1.0, rejected / float(len(safety_statuses)))
+                if safety_statuses else None
+            ),
+            "availability": "available" if safety_statuses else "not_available",
+            "source": "explicit_safety_gate_or_decision_point_status",
+            "observed_statuses": safety_statuses,
+        },
+    }
+    weighted = []
+    for name, component in components.items():
+        weight = float(config["weights"].get(name, 0.0))
+        component["weight"] = weight
+        value = component.get("value")
+        if value is not None and weight > 0:
+            weighted.append((weight, float(value)))
+    weight_sum = sum(item[0] for item in weighted)
+    value = (
+        round(sum(weight * score for weight, score in weighted) / weight_sum, 6)
+        if weight_sum else None
+    )
+    return {
+        "value": value,
+        "status": (
+            "CARLA_DECISION_INTERVAL_REWARD_AVAILABLE"
+            if value is not None else "NOT_AVAILABLE_NO_OBSERVED_COMPONENTS"
+        ),
+        "reward_version": config["reward_version"],
+        "weight_status": config["weight_status"],
+        "normalization": config["normalization"],
+        "components": components,
+    }
+
+
+def export_decision_experience_transition_dataset(
+    database_path: Path, datasets_root: Path, dataset_id: str,
+    reward_config: Dict[str, Any],
+    scenario_keys: Optional[Sequence[str]] = None,
+    run_ids: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Export recorded CARLA decision boundaries as immutable transitions."""
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$", str(dataset_id)):
+        raise ValueError("dataset id must use 1-80 safe filename characters")
+    database_path = Path(database_path).expanduser().resolve()
+    if not database_path.is_file():
+        raise ValueError("openpit database does not exist: {}".format(database_path))
+    store = SqliteRunStore(database_path)
+    try:
+        sql = """
+            SELECT e.event_id,e.run_id,e.timestamp,e.payload_json,
+                   r.scenario_id,r.scenario_seed,r.scenario_mode,
+                   r.simulator_mode,r.status,r.summary_json
+            FROM events AS e
+            JOIN scenario_runs AS r ON r.run_id=e.run_id
+            WHERE e.event_type='decision_experience_captured'
+        """
+        parameters: List[Any] = []
+        keys = sorted(set(str(item) for item in (scenario_keys or ())))
+        ids = sorted(set(str(item) for item in (run_ids or ())))
+        if ids:
+            sql += " AND e.run_id IN ({})".format(
+                ",".join("?" for _ in ids)
+            )
+            parameters.extend(ids)
+        sql += " ORDER BY e.run_id,e.tick,e.event_id"
+        rows = store.connection.execute(sql, parameters).fetchall()
+    finally:
+        store.close()
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    skipped = []
+    for row in rows:
+        try:
+            payload = json.loads(row[3])
+            summary = json.loads(row[9]) if row[9] else {}
+        except (TypeError, ValueError) as exc:
+            skipped.append({"run_id": row[1], "event_id": row[0], "reason": str(exc)})
+            continue
+        if payload.get("schema_version") != "openpit.decision-experience.v1":
+            skipped.append({
+                "run_id": row[1], "event_id": row[0],
+                "reason": "unsupported_decision_experience_schema",
+            })
+            continue
+        if keys and str(payload.get("scenario_key")) not in keys:
+            continue
+        grouped.setdefault(str(row[1]), []).append({
+            "event_id": row[0], "timestamp": row[2], "payload": payload,
+            "scenario_id": row[4], "seed": row[5],
+            "scenario_mode": row[6], "simulator_mode": row[7],
+            "run_status": row[8], "summary": summary,
+        })
+
+    records = []
+    for run_id, items in sorted(grouped.items()):
+        summary = items[0]["summary"]
+        terminal_state = _terminal_decision_state(summary)
+        for index, source in enumerate(items):
+            payload = source["payload"]
+            state = payload.get("state_before")
+            action = payload.get("action")
+            next_state = (
+                items[index + 1]["payload"].get("state_before")
+                if index + 1 < len(items) else terminal_state
+            )
+            if not all(isinstance(item, dict) for item in (state, action, next_state)):
+                skipped.append({
+                    "run_id": run_id, "event_id": source["event_id"],
+                    "reason": "invalid_state_action_or_next_state",
+                })
+                continue
+            statuses = _task_status_counts(next_state)
+            terminal = {"completed", "cancelled", "failed", "timed_out", "stuck"}
+            done = bool(statuses) and set(statuses).issubset(terminal)
+            reward = _decision_interval_reward(
+                state, action, next_state, done, summary, reward_config
+            )
+            records.append({
+                "schema_version": DECISION_EXPERIENCE_TRANSITION_SCHEMA_VERSION,
+                "experience_id": "{}:{}".format(run_id, payload["experience_id"]),
+                "episode": {
+                    "run_id": run_id,
+                    "scenario_id": source["scenario_id"],
+                    "scenario_key": payload.get("scenario_key"),
+                    "seed": source["seed"],
+                    "scenario_mode": source["scenario_mode"],
+                    "simulation_mode": source["simulator_mode"],
+                    "run_status": source["run_status"],
+                },
+                "decision": {
+                    "transition_kind": payload.get("transition_kind"),
+                    "decision_tick": payload.get("decision_tick"),
+                    "measurement_status": payload.get("measurement_status"),
+                },
+                "state": state,
+                "action": action,
+                "route_context": payload.get("route_context", []),
+                "state_after_action": payload.get("state_after"),
+                "next_state": next_state,
+                "reward": reward["value"],
+                "reward_status": reward["status"],
+                "reward_detail": reward,
+                "done": done,
+                "done_status": "DERIVED_FROM_RECORDED_NEXT_STATE_TASK_STATUS",
+                "data_quality": {
+                    "source": "openpit.db.events.decision_experience_captured",
+                    "physical_execution": True,
+                    "measurement_status": payload.get("measurement_status"),
+                    "real_mine_data": False,
+                    "eligible_for_offline_analysis": reward["value"] is not None,
+                    "eligible_for_behavior_cloning_preparation": (
+                        source["run_status"] == "PASS"
+                    ),
+                    "eligible_for_ppo_training": False,
+                },
+            })
+
+    output_dir = (
+        Path(datasets_root) / DECISION_EXPERIENCE_TRANSITION_SCHEMA_VERSION
+        / str(dataset_id)
+    )
+    output_dir.mkdir(parents=True, exist_ok=False)
+    transitions_path = output_dir / "transitions.jsonl"
+    with transitions_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def counts(values):
+        output: Dict[str, int] = {}
+        for value in values:
+            key = str(value if value is not None else "NOT_AVAILABLE")
+            output[key] = output.get(key, 0) + 1
+        return dict(sorted(output.items()))
+
+    scenario_run_ids: Dict[str, set] = {}
+    scenario_seeds: Dict[str, set] = {}
+    run_status_by_id = {}
+    for record in records:
+        episode = record["episode"]
+        scenario_key = str(episode.get("scenario_key"))
+        scenario_run_ids.setdefault(scenario_key, set()).add(episode.get("run_id"))
+        scenario_seeds.setdefault(scenario_key, set()).add(episode.get("seed"))
+        run_status_by_id[str(episode.get("run_id"))] = episode.get("run_status")
+    scenario_run_counts = {
+        key: len(value) for key, value in sorted(scenario_run_ids.items())
+    }
+    seed_coverage = {
+        key: sorted(value, key=lambda item: str(item))
+        for key, value in sorted(scenario_seeds.items())
+    }
+    required_scenarios = set(str(item) for item in (scenario_keys or ()))
+    if not required_scenarios:
+        required_scenarios = (
+            set(scenario_run_ids) if run_ids
+            else {"s01", "s02", "s04", "s09"}
+        )
+    observed_scenarios = set(scenario_run_ids)
+    component_availability: Dict[str, Dict[str, int]] = {}
+    for record in records:
+        for name, component in record.get("reward_detail", {}).get(
+            "components", {}
+        ).items():
+            status = str(component.get("availability") or "not_available")
+            target = component_availability.setdefault(str(name), {})
+            target[status] = target.get(status, 0) + 1
+    terminal_record_count = sum(bool(item["done"]) for item in records)
+    checks = [
+        {"check": "records_present", "passed": bool(records), "detail": len(records)},
+        {"check": "stored_rows_parseable", "passed": not skipped, "detail": len(skipped)},
+        {"check": "experience_ids_unique", "passed": len(records) == len({
+            item["experience_id"] for item in records
+        }), "detail": len(records)},
+        {"check": "reward_available", "passed": all(
+            item.get("reward") is not None for item in records
+        ), "detail": sum(item.get("reward") is not None for item in records)},
+        {"check": "requested_scenarios_covered", "passed": (
+            required_scenarios.issubset(observed_scenarios)
+        ), "detail": {
+            "required": sorted(required_scenarios),
+            "observed": sorted(observed_scenarios),
+            "missing": sorted(required_scenarios - observed_scenarios),
+        }},
+        {"check": "one_terminal_transition_per_run", "passed": (
+            terminal_record_count == len(grouped)
+        ), "detail": {
+            "terminal_records": terminal_record_count,
+            "source_runs": len(grouped),
+        }},
+        {"check": "carla_measurement_status_present", "passed": all(
+            item.get("decision", {}).get("measurement_status")
+            == "CARLA_MEASURED" for item in records
+        ), "detail": counts(
+            item.get("decision", {}).get("measurement_status")
+            for item in records
+        )},
+    ]
+    quality = (
+        "DATASET_QUALITY_PASS" if all(item["passed"] for item in checks)
+        else "DATASET_QUALITY_WARN"
+    )
+    rewards = [float(item["reward"]) for item in records if item.get("reward") is not None]
+    manifest = {
+        "schema_version": DECISION_EXPERIENCE_TRANSITION_SCHEMA_VERSION,
+        "dataset_id": str(dataset_id),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_database": str(database_path),
+        "source_event_type": "decision_experience_captured",
+        "scenario_filter": sorted(set(scenario_keys or ())),
+        "run_id_filter": sorted(set(run_ids or ())),
+        "source_run_count": len(grouped),
+        "record_count": len(records),
+        "skipped_record_count": len(skipped),
+        "skipped_records": skipped,
+        "reward_version": reward_config["reward_version"],
+        "reward_weight_status": reward_config["weight_status"],
+        "coverage": {
+            "required_scenarios": sorted(required_scenarios),
+            "observed_scenarios": sorted(observed_scenarios),
+            "scenario_record_counts": counts(
+                item.get("episode", {}).get("scenario_key") for item in records
+            ),
+            "scenario_run_counts": scenario_run_counts,
+            "seed_coverage": seed_coverage,
+            "unique_seed_count": len({
+                item.get("episode", {}).get("seed") for item in records
+            }),
+            "transition_kind_counts": counts(
+                item.get("decision", {}).get("transition_kind")
+                for item in records
+            ),
+            "run_status_counts": counts(run_status_by_id.values()),
+        },
+        "reward_summary": {
+            "status": "AVAILABLE_FOR_OFFLINE_ANALYSIS" if rewards else "NOT_AVAILABLE",
+            "available_record_count": len(rewards),
+            "minimum": min(rewards) if rewards else None,
+            "maximum": max(rewards) if rewards else None,
+            "mean": round(sum(rewards) / len(rewards), 6) if rewards else None,
+            "component_availability": {
+                key: dict(sorted(value.items()))
+                for key, value in sorted(component_availability.items())
+            },
+            "by_scenario": {
+                key: {
+                    "count": len(values),
+                    "minimum": min(values),
+                    "maximum": max(values),
+                    "mean": round(sum(values) / len(values), 6),
+                }
+                for key, values in sorted({
+                    scenario: [
+                        float(item["reward"]) for item in records
+                        if item.get("episode", {}).get("scenario_key") == scenario
+                        and item.get("reward") is not None
+                    ]
+                    for scenario in observed_scenarios
+                }.items()) if values
+            },
+        },
+        "terminal_record_count": terminal_record_count,
+        "ppo_eligible_record_count": 0,
+        "learning_readiness": {
+            "status": (
+                "READY_FOR_MULTI_SEED_OFFLINE_ANALYSIS"
+                if scenario_seeds and all(len(value) >= 2 for value in scenario_seeds.values())
+                else "BASELINE_DATA_AVAILABLE_MORE_SEEDS_REQUIRED"
+            ),
+            "minimum_recommended_seeds_per_scenario": 2,
+            "behavior_cloning_preparation_record_count": sum(
+                bool(item.get("data_quality", {}).get(
+                    "eligible_for_behavior_cloning_preparation"
+                )) for item in records
+            ),
+            "automatic_policy_update": "DISABLED_BY_DESIGN",
+            "policy_promotion": "NOT_AUTHORIZED",
+        },
+        "dataset_quality": {"status": quality, "checks": checks},
+        "transitions_path": str(transitions_path),
+        "limitations": [
+            "synthetic_carla_scenarios_are_not_real_mine_data",
+            "initial_equal_reward_weights_are_not_validated_as_optimal",
+            "not_authorized_for_automatic_policy_update_or_ppo_training",
+        ],
+    }
+    manifest_path = output_dir / "manifest.json"
+    manifest["manifest_path"] = str(manifest_path)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
 
 
 def _evaluate_structural_reward(

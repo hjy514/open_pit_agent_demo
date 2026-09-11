@@ -15,10 +15,12 @@ from fastapi.responses import FileResponse
 
 from open_pit_agent.control import ControlError, UnifiedScenarioControlManager
 from open_pit_agent.runtime_state import runtime
+from open_pit_agent.sqlite_store import SqliteRunStore
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CAMERA_ROOT = PROJECT_ROOT / "artifacts" / "live_cameras"
+RUN_DATABASE = PROJECT_ROOT / "data" / "database" / "openpit.db"
 scenario_control = UnifiedScenarioControlManager(PROJECT_ROOT)
 
 
@@ -46,7 +48,25 @@ def root():
         "camera_endpoint": "/camera/streams",
         "scenario_catalog_endpoint": "/scenario/catalog",
         "scenario_control_endpoint": "/scenario/control/status",
+        "learning_status_endpoint": "/learning/status",
     }
+
+
+@app.get("/learning/status")
+def learning_status(minimum_valid_runs: int = Query(20, ge=1, le=10000)):
+    if not RUN_DATABASE.is_file():
+        return {
+            "schema_version": "openpit.learning-status.v1",
+            "status": "DATABASE_UNAVAILABLE",
+            "database_path": str(RUN_DATABASE),
+            "automatic_online_update": False,
+            "automatic_promotion": False,
+        }
+    store = SqliteRunStore(RUN_DATABASE)
+    try:
+        return store.learning_status_report(minimum_valid_runs)
+    finally:
+        store.close()
 
 
 @app.get("/scenario/catalog")

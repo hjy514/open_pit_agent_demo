@@ -23,9 +23,17 @@ from widgets.map_widget import MapWidget
 from widgets.vehicle_panel import VehiclePanel
 from windows.ai_agent_window import AIAgentWindow
 from windows.human_dispatch_window import HumanDispatchWindow
+from ui.vehicle_labels import (
+    action_label,
+    mode_label,
+    phase_label,
+    policy_label,
+    vehicle_count_label,
+)
 
 
 API_BASE_URL = "http://127.0.0.1:8000"
+COMPETITION_SCENARIO_IDS = {"s01", "s02", "s04", "s08", "s09"}
 
 
 class MainWindow(QMainWindow):
@@ -67,8 +75,13 @@ class MainWindow(QMainWindow):
         self.agent_window.show()
 
     def show_dispatch_window(self):
-        self.dispatch_window = HumanDispatchWindow()
+        if self.dispatch_window is None:
+            self.dispatch_window = HumanDispatchWindow()
+        else:
+            self.dispatch_window.refresh_data()
         self.dispatch_window.show()
+        self.dispatch_window.raise_()
+        self.dispatch_window.activateWindow()
 
     def create_scenario_control(self):
         frame = QFrame()
@@ -94,7 +107,7 @@ class MainWindow(QMainWindow):
         self.scenario_vehicle_combo = QComboBox()
         layout.addWidget(self.scenario_vehicle_combo)
 
-        layout.addWidget(QLabel("Seed"))
+        layout.addWidget(QLabel("随机种子"))
         self.scenario_seed = QSpinBox()
         self.scenario_seed.setRange(0, 2147483647)
         self.scenario_seed.setValue(202616)
@@ -128,7 +141,7 @@ class MainWindow(QMainWindow):
         self.scenario_end_button.clicked.connect(self.end_scenario)
         layout.addWidget(self.scenario_end_button)
 
-        self.scenario_status = QLabel("场景控制：等待API")
+        self.scenario_status = QLabel("场景控制：等待智能体服务")
         self.scenario_status.setMinimumWidth(190)
         layout.addWidget(self.scenario_status, 1)
         return frame
@@ -139,7 +152,15 @@ class MainWindow(QMainWindow):
                 API_BASE_URL + "/scenario/catalog", timeout=1.5
             )
             response.raise_for_status()
-            self.scenario_catalog = response.json().get("scenarios", [])
+            # The backend keeps the complete engineering catalog for command
+            # line regression and later expansion.  The competition UI only
+            # exposes the four accepted multi-vehicle scenarios plus the
+            # preserved slope Golden Demo, so operators are not distracted by
+            # unfinished research entries.
+            self.scenario_catalog = [
+                item for item in response.json().get("scenarios", [])
+                if item.get("scenario_id") in COMPETITION_SCENARIO_IDS
+            ]
             selected = self.scenario_combo.currentData()
             self.scenario_combo.blockSignals(True)
             self.scenario_combo.clear()
@@ -169,19 +190,24 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         self.scenario_mode_combo.clear()
-        self.scenario_mode_combo.addItems(item.get("modes", []))
+        for mode in item.get("modes", []):
+            self.scenario_mode_combo.addItem(mode_label(mode), mode)
         self.scenario_vehicle_combo.clear()
         for value in item.get("vehicle_counts", []):
-            self.scenario_vehicle_combo.addItem(str(value), int(value))
+            self.scenario_vehicle_combo.addItem(
+                vehicle_count_label(value, scenario_id), int(value)
+            )
         default_count = item.get("default_vehicle_count")
         index = self.scenario_vehicle_combo.findData(default_count)
         if index >= 0:
             self.scenario_vehicle_combo.setCurrentIndex(index)
         self.scenario_policy_combo.clear()
-        self.scenario_policy_combo.addItem("auto")
+        self.scenario_policy_combo.addItem(policy_label("auto"), "auto")
         for policy in item.get("policies", []):
             if policy != "auto":
-                self.scenario_policy_combo.addItem(policy)
+                self.scenario_policy_combo.addItem(
+                    policy_label(policy), policy
+                )
         fixed_golden = item.get("implementation_mode") == (
             "legacy_golden_compatibility_adapter"
         )
@@ -193,11 +219,13 @@ class MainWindow(QMainWindow):
             self.scenario_random_seed.setChecked(False)
         self.scenario_policy_combo.setEnabled(not fixed_golden)
         self.on_scenario_mode_changed(
-            self.scenario_mode_combo.currentText()
+            self.scenario_mode_combo.currentData()
         )
 
     def on_scenario_mode_changed(self, mode):
-        carla_mode = str(mode) == "carla"
+        carla_mode = str(
+            self.scenario_mode_combo.currentData() or mode
+        ) == "carla"
         self.scenario_check_only.setEnabled(carla_mode)
         if not carla_mode:
             self.scenario_check_only.setChecked(False)
@@ -219,11 +247,11 @@ class MainWindow(QMainWindow):
             return
         payload = {
             "scenario_id": self.scenario_combo.currentData(),
-            "mode": self.scenario_mode_combo.currentText(),
+            "mode": self.scenario_mode_combo.currentData(),
             "vehicle_count": self.scenario_vehicle_combo.currentData(),
             "seed": self.scenario_seed.value(),
             "random_seed": self.scenario_random_seed.isChecked(),
-            "policy": self.scenario_policy_combo.currentText(),
+            "policy": self.scenario_policy_combo.currentData(),
             "check_only": self.scenario_check_only.isChecked(),
         }
         try:
@@ -316,7 +344,7 @@ class MainWindow(QMainWindow):
             if completed is not None and total is not None else ""
         )
         phase = status.get("current_phase")
-        phase_text = " ｜ 阶段 {}".format(phase) if phase else ""
+        phase_text = " ｜ 阶段 {}".format(phase_label(phase)) if phase else ""
         self.scenario_status.setText(
             "场景控制：{} {}{}{}".format(
                 scenario, state_labels.get(state, state), task_text, phase_text
@@ -373,7 +401,7 @@ class MainWindow(QMainWindow):
             )
             self.scenario_policy_combo.setEnabled(not fixed_golden)
             self.scenario_check_only.setEnabled(
-                self.scenario_mode_combo.currentText() == "carla"
+                self.scenario_mode_combo.currentData() == "carla"
             )
 
         paused = state == "paused"
@@ -413,27 +441,30 @@ class MainWindow(QMainWindow):
             if not point_id or point_id in self._shown_decision_point_ids:
                 continue
             self._shown_decision_point_ids.add(point_id)
-            action_type = point.get("action_type", "事件响应")
-            reason = point.get("reason", "")
-            answer = QMessageBox.question(
-                self,
-                "需要人工确认的调度决策",
-                "场景事件已触发，需要确认后才能继续执行。\n\n"
-                "决策：{}\n原因：{}\n\n"
-                "是否批准推荐方案？".format(action_type, reason),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+            action_type = action_label(
+                point.get("action_type", "事件响应")
             )
-            response_value = "approve" if answer == QMessageBox.StandardButton.Yes else "reject"
-            try:
-                resolved = requests.post(
-                    API_BASE_URL + "/decision-points/{}/resolve".format(point_id),
-                    json={"response": response_value, "source": "dispatch_center_popup"},
-                    timeout=1.5,
-                )
-                resolved.raise_for_status()
-            except requests.RequestException as exc:
-                QMessageBox.warning(self, "决策提交失败", str(exc))
+            reason = point.get("reason", "")
+            notice = QMessageBox(self)
+            notice.setIcon(QMessageBox.Icon.Warning)
+            notice.setWindowTitle("调度事件提醒")
+            notice.setText("场景事件已触发，车队正在安全等待。")
+            notice.setInformativeText(
+                "建议响应：{}\n原因：{}\n\n"
+                "请进入调度决策中心，查看候选车辆、代价和"
+                "安全约束后下派任务。".format(action_type, reason)
+            )
+            open_button = notice.addButton(
+                "进入调度决策中心",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            notice.addButton(
+                "稍后处理（保持安全等待）",
+                QMessageBox.ButtonRole.RejectRole,
+            )
+            notice.exec()
+            if notice.clickedButton() is open_button:
+                self.show_dispatch_window()
             break
 
     def init_ui(self):
@@ -491,14 +522,14 @@ class MainWindow(QMainWindow):
         agent_frame.setFrameShape(QFrame.Shape.Box)
         agent_layout = QVBoxLayout()
 
-        agent_title = QLabel("AI Agent决策中心")
+        agent_title = QLabel("智能体决策中心")
         agent_title.setStyleSheet(
             "font-size:20px;font-weight:bold;"
         )
         agent_layout.addWidget(agent_title)
 
         agent_button = QPushButton(
-            "展开AI Agent决策中心"
+            "展开智能体决策中心"
         )
         agent_button.clicked.connect(
             self.show_agent_window
@@ -507,7 +538,7 @@ class MainWindow(QMainWindow):
 
         dispatch_summary = QLabel(
             "人机协同状态：\n"
-            "AI方案等待调度员确认"
+            "智能方案等待调度员确认"
         )
         agent_layout.addWidget(dispatch_summary)
 

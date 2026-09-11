@@ -15,7 +15,10 @@ from ..map_resources import MapResourceStore, route_plans_from_store
 from ..runtime_state import RuntimeState
 from .catalog import load_scenario_catalog, scenario_spec
 from .fleet import vehicle_state_snapshot
-from .models import ScenarioLifecycle, normalize_scenario_run_result
+from .models import (
+    DECISION_POINT_SCHEMA_VERSION, ScenarioLifecycle,
+    normalize_scenario_run_result,
+)
 from .random_s01 import prepare_random_map_workload
 
 
@@ -37,6 +40,11 @@ FLEET_IMMEDIATE_LAUNCH_COUNT = 1
 FLEET_BASE_LAUNCH_GAP_TICKS = 120
 FLEET_DENSITY_GAP_TICKS = 20
 RUNTIME_TELEMETRY_INTERVAL_TICKS = 100
+# UI snapshots are deliberately more frequent than persisted telemetry.
+# At the 0.05 s fixed simulation step this is one map update every 0.5 s,
+# without multiplying database/runtime-result telemetry volume by ten.
+UI_RUNTIME_PUBLISH_INTERVAL_TICKS = 10
+RUNTIME_HEARTBEAT_INTERVAL_TICKS = 200
 # Runtime traffic coordination is a shared safety service for every CARLA
 # scenario, not an S06-only event.  It supplements (and does not replace)
 # static route-edge admission: the latter prevents known conflicts before
@@ -53,6 +61,7 @@ TRAFFIC_LOW_SPEED_MPS = 0.80
 TRAFFIC_BLOCK_CONFIRMATION_SAMPLES = 2
 TRAFFIC_MIN_HOLD_TICKS = 40
 TRAFFIC_ESCALATION_TICKS = 400
+TRAFFIC_MAX_TASK_WAIT_TICKS = 1200
 # These are lifecycle guards, not normal scene durations.  An event's seeded
 # time is only its earliest eligible time; a live fleet must first launch and
 # demonstrate measurable task progress.  A stalled task receives one
@@ -66,6 +75,7 @@ MAX_NAVIGATION_RESTARTS = 1
 MAX_FORWARD_RECOVERY_MANEUVERS = 1
 MAX_RUNTIME_TASK_REASSIGNMENTS = 1
 SAFETY_WATCHDOG_EXTENSION_TICKS = STUCK_WINDOW_TICKS
+MAX_SAFETY_WATCHDOG_EXTENSIONS = 4
 P6_DEFAULT_CONCURRENT_ROUTE_CAPACITY = 1
 CARLA_LOADING_SERVICE_TICKS = 100
 CARLA_DUMPING_SERVICE_TICKS = 60
@@ -498,6 +508,52 @@ def _fleet_runtime_sample(adapter: Any, tasks: List[Any], tick_index: int) -> Di
     }
 
 
+def _decision_experience(
+    scenario_key: str, transition_kind: str, tick_index: int,
+    state_before: Dict[str, Any], state_after: Dict[str, Any],
+    action: Dict[str, Any], task_mission_plans: List[Dict[str, Any]],
+    sequence: int,
+) -> Dict[str, Any]:
+    """Build one factual decision-boundary sample from measured CARLA state.
+
+    Reward is deliberately left unavailable until a versioned reward model is
+    approved. This prevents runtime evidence from being presented as a
+    training transition before its objective has been defined.
+    """
+    task_ids = {
+        str(item) for item in action.get("task_ids", []) if item is not None
+    }
+    if action.get("task_id") is not None:
+        task_ids.add(str(action["task_id"]))
+    route_context = [
+        deepcopy(item) for item in task_mission_plans
+        if str(item.get("task_id")) in task_ids
+    ]
+    terminal_states = {"completed", "timed_out", "cancelled", "stuck"}
+    after_tasks = state_after.get("tasks", [])
+    return {
+        "schema_version": "openpit.decision-experience.v1",
+        "experience_id": "{}:{}:{}:{}".format(
+            scenario_key, transition_kind, int(tick_index), int(sequence)
+        ),
+        "scenario_key": str(scenario_key),
+        "transition_kind": str(transition_kind),
+        "decision_tick": int(tick_index),
+        "tick": int(tick_index),
+        "tick_source": "CARLA_RUNTIME_DECISION_BOUNDARY",
+        "measurement_status": "CARLA_MEASURED",
+        "state_before": deepcopy(state_before),
+        "action": deepcopy(action),
+        "route_context": route_context,
+        "state_after": deepcopy(state_after),
+        "reward": None,
+        "reward_status": "NOT_AVAILABLE_NO_REWARD_MODEL",
+        "done": bool(after_tasks) and all(
+            str(item.get("status")) in terminal_states for item in after_tasks
+        ),
+    }
+
+
 def _publish_runtime_snapshot(runtime_publisher: Optional[Callable[[Dict[str, Any]], None]],
                               adapter: Any, tasks: List[Any], workload: Dict[str, Any],
                               structural: Dict[str, Any], scenario: str,
@@ -660,7 +716,7 @@ def _runtime_route_waypoints(config: Any, structural: Dict[str, Any]
     decisions = []
     for key in (
         "equipment_decisions", "weather_decisions", "blast_decisions",
-        "route_changes",
+        "route_changes", "compound_failure_decisions",
     ):
         decisions.extend(
             item for item in structural.get(key, []) if isinstance(item, dict)
@@ -670,14 +726,19 @@ def _runtime_route_waypoints(config: Any, structural: Dict[str, Any]
         decisions.append(takeover)
     sequences = set()
     for item in decisions:
-        edge_ids = (
-            item.get("selected_edge_ids")
-            or item.get("replanned_edge_ids")
-            or item.get("route_edge_ids")
-            or []
-        )
-        if edge_ids:
-            sequences.add(tuple(str(edge_id) for edge_id in edge_ids))
+        route_fields = [
+            item.get("selected_edge_ids"),
+            item.get("replanned_edge_ids"),
+            item.get("route_edge_ids"),
+        ]
+        displaced_contract = item.get(
+            "displaced_task_recovery_route_contract"
+        ) or {}
+        if isinstance(displaced_contract, dict):
+            route_fields.append(displaced_contract.get("edge_ids"))
+        for edge_ids in route_fields:
+            if edge_ids:
+                sequences.add(tuple(str(edge_id) for edge_id in edge_ids))
     if not sequences:
         return {}
     binding = config.map_resource
@@ -746,6 +807,29 @@ def _apply_selected_route(adapter: Any, task_id: str, vehicle_id: str,
     )
 
 
+def _selected_route_has_physical_evidence(
+        decision: Dict[str, Any]) -> bool:
+    """Return true only for an explicitly P6-validated event route.
+
+    A RoadGraph/Dijkstra contract proves topology connectivity, but it does
+    not prove that CARLA's BasicAgent can physically traverse the waypoint
+    chain with the mine-truck model. Runtime incidents therefore must not
+    replace an admitted P6 route with a topology-only detour.
+    """
+    contract = decision.get("route_contract") or {}
+    evidence = (
+        decision.get("execution_evidence")
+        or decision.get("validation_status")
+        or (contract.get("execution_evidence") if isinstance(contract, dict)
+            else None)
+        or (contract.get("validation_status") if isinstance(contract, dict)
+            else None)
+    )
+    return str(evidence or "").upper() in {
+        "PHYSICAL_REACHED", "P6_PHYSICAL_REACHED",
+    }
+
+
 def _fleet_launch_schedule(
     workload: Dict[str, Any],
     route_edge_plans: Optional[Dict[str, List[str]]] = None,
@@ -791,11 +875,9 @@ def _fleet_launch_schedule(
             "topology_conflicts_with_task_ids": conflicts,
             "physical_concurrent_route_capacity": None,
             "runtime_admission_strategy": (
-                "TOPOLOGY_CONFLICT_SERIALIZED_WITH_HEADWAY"
+                "STAGGERED_HEADWAY_WITH_RUNTIME_RIGHT_OF_WAY"
             ),
             "release_condition": (
-                "configured_headway_and_prior_route_conflicts_terminal"
-                if conflicts else
                 "configured_headway_elapsed"
                 if launch_tick else "initial_route_admission"
             ),
@@ -808,13 +890,14 @@ def _reconcile_route_admission(
     state: Dict[str, Any], scenario_paused_vehicle_ids: Optional[List[str]] = None,
     tick_index: int = 0,
 ) -> List[Dict[str, Any]]:
-    """Apply headway and serialize tasks that share known road edges.
+    """Apply a deterministic launch headway before runtime right-of-way.
 
-    P6 remains isolated-route evidence and is not promoted to a multi-truck
-    safety claim.  Tasks with proven disjoint edge sequences may execute in
-    parallel; a later task sharing a known edge waits for its predecessors to
-    become terminal.  Missing topology retains the conservative initial
-    headway without pretending that an unknown route is conflict-free.
+    A shared topology edge is useful conflict metadata, but reserving that
+    edge until the predecessor's complete business task becomes terminal can
+    leave a full-size truck stopped on the road and physically block an
+    already released truck.  Every actor is therefore released by its launch
+    headway; measured runtime traffic coordination owns subsequent local
+    yielding decisions.
     """
     task_by_id = {str(item.task_id): item for item in tasks}
     schedule_by_task = {
@@ -827,17 +910,7 @@ def _reconcile_route_admission(
         if task.status in TERMINAL_TASK_STATES or not task.assigned_vehicle_id:
             continue
         launch_tick = int(schedule_by_task.get(task_id, {}).get("launch_tick", 0))
-        conflicts = schedule_by_task.get(task_id, {}).get(
-            "topology_conflicts_with_task_ids", []
-        )
-        unresolved_conflicts = [
-            conflict_id for conflict_id in conflicts
-            if conflict_id in task_by_id
-            and task_by_id[conflict_id].status not in TERMINAL_TASK_STATES
-        ]
-        eligible = not (
-            int(tick_index) < launch_tick or unresolved_conflicts
-        )
+        eligible = int(tick_index) >= launch_tick
         vehicle_id = str(task.assigned_vehicle_id)
         eligibility_by_vehicle.setdefault(vehicle_id, []).append(eligible)
         if eligible:
@@ -872,7 +945,9 @@ def _reconcile_route_admission(
         "active_task_ids": sorted(active_task_ids),
         "active_vehicle_id": None,
         "held_vehicle_ids": sorted(desired_held),
-        "admission_strategy": "TOPOLOGY_CONFLICT_SERIALIZED_WITH_HEADWAY",
+        "admission_strategy": (
+            "STAGGERED_HEADWAY_WITH_RUNTIME_RIGHT_OF_WAY"
+        ),
     })
     return controls
 
@@ -1006,6 +1081,22 @@ def _runtime_traffic_summary(state: Dict[str, Any], supported: bool,
     }
 
 
+def _resume_after_traffic_clearance(adapter: Any,
+                                    vehicle_id: str) -> Dict[str, Any]:
+    """Release a short traffic hold without rebuilding BasicAgent.
+
+    A paused actor does not consume route progress, so its controller can
+    continue after a normal right-of-way hold. Compatibility adapters without
+    the optional keyword retain their previous behaviour.
+    """
+    try:
+        return dict(adapter.resume_vehicle(
+            vehicle_id, refresh_navigation=False
+        ))
+    except TypeError:
+        return dict(adapter.resume_vehicle(vehicle_id))
+
+
 def _reconcile_runtime_traffic(
     tasks: List[Any], vehicle_states: List[Any], adapter: Any,
     state: Dict[str, Any], tick_index: int,
@@ -1013,10 +1104,10 @@ def _reconcile_runtime_traffic(
 ) -> List[Dict[str, Any]]:
     """Coordinate measured multi-truck encounters for every common scenario.
 
-    Known route conflicts are already serialized by ``_reconcile_route_admission``.
-    This runtime layer covers converging actors and close following pairs using
-    factual CARLA state.  It never invents a collision and never overrides a
-    hold owned by the operator, an incident response or route admission.
+    Known route conflicts inform the launch schedule, while this runtime layer
+    covers converging actors and close following pairs using factual CARLA
+    state. It never invents a collision and never overrides a hold owned by
+    the operator, an incident response or initial route admission.
     """
     protected = {str(item) for item in protected_vehicle_ids or []}
     holds = state.setdefault("holds", {})
@@ -1068,7 +1159,9 @@ def _reconcile_runtime_traffic(
                 and not task_terminal_by_vehicle.get(yielding_id, False)
                 and yielding_id not in protected
             ):
-                response = dict(adapter.resume_vehicle(yielding_id))
+                response = _resume_after_traffic_clearance(
+                    adapter, yielding_id
+                )
                 action_status = "APPLIED"
             control = {
                 "action": "resume_after_runtime_traffic_clearance",
@@ -1399,6 +1492,7 @@ def _event_ticks(scenario: str, result: Dict[str, Any], ticks: int) -> Tuple[int
         event, recovery = int(payload.get("event_tick") or 30), int(payload.get("recovery_tick") or 60)
     elif scenario == "s07":
         event = int(result.get("closure_tick") or 30)
+        recovery = int(result.get("recovery_tick") or 0)
     elif scenario == "s09":
         ordered = result.get("compound_events", [])
         event = min([int(item.get("tick") or 30) for item in ordered] or [30])
@@ -1420,17 +1514,30 @@ def _event_is_ready(scenario: str, scheduled_tick: int, tick_index: int,
     last_launch = max([
         int(item.get("launch_tick", 0)) for item in launch_schedule
     ] or [0])
-    readiness_tick = max(int(scheduled_tick or 0), last_launch + EVENT_POST_LAUNCH_SETTLE_TICKS)
+    failed_vehicle = None
+    relevant_launch = last_launch
+    if scenario in {"s02", "s09"}:
+        # A fault is tied to the affected truck's actual work, not to the
+        # time at which the final unrelated fleet member leaves staging.
+        failed_vehicle = progress.get(
+            "__failed_vehicle__", {}
+        ).get("vehicle_id")
+        affected_launches = [
+            int(item.get("launch_tick", 0))
+            for item in launch_schedule
+            if str(item.get("vehicle_id")) == str(failed_vehicle)
+        ]
+        if affected_launches:
+            relevant_launch = max(affected_launches)
+    readiness_tick = max(
+        int(scheduled_tick or 0),
+        relevant_launch + EVENT_POST_LAUNCH_SETTLE_TICKS,
+    )
     # Keep small deterministic adapter tests practical while real episodes
     # still use the full post-launch gate.
     readiness_tick = min(readiness_tick, max(1, safety_watchdog_tick_limit // 4))
     if tick_index < readiness_tick:
         return False
-    failed_vehicle = None
-    if scenario in {"s02", "s09"}:
-        # The progress map stores this hint when the structural result is
-        # attached by the caller below.
-        failed_vehicle = progress.get("__failed_vehicle__", {}).get("vehicle_id")
     relevant = [
         task for task in tasks
         if task.status not in TERMINAL_TASK_STATES
@@ -1471,7 +1578,9 @@ def _update_progress_watchdog(tasks: List[Any], tick_index: int,
     for task in tasks:
         if task.status in TERMINAL_TASK_STATES or task.last_distance_m is None:
             continue
-        if task.status == "assigned":
+        if task.status in {
+            "assigned", "released", "waiting_recovery_capacity",
+        }:
             # A reassignment may put the selected vehicle's original work
             # behind the urgent task.  That queued task is not navigating and
             # must not inherit the active vehicle's speed or be classified as
@@ -1542,6 +1651,98 @@ def _update_progress_watchdog(tasks: List[Any], tick_index: int,
             continue
         if tick_index - int(record.get("last_progress_tick", tick_index)) < STUCK_WINDOW_TICKS:
             continue
+        classify_blockage = getattr(
+            adapter, "classify_navigation_blockage", None
+        )
+        blockage = None
+        if callable(classify_blockage) and task.assigned_vehicle_id:
+            try:
+                blockage = dict(classify_blockage(task.assigned_vehicle_id))
+            except Exception as exc:
+                # Classification is an advisory execution guard.  Failure to
+                # observe geometry must not disable the existing deterministic
+                # navigation recovery path.
+                blockage = {
+                    "category": "CONTROLLER_STUCK",
+                    "reason": "classification_error",
+                    "error": "{}: {}".format(type(exc).__name__, exc),
+                }
+        blockage_category = str(
+            (blockage or {}).get("category", "CONTROLLER_STUCK")
+        )
+        if blockage_category == "TRAFFIC_BLOCKED":
+            wait_started_tick = int(record.setdefault(
+                "traffic_wait_started_tick", tick_index
+            ))
+            traffic_wait_ticks = int(tick_index) - wait_started_tick
+            if traffic_wait_ticks >= TRAFFIC_MAX_TASK_WAIT_TICKS:
+                record.update({
+                    "blockage_category": "TRAFFIC_WAIT_EXCEEDED",
+                    "blockage_observed_tick": tick_index,
+                    "blocker_vehicle_id": blockage.get(
+                        "blocker_vehicle_id"
+                    ),
+                })
+                control = {
+                    "action": "escalate_persistent_vehicle_blockage",
+                    "status": "ROUTE_RECOVERY_REQUIRED",
+                    "task_id": task.task_id,
+                    "vehicle_id": task.assigned_vehicle_id,
+                    "traffic_wait_ticks": traffic_wait_ticks,
+                    "stalled_distance_m": distance,
+                    "blockage": blockage,
+                }
+                controls.append(control)
+                _emit(
+                    adapter,
+                    "vehicle_navigation_traffic_wait_exceeded",
+                    control,
+                )
+                # Continue through the existing deterministic navigation
+                # restart, lane recovery and fleet reassignment sequence.
+            else:
+                record.update({
+                    "last_progress_tick": tick_index,
+                    "blockage_category": blockage_category,
+                    "blockage_observed_tick": tick_index,
+                    "blocker_vehicle_id": blockage.get("blocker_vehicle_id"),
+                })
+                control = {
+                    "action": "wait_for_detected_vehicle_blockage",
+                    "status": "TRAFFIC_WAIT",
+                    "task_id": task.task_id,
+                    "vehicle_id": task.assigned_vehicle_id,
+                    "traffic_wait_ticks": traffic_wait_ticks,
+                    "maximum_traffic_wait_ticks": TRAFFIC_MAX_TASK_WAIT_TICKS,
+                    "stalled_distance_m": distance,
+                    "blockage": blockage,
+                }
+                controls.append(control)
+                _emit(
+                    adapter,
+                    "vehicle_navigation_waiting_for_traffic",
+                    control,
+                )
+                continue
+        if blockage_category == "VEHICLE_FAILED":
+            recovery_controls = _recover_stalled_vehicle_work(
+                tasks, task, tick_index, adapter, progress,
+                recovery_attempts, held,
+            )
+            if recovery_controls:
+                controls.extend(recovery_controls)
+                continue
+        if blockage_category == "ROUTE_BLOCKED":
+            record.update({
+                "blockage_category": blockage_category,
+                "blockage_observed_tick": tick_index,
+                "blocker_vehicle_id": blockage.get("blocker_vehicle_id"),
+            })
+            _emit(adapter, "vehicle_navigation_route_blocked", {
+                "task_id": task.task_id,
+                "vehicle_id": task.assigned_vehicle_id,
+                "blockage": blockage,
+            })
         restart = callable(getattr(adapter, "set_task_speed_limit", None))
         if restart and int(record.get("restart_count", 0)) < MAX_NAVIGATION_RESTARTS:
             speed = float(task_speed_caps.get(task.task_id, 15.0))
@@ -1590,7 +1791,23 @@ def _update_progress_watchdog(tasks: List[Any], tick_index: int,
         task.completed_tick = tick_index
         retirement = getattr(adapter, "retire_vehicle", None)
         retirement_result = None
-        if callable(retirement) and task.assigned_vehicle_id:
+        detach_task = getattr(
+            adapter, "detach_terminal_task_and_resume_vehicle", None
+        )
+        vehicle_id = str(task.assigned_vehicle_id or "")
+        remaining_vehicle_work = [
+            item for item in tasks
+            if item.task_id != task.task_id
+            and str(getattr(item, "assigned_vehicle_id", "") or "")
+            == vehicle_id
+            and item.status not in TERMINAL_TASK_STATES
+        ]
+        if remaining_vehicle_work and callable(detach_task):
+            retirement_result = detach_task(
+                task.task_id,
+                reason="terminal_stalled_task_releases_vehicle_queue",
+            )
+        elif callable(retirement) and task.assigned_vehicle_id:
             retirement_result = retirement(
                 task.assigned_vehicle_id,
                 reason="navigation_stuck_clears_active_routes",
@@ -1669,6 +1886,13 @@ def _runtime_recovery_candidates(
             reasons.append("vehicle_state_not_executable")
         if not required.issubset(capabilities):
             reasons.append("capability_mismatch")
+        # Runtime recovery is an emergency fallback, not an implicit
+        # pre-emption policy. Giving a stalled task to a truck that already
+        # owns unfinished work can strand that original work if the
+        # replacement route also fails. Busy-truck takeover must go through
+        # an explicit scheduler/pre-emption decision.
+        if vehicle_tasks:
+            reasons.append("active_work_in_progress")
         if current_priority > int(getattr(task, "priority", 0) or 0):
             reasons.append("higher_priority_work_in_progress")
         candidates.append({
@@ -1758,12 +1982,17 @@ def _recover_stalled_vehicle_work(
             (item for item in candidates if item["feasible"]), None
         )
         if selected is None:
-            released_task.status = "stuck"
-            released_task.status_reason = "no_capability_safe_recovery_vehicle"
-            released_task.completed_tick = int(tick_index)
+            released_task.status = "waiting_recovery_capacity"
+            released_task.status_reason = (
+                "waiting_for_capability_safe_recovery_vehicle"
+            )
+            released_task.completed_tick = None
+            setattr(
+                released_task, "recovery_wait_started_tick", int(tick_index)
+            )
             controls.append({
-                "action": "mark_released_task_stuck_no_recovery_vehicle",
-                "status": "NO_FEASIBLE_CANDIDATE",
+                "action": "queue_released_task_for_recovery_capacity",
+                "status": "WAITING_FOR_RECOVERY_CAPACITY",
                 "task_id": task_id,
                 "old_vehicle_id": old_vehicle_id,
                 "candidate_evaluations": candidates,
@@ -1797,6 +2026,154 @@ def _recover_stalled_vehicle_work(
     return controls
 
 
+def _retry_waiting_recovery_tasks(
+    tasks: List[Any], tick_index: int, adapter: Any,
+    progress: Dict[str, Dict[str, Any]],
+    recovery_attempts: Dict[str, int],
+    held_vehicle_ids: Optional[List[str]] = None,
+    decision_points: Optional[List[Dict[str, Any]]] = None,
+    scenario_key: Optional[str] = None,
+    policy_version: Optional[str] = None,
+    operator_reviewer: Optional[Callable[[Dict[str, Any]], str]] = None,
+    decision_publisher: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> List[Dict[str, Any]]:
+    """Request and execute a recovery decision when capacity becomes idle.
+
+    Runtime detection remains in the execution bridge, but the selected
+    candidate, hard-constraint result, safety gate and optional operator
+    response are captured as the same DecisionPoint contract used by the
+    dispatch center.  Without an operator reviewer the existing CLI behavior
+    remains deterministic and auto-approved.
+    """
+    reassign = getattr(adapter, "reassign_task", None)
+    if not callable(reassign):
+        return []
+    controls = []
+    for task in sorted(tasks, key=lambda item: (
+        -int(getattr(item, "priority", 0) or 0), str(item.task_id)
+    )):
+        if task.status != "waiting_recovery_capacity":
+            continue
+        candidates = _runtime_recovery_candidates(
+            tasks, task, adapter,
+            excluded_vehicle_ids=[str(
+                getattr(task, "original_vehicle_id", None) or ""
+            )],
+            held_vehicle_ids=list(held_vehicle_ids or []),
+        )
+        selected = next(
+            (item for item in candidates if item["feasible"]), None
+        )
+        if selected is None:
+            continue
+        if getattr(task, "recovery_review_status", None) in {
+            "REJECTED_BY_HUMAN", "OPERATOR_REVIEW_TIMEOUT",
+        }:
+            continue
+        point = {
+            "schema_version": DECISION_POINT_SCHEMA_VERSION,
+            "decision_point_id": "runtime-recovery:{}:{}".format(
+                task.task_id, int(tick_index)
+            ),
+            "scenario_key": scenario_key,
+            "trigger": {
+                "type": "recovery_capacity_available",
+                "tick": int(tick_index),
+                "task_id": str(task.task_id),
+            },
+            "trigger_event_id": None,
+            "affected_entities": {
+                "task_ids": [str(task.task_id)],
+                "vehicle_ids": [selected["vehicle_id"]],
+            },
+            "action_type": "reassign_waiting_recovery_task",
+            "reason": (
+                "compatible idle recovery vehicle passed hard constraints"
+            ),
+            "candidate_actions": [dict(item) for item in candidates],
+            "candidate_evaluations": [dict(item) for item in candidates],
+            "recommended_action": {
+                "action_type": "reassign_task",
+                "task_id": str(task.task_id),
+                "selected_vehicle_id": selected["vehicle_id"],
+                "policy_version": policy_version or "RuntimeRecoveryPolicy-V1",
+            },
+            "recommended_vehicle_id": selected["vehicle_id"],
+            "policy_version": policy_version or "RuntimeRecoveryPolicy-V1",
+            "confidence": None,
+            "constraint_results": list(selected["constraint_results"]),
+            "safety_review": {
+                "status": "APPROVED",
+                "shield_mode": "hard_constraint_execution_gate",
+                "failed_constraints": [],
+            },
+            "review_policy": (
+                "REQUIRED_BEFORE_EXECUTION"
+                if operator_reviewer is not None else "AUTO_POLICY"
+            ),
+            "review_status": (
+                "PENDING_HUMAN_CONFIRMATION"
+                if operator_reviewer is not None else "AUTO_APPROVED"
+            ),
+            "operator_response": None,
+            "execution_status": "PENDING_APPROVAL",
+            "deduplication_key": "runtime-recovery:{}".format(task.task_id),
+        }
+        if decision_points is not None:
+            decision_points.append(point)
+        if operator_reviewer is not None:
+            if callable(decision_publisher):
+                decision_publisher(point)
+            response = str(operator_reviewer(point)).lower().strip()
+            point["operator_response"] = {
+                "action": response,
+                "source": "human_dispatch_center",
+                "tick": int(tick_index),
+            }
+            if response != "approve":
+                point["review_status"] = (
+                    "REJECTED_BY_HUMAN" if response == "reject"
+                    else "OPERATOR_REVIEW_TIMEOUT"
+                )
+                point["execution_status"] = "HELD_NOT_EXECUTED"
+                setattr(task, "recovery_review_status", point["review_status"])
+                controls.append({
+                    "action": "hold_waiting_recovery_after_operator_review",
+                    "status": point["review_status"],
+                    "task_id": str(task.task_id),
+                    "vehicle_id": selected["vehicle_id"],
+                    "decision_point_id": point["decision_point_id"],
+                })
+                continue
+            point["review_status"] = "APPROVED_BY_HUMAN"
+        point["execution_status"] = "APPROVED_FOR_EXECUTION"
+        response = _reassign_for_scenario(
+            adapter, str(task.task_id), selected["vehicle_id"],
+            "scenario_recovery_capacity",
+        )
+        recovery_attempts[str(task.task_id)] = int(
+            recovery_attempts.get(str(task.task_id), 0)
+        ) + 1
+        progress.pop(str(task.task_id), None)
+        wait_started_tick = int(getattr(
+            task, "recovery_wait_started_tick", tick_index
+        ))
+        control = {
+            "action": "reassign_waiting_task_after_capacity_available",
+            "status": "APPLIED",
+            "task_id": str(task.task_id),
+            "vehicle_id": selected["vehicle_id"],
+            "recovery_wait_ticks": int(tick_index) - wait_started_tick,
+            "candidate_evaluations": candidates,
+            "decision_point_id": point["decision_point_id"],
+            **dict(response),
+        }
+        point["execution_status"] = "EXECUTING"
+        controls.append(control)
+        _emit(adapter, "runtime_recovery_capacity_became_available", control)
+    return controls
+
+
 def _recently_progressing_task_ids(
     tasks: List[Any], tick_index: int,
     progress: Dict[str, Dict[str, Any]],
@@ -1805,6 +2182,17 @@ def _recently_progressing_task_ids(
     task_ids = []
     for task in tasks:
         if task.status in TERMINAL_TASK_STATES or task.status == "assigned":
+            continue
+        if task.status == "waiting_recovery_capacity":
+            wait_started_tick = getattr(
+                task, "recovery_wait_started_tick", None
+            )
+            if (
+                wait_started_tick is not None
+                and tick_index - int(wait_started_tick)
+                <= TRAFFIC_MAX_TASK_WAIT_TICKS
+            ):
+                task_ids.append(str(task.task_id))
             continue
         record = progress.get(task.task_id) or {}
         # A freshly observed navigation leg may not yet have accumulated the
@@ -1853,6 +2241,30 @@ def _reassign_for_scenario(adapter: Any, task_id: str, vehicle_id: str,
         return method(task_id, vehicle_id)
 
 
+def _clear_unparked_fault_vehicle(
+    adapter: Any, workload: Dict[str, Any], vehicle_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Clear an owned fault actor only when no safe pull-over is configured.
+
+    The fault event and interrupted task remain in the runtime/database
+    evidence.  This is the common finite-episode fallback for a mine map that
+    has no validated parking resource; an externally owned actor is only held
+    safely by ``retire_vehicle`` and is never destroyed here.
+    """
+    pull_over_offset = float(
+        workload["config"].demo.fault_pull_over_offset_m or 0.0
+    )
+    if pull_over_offset > 0.0:
+        return None
+    retire = getattr(adapter, "retire_vehicle", None)
+    if not callable(retire):
+        return None
+    return dict(retire(
+        str(vehicle_id),
+        reason="faulted_vehicle_clears_active_route_no_validated_parking",
+    ))
+
+
 def _apply_primary_event(scenario: str, structural: Dict[str, Any],
                          workload: Dict[str, Any], tasks: List[Any],
                          adapter: Any,
@@ -1876,6 +2288,14 @@ def _apply_primary_event(scenario: str, structural: Dict[str, Any],
         if failed:
             adapter.inject_fault(str(failed))
             record("inject_vehicle_fault", {"vehicle_id": str(failed)})
+            clearance = _clear_unparked_fault_vehicle(
+                adapter, workload, str(failed)
+            )
+            if clearance is not None:
+                record("clear_faulted_vehicle_from_active_route", {
+                    "vehicle_id": str(failed),
+                    "vehicle_clearance": clearance,
+                })
         final_map = _assignment_map(structural.get("tasks", []))
         for task_id in structural.get("released_task_ids", []):
             task = task_by_id.get(str(task_id))
@@ -1965,6 +2385,27 @@ def _apply_primary_event(scenario: str, structural: Dict[str, Any],
             task, selected = task_by_id.get(task_id), decision.get("vehicle_id")
             if task is None or not selected or task.status in TERMINAL_TASK_STATES:
                 continue
+            if not _selected_route_has_physical_evidence(decision):
+                # Preserve the admitted P6 route. A topology-only detour is
+                # planning evidence, not permission for physical execution.
+                current_vehicle_id = str(
+                    task.assigned_vehicle_id
+                    or decision.get("original_vehicle_id")
+                    or selected
+                )
+                if current_vehicle_id not in paused:
+                    paused.append(current_vehicle_id)
+                pause_response = dict(adapter.pause_vehicle(current_vehicle_id))
+                record("hold_for_unvalidated_temporary_detour", {
+                    **pause_response,
+                    "task_id": task_id,
+                    "vehicle_id": current_vehicle_id,
+                    "closed_edge_id": decision.get("closed_edge_id"),
+                    "selected_route_evidence": "TOPOLOGY_ONLY",
+                    "preserved_route_evidence": "P6_PHYSICAL_REACHED",
+                    "release_condition": "ROAD_REOPEN",
+                })
+                continue
             response = dict(_reassign_for_scenario(
                 adapter, task_id, str(selected), "scenario_event"
             ))
@@ -2012,8 +2453,22 @@ def _apply_recovery(scenario: str, structural: Dict[str, Any],
                 "action": "inject_vehicle_fault_after_road_closure",
                 "status": "APPLIED", "vehicle_id": str(failed),
             })
+            clearance = _clear_unparked_fault_vehicle(
+                adapter, workload, str(failed)
+            )
+            if clearance is not None:
+                applied.append({
+                    "action": "clear_faulted_vehicle_from_active_route",
+                    "status": "APPLIED", "vehicle_id": str(failed),
+                    "vehicle_clearance": clearance,
+                })
         final_map = _assignment_map(structural.get("tasks", []))
         task_by_id = {item.task_id: item for item in tasks}
+        compound_decisions = [
+            item for item in structural.get(
+                "compound_failure_decisions", []
+            ) if isinstance(item, dict)
+        ]
         for task_id in structural.get("released_task_ids", []):
             task, selected = task_by_id.get(str(task_id)), final_map.get(str(task_id))
             if task is None or not selected or task.status in TERMINAL_TASK_STATES:
@@ -2028,20 +2483,83 @@ def _apply_recovery(scenario: str, structural: Dict[str, Any],
                 "action": "compound_fault_task_takeover",
                 "status": "APPLIED", **response,
             })
-            takeover = structural.get("takeover_decision") or {}
+            takeover = structural.get("takeover_decision") or next((
+                item for item in compound_decisions
+                if str(item.get("task_id")) == str(task_id)
+            ), {})
             if str(takeover.get("task_id")) == str(task_id):
-                route_response = _apply_selected_route(
-                    adapter, str(task_id), str(selected), takeover,
-                    route_waypoints,
+                aligned_takeover = bool(
+                    response.get("aligned_service_target_takeover")
                 )
+                # The response vehicle is already travelling to the same P6
+                # service target.  Replacing that physical route with a
+                # topology-derived waypoint chain can turn a short validated
+                # leg into a kilometre-scale loop.  Queue the urgent task at
+                # the front and retain the existing destination; once it is
+                # reached the displaced same-target task resumes and
+                # terminates at the same service zone.
+                route_response = None
+                if aligned_takeover:
+                    applied.append({
+                        "action": "continue_aligned_p6_takeover_route",
+                        "status": "APPLIED",
+                        "task_id": str(task_id),
+                        "vehicle_id": str(selected),
+                        "displaced_task_id": takeover.get(
+                            "selected_vehicle_current_task_id"
+                        ),
+                        "goal_point_id": takeover.get("goal_point_id"),
+                        "route_source": (
+                            "EXISTING_P6_SERVICE_TARGET_ROUTE"
+                        ),
+                    })
+                else:
+                    route_response = _apply_selected_route(
+                        adapter, str(task_id), str(selected), takeover,
+                        route_waypoints,
+                    )
                 if route_response:
                     applied.append({
                         "action": "apply_compound_takeover_route",
                         "status": "APPLIED", **route_response,
                     })
-    for vehicle_id in paused:
-        response = adapter.resume_vehicle(vehicle_id)
-        applied.append({"action": "resume_after_event_clearance", "status": "APPLIED", **response})
+                # The selected vehicle may have had ordinary work suspended
+                # by the urgent takeover.  Preserve the route planned from
+                # the takeover destination to that displaced task's target;
+                # the adapter activates it only after the urgent task ends.
+                displaced_task_id = str(
+                    takeover.get("selected_vehicle_current_task_id") or ""
+                )
+                displaced_contract = takeover.get(
+                    "displaced_task_recovery_route_contract"
+                ) or {}
+                displaced_edges = displaced_contract.get("edge_ids", []) \
+                    if isinstance(displaced_contract, dict) else []
+                displaced_points = route_waypoints.get(tuple(
+                    str(edge_id) for edge_id in displaced_edges
+                ))
+                configure_deferred = getattr(
+                    adapter, "configure_deferred_task_route", None
+                )
+                if (
+                    displaced_task_id and displaced_points
+                    and callable(configure_deferred)
+                ):
+                    deferred_response = configure_deferred(
+                        displaced_task_id, str(selected), displaced_points,
+                        blocked_edge_id=takeover.get("closed_edge_id"),
+                        route_edge_ids=displaced_edges,
+                    )
+                    applied.append({
+                        "action": "configure_displaced_task_recovery_route",
+                        "status": "APPLIED", **deferred_response,
+                    })
+    # S09 uses this first recovery slot for its ordered vehicle-failure event.
+    # Its road hold is released separately at the final recovery tick.
+    if scenario != "s09":
+        for vehicle_id in paused:
+            response = adapter.resume_vehicle(vehicle_id)
+            applied.append({"action": "resume_after_event_clearance", "status": "APPLIED", **response})
     if scenario == "s05":
         speeds = {item.vehicle_id: item.target_speed_kmh for item in workload["vehicles"]}
         affected = {str(item.get("task_id")): str(item.get("vehicle_id"))
@@ -2075,7 +2593,15 @@ def _physical_cycle(scenario: str, structural: Dict[str, Any],
         RuntimeState(),
         risk_stage=fixed({"status": "EVENT_EVALUATED", "scenario_key": scenario}),
         decision_stage=fixed({"status": "DECIDED", "policy_version": structural.get("policy_version")}),
-        scheduling_stage=fixed({"status": "SCHEDULED", "assignments": command["assignments"]}),
+        scheduling_stage=fixed({
+            "status": "SCHEDULED",
+            "assignments": command["assignments"],
+            # Persist the exact command admitted by the safety gate.  The
+            # closed-loop database previously kept only the assignment map,
+            # which made CARLA cycles incomplete as (state, action, result,
+            # next_state) experience records.
+            "command": deepcopy(command),
+        }),
         planning_stage=fixed({"status": "PLANNED", "route_plans": structural.get("route_plans", [])}),
         safety_stage=fixed({"status": "APPROVED", "shield_mode": "execution_gate"}),
         execution_stage=lambda context: feedback,
@@ -2094,6 +2620,7 @@ def run_carla_scenario_execution(scenario: str, config: Any,
                                  runtime_publisher: Optional[Callable[[Dict[str, Any]], None]] = None,
                                  operator_reviewer: Optional[Callable[[Dict[str, Any]], str]] = None,
                                  control_state_reader: Optional[Callable[[], str]] = None,
+                                 display_speed_scale: float = 1.0,
                                  ) -> Dict[str, Any]:
     """Execute S01-S07/S09 through one CARLA and feedback contract."""
     name = str(scenario).lower()
@@ -2101,6 +2628,8 @@ def run_carla_scenario_execution(scenario: str, config: Any,
         raise ValueError("unsupported CARLA scenario: {}".format(scenario))
     if ticks < 1:
         raise ValueError("ticks must be at least 1")
+    if display_speed_scale < 0.5 or display_speed_scale > 1.0:
+        raise ValueError("display_speed_scale must be between 0.5 and 1.0")
     from .runner import run_structural_scenario
     common_spec = scenario_spec(name, load_scenario_catalog()).to_dict()
 
@@ -2204,6 +2733,41 @@ def run_carla_scenario_execution(scenario: str, config: Any,
     physical_speed_caps, physical_speed_evidence = _physical_speed_caps(
         workload, physical_validation_records
     )
+    if display_speed_scale < 1.0:
+        vehicle_speeds = {
+            str(item.vehicle_id): float(item.target_speed_kmh)
+            for item in workload["vehicles"]
+        }
+        assigned_vehicles = initial_assignments or final_assignments
+        evidence_by_task = {
+            str(item["task_id"]): item for item in physical_speed_evidence
+        }
+        for task in workload.get("task_drafts", []):
+            task_id = str(task["task_id"])
+            vehicle_id = str(assigned_vehicles.get(
+                task_id, task.get("preferred_vehicle_id", "")
+            ))
+            base_speed = physical_speed_caps.get(
+                task_id, vehicle_speeds.get(vehicle_id)
+            )
+            if base_speed is None:
+                continue
+            scaled_speed = max(6.0, float(base_speed) * display_speed_scale)
+            physical_speed_caps[task_id] = scaled_speed
+            evidence = evidence_by_task.get(task_id)
+            if evidence is None:
+                evidence = {
+                    "task_id": task_id,
+                    "from_point_id": str(task.get("from_point_id", "")),
+                    "to_point_id": str(task.get("to_point_id", "")),
+                    "arrival_tolerance_m": None,
+                    "source": "SCENARIO_CONFIG_TARGET_SPEED",
+                }
+                physical_speed_evidence.append(evidence)
+            evidence["base_speed_limit_kmh"] = round(float(base_speed), 3)
+            evidence["speed_limit_kmh"] = round(scaled_speed, 3)
+            evidence["display_speed_scale"] = display_speed_scale
+            evidence["presentation_override"] = True
     production_cycle_plans = _production_cycle_plans(
         workload, physical_pairs, planner_pairs,
         assignments=initial_assignments or final_assignments,
@@ -2214,11 +2778,18 @@ def run_carla_scenario_execution(scenario: str, config: Any,
     recommended_ticks, tick_budget = _recommended_execution_ticks(
         workload, name, physical_validation_records, launch_schedule,
         assignments=final_assignments or initial_assignments,
-        # Route-edge conflict admission can serialize part of the fleet.  A
-        # serial budget prevents the safety watchdog from ending a valid
-        # queued episode merely because concurrency was deliberately reduced.
-        physical_route_capacity=1,
+        # Initial departures are staggered, then factual runtime right-of-way
+        # coordinates the fleet. Budget by each vehicle's own assigned queue
+        # instead of incorrectly summing every route as one global serial job.
+        physical_route_capacity=max(1, int(vehicle_count)),
     )
+    if display_speed_scale < 1.0:
+        recommended_ticks = int(ceil(
+            float(recommended_ticks) / display_speed_scale
+        ))
+        tick_budget["display_speed_scale"] = display_speed_scale
+        tick_budget["speed_adjusted"] = True
+        tick_budget["recommended_ticks"] = recommended_ticks
     requested_ticks = int(ticks)
     # This is a last-resort safety watchdog.  Successful episodes end because
     # their tasks and incident lifecycle are complete, not because this count
@@ -2259,7 +2830,37 @@ def run_carla_scenario_execution(scenario: str, config: Any,
     adapter = adapter_factory(workload["config"], load_map=load_map)
     manager = ExecutionManager(adapter, physical_execution=True)
     events, feedback, controls, runtime_telemetry = [], [], [], []
+    decision_experiences: List[Dict[str, Any]] = []
     ticks_executed, final_states, destroyed = 0, [], 0
+    interrupted = False
+    interruption_reason = None
+    mission_configuration = {
+        "status": "NOT_STARTED", "task_count": 0,
+    }
+    production_configuration = {
+        "status": "NOT_STARTED", "task_count": 0,
+    }
+    simulation_timing = {
+        "status": "PLANNED",
+        "mode": "ASYNCHRONOUS_FIXED_DELTA",
+        "fixed_delta_seconds": P6_TICK_SECONDS_ESTIMATE,
+    }
+    speed_cap_supported = False
+    headway_supported = False
+    traffic_coordination_supported = False
+    route_admission_state: Dict[str, Any] = {
+        "active_task_id": None,
+        "active_vehicle_id": None,
+        "held_vehicle_ids": [],
+    }
+    traffic_coordination_state: Dict[str, Any] = {
+        "holds": {}, "observations": {}, "decisions": [],
+        "detected_conflict_count": 0,
+        "resolved_conflict_count": 0,
+        "escalated_conflict_count": 0,
+    }
+    safety_watchdog_triggered = False
+    safety_watchdog_extension_count = 0
     scheduled_event_tick, scheduled_recovery_tick = _event_ticks(
         name, structural, effective_execution_ticks
     )
@@ -2267,6 +2868,17 @@ def run_carla_scenario_execution(scenario: str, config: Any,
     recovery_delay_ticks = max(
         0, int(scheduled_recovery_tick or 0) - int(scheduled_event_tick or 0)
     )
+    scheduled_road_clearance_tick = (
+        int(structural.get("recovery_tick") or 0)
+        if name == "s09" else None
+    )
+    road_clearance_delay_ticks = max(
+        0,
+        int(scheduled_road_clearance_tick or 0)
+        - int(scheduled_event_tick or 0),
+    )
+    road_clearance_tick = None
+    road_clearance_applied = False
     paused, event_applied, recovery_applied = [], False, False
     operator_review_status = "NOT_REQUESTED"
     progress = {
@@ -2275,6 +2887,7 @@ def run_carla_scenario_execution(scenario: str, config: Any,
         }
     }
     runtime_recovery_attempts: Dict[str, int] = {}
+    runtime_decision_points = structural.setdefault("decision_points", [])
     _runtime_adapter_call(adapter.connect)
     lifecycle.mark("start", "ready" if check_only else "completed", {
         "execution_mode": "carla", "connected": True,
@@ -2309,13 +2922,17 @@ def run_carla_scenario_execution(scenario: str, config: Any,
                     ),
                 },
                 "tick_budget": tick_budget,
+                "simulation_timing": {
+                    **simulation_timing,
+                    "status": "CHECK_ONLY_NOT_APPLIED",
+                },
                 "launch_schedule": launch_schedule,
                 "route_traffic_admission": {
                     "status": "READY",
                     "physical_concurrent_route_capacity": None,
                     "capacity_source": "NOT_MULTI_TRUCK_VALIDATED",
                     "runtime_admission_strategy": (
-                        "TOPOLOGY_CONFLICT_SERIALIZED_WITH_HEADWAY"
+                        "STAGGERED_HEADWAY_WITH_RUNTIME_RIGHT_OF_WAY"
                     ),
                     "topology_route_count": len(task_route_edges),
                 },
@@ -2339,6 +2956,18 @@ def run_carla_scenario_execution(scenario: str, config: Any,
             return normalize_scenario_run_result(
                 result, scenario_key=name, scenario_spec=common_spec
             )
+        configure_timing = getattr(
+            adapter, "configure_fixed_time_step", None
+        )
+        if callable(configure_timing):
+            simulation_timing = _runtime_adapter_call(
+                configure_timing, P6_TICK_SECONDS_ESTIMATE
+            )
+        else:
+            simulation_timing = {
+                "status": "NOT_SUPPORTED_BY_ADAPTER",
+                "fixed_delta_seconds": None,
+            }
         _runtime_adapter_call(adapter.ensure_vehicles, spawn_missing=True)
         runtime_zones = _runtime_adapter_call(adapter.resolve_zones, workload["zones"])
         mission_supported = callable(
@@ -2363,6 +2992,9 @@ def run_carla_scenario_execution(scenario: str, config: Any,
             production_configuration = {
                 "status": "NOT_SUPPORTED_BY_ADAPTER", "task_count": 0,
             }
+        dispatch_state_before = _runtime_adapter_call(
+            _fleet_runtime_sample, adapter, tasks, 0
+        )
         dispatch_feedback = _runtime_adapter_call(
             manager.dispatch, command, tasks, runtime_zones
         )
@@ -2370,6 +3002,22 @@ def run_carla_scenario_execution(scenario: str, config: Any,
         if dispatch_feedback.status != "SUCCEEDED":
             raise RuntimeError(dispatch_feedback.error or "CARLA dispatch failed")
         events.extend(dispatch_feedback.events)
+        dispatch_state_after = _runtime_adapter_call(
+            _fleet_runtime_sample, adapter, tasks, 0
+        )
+        decision_experiences.append(_decision_experience(
+            name, "initial_dispatch", 0,
+            dispatch_state_before, dispatch_state_after,
+            {
+                "schema_version": "openpit.execution-command.v1",
+                "action_type": command.action_type,
+                "task_ids": list(command.task_ids),
+                "assignments": dict(command.assignments),
+                "policy_version": command.issued_by,
+                "safety_gate_status": command.safety_gate_status,
+            },
+            task_mission_plans, len(decision_experiences) + 1,
+        ))
         _publish_runtime_snapshot(
             runtime_publisher, adapter, tasks, workload, structural, name, 0,
             "dispatch", event={
@@ -2386,18 +3034,26 @@ def run_carla_scenario_execution(scenario: str, config: Any,
         }
         if speed_cap_supported:
             for task_id, speed_limit_kmh in sorted(physical_speed_caps.items()):
+                speed_evidence = physical_evidence_by_task.get(task_id, {})
                 response = _runtime_adapter_call(
                     adapter.set_task_speed_limit, task_id, speed_limit_kmh
                 )
                 controls.append({
-                    "action": "apply_p6_validated_speed_cap",
+                    "action": (
+                        "apply_presentation_speed_cap"
+                        if speed_evidence.get("presentation_override")
+                        else "apply_p6_validated_speed_cap"
+                    ),
                     "status": "APPLIED",
-                    "source": "P6_ISOLATED_SINGLE_TRUCK_VALIDATION",
+                    "source": speed_evidence.get(
+                        "source", "P6_ISOLATED_SINGLE_TRUCK_VALIDATION"
+                    ),
+                    "display_speed_scale": speed_evidence.get(
+                        "display_speed_scale"
+                    ),
                     **response,
                 })
-                tolerance = physical_evidence_by_task.get(task_id, {}).get(
-                    "arrival_tolerance_m"
-                )
+                tolerance = speed_evidence.get("arrival_tolerance_m")
                 if arrival_tolerance_supported and tolerance is not None:
                     tolerance_response = _runtime_adapter_call(
                         adapter.set_task_arrival_tolerance,
@@ -2416,7 +3072,7 @@ def run_carla_scenario_execution(scenario: str, config: Any,
             "active_vehicle_id": None,
             "held_vehicle_ids": [],
         }
-        traffic_coordination_state: Dict[str, Any] = {
+        traffic_coordination_state = {
             "holds": {}, "observations": {}, "decisions": [],
             "detected_conflict_count": 0,
             "resolved_conflict_count": 0,
@@ -2525,7 +3181,11 @@ def run_carla_scenario_execution(scenario: str, config: Any,
                 progressing_task_ids = _recently_progressing_task_ids(
                     tasks, tick_index, progress
                 )
-                if progressing_task_ids:
+                if (
+                    progressing_task_ids
+                    and safety_watchdog_extension_count
+                    < MAX_SAFETY_WATCHDOG_EXTENSIONS
+                ):
                     previous_limit = effective_execution_ticks
                     effective_execution_ticks += SAFETY_WATCHDOG_EXTENSION_TICKS
                     effective_timeout_ticks = max(
@@ -2593,6 +3253,10 @@ def run_carla_scenario_execution(scenario: str, config: Any,
                 event_tick = tick_index
                 if recovery_delay_ticks:
                     recovery_tick = event_tick + recovery_delay_ticks
+                if road_clearance_delay_ticks:
+                    road_clearance_tick = (
+                        event_tick + road_clearance_delay_ticks
+                    )
                 review_paused = []
                 review_points = _event_review_points(structural)
                 if operator_reviewer is not None and review_points:
@@ -2656,6 +3320,9 @@ def run_carla_scenario_execution(scenario: str, config: Any,
                         # must not bypass the independent route-capacity hold.
                         if vehicle_id not in traffic_held:
                             _runtime_adapter_call(adapter.resume_vehicle, vehicle_id)
+                event_state_before = _runtime_adapter_call(
+                    _fleet_runtime_sample, adapter, tasks, tick_index
+                )
                 current, paused = _runtime_adapter_call(
                     _apply_primary_event, name, structural, workload, tasks,
                     adapter, runtime_route_waypoints,
@@ -2668,6 +3335,26 @@ def run_carla_scenario_execution(scenario: str, config: Any,
                         launch_schedule, route_admission_state, paused,
                         tick_index,
                     ))
+                event_state_after = _runtime_adapter_call(
+                    _fleet_runtime_sample, adapter, tasks, tick_index
+                )
+                affected_task_ids = sorted({
+                    str(item.get("task_id")) for item in current
+                    if isinstance(item, dict) and item.get("task_id")
+                })
+                decision_experiences.append(_decision_experience(
+                    name, "scenario_event_response", tick_index,
+                    event_state_before, event_state_after,
+                    {
+                        "action_type": "apply_scenario_event_response",
+                        "task_ids": affected_task_ids,
+                        "controls": deepcopy(current),
+                        "policy_version": structural.get("policy_version"),
+                        "operator_review_status": operator_review_status,
+                        "decision_points": deepcopy(review_points),
+                    },
+                    task_mission_plans, len(decision_experiences) + 1,
+                ))
                 _publish_runtime_snapshot(
                     runtime_publisher, adapter, tasks, workload, structural, name,
                     tick_index, "event", event={
@@ -2695,6 +3382,45 @@ def run_carla_scenario_execution(scenario: str, config: Any,
                         "type": "scenario_recovery_applied",
                         "message": "{} 场景恢复控制已执行".format(name.upper()),
                         "payload": {"controls": recovery_controls},
+                    },
+                )
+            if (
+                road_clearance_tick
+                and tick_index == road_clearance_tick
+                and not road_clearance_applied
+            ):
+                clearance_controls = []
+                for vehicle_id in paused:
+                    response = _runtime_adapter_call(
+                        adapter.resume_vehicle, vehicle_id
+                    )
+                    item = {
+                        "action": "resume_p6_route_after_road_reopen",
+                        "status": "APPLIED",
+                        "road_status": "OPEN",
+                        **response,
+                    }
+                    clearance_controls.append(item)
+                    _emit(adapter, "scenario_control_recovered", item)
+                controls.extend(clearance_controls)
+                paused = []
+                road_clearance_applied = True
+                if headway_supported:
+                    controls.extend(_runtime_adapter_call(
+                        _reconcile_route_admission, tasks, adapter,
+                        launch_schedule, route_admission_state, [],
+                        tick_index,
+                    ))
+                _publish_runtime_snapshot(
+                    runtime_publisher, adapter, tasks, workload, structural,
+                    name, tick_index, "road_reopen", event={
+                        "type": "scenario_road_reopened",
+                        "message": (
+                            "{} 道路封控已解除，恢复P6任务路线".format(
+                                name.upper()
+                            )
+                        ),
+                        "payload": {"controls": clearance_controls},
                     },
                 )
             _runtime_adapter_call(adapter.tick)
@@ -2741,20 +3467,126 @@ def run_carla_scenario_execution(scenario: str, config: Any,
                     for item in runtime_sample.get("tasks", [])
                     if item.get("assigned_vehicle_id")
                 }
+                recovery_held_vehicle_ids = sorted(
+                    set(route_admission_state.get("held_vehicle_ids", []))
+                    | set(traffic_coordination_state.get("holds", {}))
+                ) if headway_supported else []
+
+                def publish_recovery_decision(point):
+                    _publish_runtime_snapshot(
+                        runtime_publisher, adapter, tasks, workload,
+                        structural, name, ticks_executed,
+                        "await_recovery_decision", event={
+                            "type": "decision_point_pending",
+                            "message": "{} 恢复任务等待调度确认".format(
+                                name.upper()
+                            ),
+                            "payload": {
+                                "decision_point_ids": [
+                                    point["decision_point_id"]
+                                ],
+                            },
+                        }, decision_override={
+                            "status": "PENDING_HUMAN_CONFIRMATION",
+                            "policy_version": point.get("policy_version"),
+                            "decision_points": [point],
+                        },
+                    )
+
+                recovery_state_before = _runtime_adapter_call(
+                    _fleet_runtime_sample, adapter, tasks, ticks_executed
+                )
+                decision_point_count_before = len(runtime_decision_points)
+                recovery_controls = _runtime_adapter_call(
+                    _retry_waiting_recovery_tasks, tasks, ticks_executed,
+                    adapter, progress, runtime_recovery_attempts,
+                    recovery_held_vehicle_ids,
+                    decision_points=runtime_decision_points,
+                    scenario_key=name,
+                    policy_version=(
+                        structural.get("policy_version")
+                        or "RuntimeRecoveryPolicy-V1"
+                    ),
+                    operator_reviewer=operator_reviewer,
+                    decision_publisher=publish_recovery_decision,
+                )
+                controls.extend(recovery_controls)
+                new_recovery_points = runtime_decision_points[
+                    decision_point_count_before:
+                ]
+                if new_recovery_points or recovery_controls:
+                    recovery_state_after = _runtime_adapter_call(
+                        _fleet_runtime_sample, adapter, tasks, ticks_executed
+                    )
+                    recovery_task_ids = sorted({
+                        str(item.get("task_id")) for item in recovery_controls
+                        if isinstance(item, dict) and item.get("task_id")
+                    })
+                    decision_experiences.append(_decision_experience(
+                        name, "runtime_task_recovery", ticks_executed,
+                        recovery_state_before, recovery_state_after,
+                        {
+                            "action_type": "runtime_task_recovery",
+                            "task_ids": recovery_task_ids,
+                            "controls": deepcopy(recovery_controls),
+                            "decision_points": deepcopy(new_recovery_points),
+                            "policy_version": "RuntimeRecoveryPolicy-V1",
+                        },
+                        task_mission_plans, len(decision_experiences) + 1,
+                    ))
                 watchdog_controls = _runtime_adapter_call(
                     _update_progress_watchdog, tasks, ticks_executed, adapter,
                     progress, physical_speed_caps,
-                    sorted(
-                        set(route_admission_state.get("held_vehicle_ids", []))
-                        | set(traffic_coordination_state.get("holds", {}))
-                    ) if headway_supported else [],
+                    recovery_held_vehicle_ids,
                     measured_vehicle_speeds,
                     runtime_recovery_attempts,
                 )
                 controls.extend(watchdog_controls)
+                if (
+                    ticks_executed % RUNTIME_HEARTBEAT_INTERVAL_TICKS == 0
+                    and isinstance(adapter, CarlaAdapter)
+                ):
+                    moving_vehicle_ids = sorted({
+                        str(item.get("assigned_vehicle_id"))
+                        for item in runtime_sample.get("tasks", [])
+                        if item.get("assigned_vehicle_id")
+                        and float(
+                            (item.get("vehicle") or {}).get("speed_mps")
+                            or 0.0
+                        ) >= STUCK_MIN_MOTION_SPEED_MPS
+                    })
+                    held_vehicle_ids = sorted(
+                        set(route_admission_state.get(
+                            "held_vehicle_ids", []
+                        )) | set(traffic_coordination_state.get("holds", {}))
+                    )
+                    completed_count = sum(
+                        item.status == "completed" for item in tasks
+                    )
+                    print(
+                        "[CARLA进度] {} tick={} 任务={}/{} 移动车辆={} "
+                        "等待车辆={} 恢复次数={}".format(
+                            name.upper(), ticks_executed, completed_count,
+                            len(tasks), len(moving_vehicle_ids),
+                            len(held_vehicle_ids),
+                            sum(runtime_recovery_attempts.values()),
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            if (
+                runtime_publisher is not None
+                and (
+                    ticks_executed == 1
+                    or ticks_executed % UI_RUNTIME_PUBLISH_INTERVAL_TICKS == 0
+                    or all(
+                        task.status in TERMINAL_TASK_STATES for task in tasks
+                    )
+                )
+            ):
                 _publish_runtime_snapshot(
-                    runtime_publisher, adapter, tasks, workload, structural, name,
-                    ticks_executed, "execute"
+                    runtime_publisher, adapter, tasks, workload, structural,
+                    name, ticks_executed, "execute"
                 )
             tick_index += 1
         events.extend(adapter.drain_events())
@@ -2771,6 +3603,40 @@ def run_carla_scenario_execution(scenario: str, config: Any,
                 "task_count": len(tasks),
             }
         )
+    except KeyboardInterrupt:
+        interrupted = True
+        interruption_reason = "operator_interrupted_run"
+        for task in tasks:
+            if task.status in TERMINAL_TASK_STATES:
+                continue
+            task.status = "cancelled"
+            task.status_reason = interruption_reason
+            task.completed_tick = ticks_executed
+        controls.append({
+            "action": "interrupt_scenario_and_preserve_partial_evidence",
+            "status": "INTERRUPTED",
+            "tick": ticks_executed,
+            "reason": interruption_reason,
+        })
+        try:
+            events.extend(adapter.drain_events())
+        except Exception:
+            pass
+        try:
+            final_states = vehicle_state_snapshot(adapter.list_states())
+        except Exception:
+            final_states = []
+        _publish_runtime_snapshot(
+            runtime_publisher, adapter, tasks, workload, structural, name,
+            ticks_executed, "finish", outcome={
+                "status": "INTERRUPTED",
+                "completed_task_count": sum(
+                    item.status == "completed" for item in tasks
+                ),
+                "task_count": len(tasks),
+                "reason": interruption_reason,
+            },
+        )
     finally:
         if not check_only:
             destroyed = _runtime_adapter_call(adapter.destroy_spawned_vehicles)
@@ -2781,11 +3647,22 @@ def run_carla_scenario_execution(scenario: str, config: Any,
     # validation can verify the same semantics against measured execution.
     result = dict(structural)
     result.update({
-        "status": "PASS" if completed == len(tasks) else "PARTIAL",
+        "status": (
+            "INTERRUPTED" if interrupted
+            else "PASS" if completed == len(tasks) else "PARTIAL"
+        ),
         "mode": "carla_multi_scenario_execution", "scenario_key": name,
-        "scenario_id": workload["config"].scenario_id, "seed": workload["seed"],
+        "scenario_id": (
+            structural.get("scenario_id") or workload["config"].scenario_id
+        ),
+        # Keep the caller-visible experiment seed stable.  A scenario may use
+        # a deterministic internal workload attempt, recorded separately as
+        # ``workload_seed``/``generation_attempt`` in the structural result.
+        "seed": int(structural.get("seed", workload["seed"])),
         "vehicle_count": vehicle_count, "task_count": len(tasks),
         "completed_task_count": completed,
+        "interrupted": interrupted,
+        "interruption_reason": interruption_reason,
         "terminal_task_count": sum(item.status in TERMINAL_TASK_STATES for item in tasks),
         "ticks_requested": requested_ticks,
         "effective_execution_ticks": effective_execution_ticks,
@@ -2801,14 +3678,19 @@ def run_carla_scenario_execution(scenario: str, config: Any,
             else "LEGACY_POINT_TO_POINT_ADAPTER"
         ),
         "tick_budget": tick_budget,
+        "simulation_timing": simulation_timing,
         "ticks_executed": ticks_executed,
         "all_tasks_completed": completed == len(tasks),
         "scheduled_event_tick": scheduled_event_tick,
         "scheduled_recovery_tick": scheduled_recovery_tick,
         "event_tick": event_tick, "recovery_tick": recovery_tick,
+        "scheduled_road_clearance_tick": scheduled_road_clearance_tick,
+        "road_clearance_tick": road_clearance_tick,
+        "road_clearance_applied": road_clearance_applied,
         "configured_task_timeout_ticks": configured_timeout_ticks,
         "effective_task_timeout_ticks": effective_timeout_ticks,
         "safety_watchdog_tick_limit": effective_execution_ticks,
+        "safety_watchdog_max_extensions": MAX_SAFETY_WATCHDOG_EXTENSIONS,
         "safety_watchdog_triggered": safety_watchdog_triggered,
         "safety_watchdog_extension_count": safety_watchdog_extension_count,
         "scenario_event_applied": event_applied, "runtime_controls": controls,
@@ -2819,7 +3701,7 @@ def run_carla_scenario_execution(scenario: str, config: Any,
             "physical_concurrent_route_capacity": None,
             "capacity_source": "NOT_MULTI_TRUCK_VALIDATED",
             "runtime_admission_strategy": (
-                "TOPOLOGY_CONFLICT_SERIALIZED_WITH_HEADWAY"
+                "STAGGERED_HEADWAY_WITH_RUNTIME_RIGHT_OF_WAY"
             ),
             "topology_route_count": len(task_route_edges),
             "final_state": route_admission_state if headway_supported else {},
@@ -2858,6 +3740,7 @@ def run_carla_scenario_execution(scenario: str, config: Any,
         "final_vehicle_states": final_states, "events": events,
         "execution_diagnostics": _task_execution_diagnostics(tasks, controls),
         "runtime_telemetry": runtime_telemetry,
+        "decision_experiences": decision_experiences,
         "event_count": len(events), "execution_commands": [command.to_dict()],
         "execution_feedback": feedback, "destroyed_vehicle_count": destroyed,
         "database_recording": False,
@@ -2903,6 +3786,9 @@ def run_carla_scenario_execution(scenario: str, config: Any,
     )
     normalized["data_contract"]["production_runtime"] = (
         "openpit.production-runtime.v1"
+    )
+    normalized["data_contract"]["decision_experience"] = (
+        "openpit.decision-experience.v1"
     )
     normalized["concrete_episode_v2"]["production_system"][
         "runtime_status"

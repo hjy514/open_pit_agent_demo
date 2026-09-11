@@ -120,7 +120,9 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
                                    minimum_length_m: float = 500.0,
                                    maximum_length_m: float = 3000.0,
                                    scenario_key: str = "s07",
-                                   eligible_pairs_override: Optional[Set[Tuple[str, str]]] = None) -> Dict[str, Any]:
+                                   eligible_pairs_override: Optional[Set[Tuple[str, str]]] = None,
+                                   allow_temporary_control_wait: bool = False,
+                                   ) -> Dict[str, Any]:
     """Run a seeded road-edge closure and selective route-replanning episode.
 
     The interruption is admitted only when it affects part of the active
@@ -287,6 +289,16 @@ def run_random_s07_structural_mock(config: Any, seed: Optional[int] = None,
                     start, goal = anchors.get(start_id), anchors.get(goal_id)
                     if start is None or goal is None:
                         break
+                    if allow_temporary_control_wait:
+                        original = route_planner.plan(start, goal).to_dict()
+                        solutions[task_id] = {
+                            "action_type": "hold_for_temporary_control",
+                            "vehicle_id": assignment_by_task[task_id].vehicle_id,
+                            "start_point_id": start_id,
+                            "route": original,
+                            "candidate_evaluations": [],
+                        }
+                        continue
                     alternative = route_planner.plan(
                         start, goal, closed_edge_ids={edge_id}
                     ).to_dict()

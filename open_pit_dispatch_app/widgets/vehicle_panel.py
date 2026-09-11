@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 
 from windows.vehicle_management_window import VehicleManagementWindow
 from ui.vehicle_labels import (
+    communication_label,
     health_label,
     status_label,
     task_label,
@@ -38,7 +39,7 @@ class VehicleCard(QFrame):
         speed = data.get("speed", "-")
         task = task_label(data.get("task"))
         health = health_label(data.get("health", "-"))
-        communication = data.get("communication", "-")
+        communication = communication_label(data.get("communication", "-"))
 
         label = QLabel(
             "<b>{}</b><br>"
@@ -90,7 +91,7 @@ class VehiclePanel(QWidget):
         button.clicked.connect(self.open_window)
         layout.addWidget(button)
 
-        self.connection_label = QLabel("Agent API：正在连接")
+        self.connection_label = QLabel("智能体服务：正在连接")
         layout.addWidget(self.connection_label)
 
         self.scroll = QScrollArea()
@@ -121,14 +122,14 @@ class VehiclePanel(QWidget):
             self.vehicle_data = self.fetch_vehicle_data()
 
             self.connection_label.setText(
-                "Agent API：已连接"
+                "智能体服务：已连接"
             )
 
             self.rebuild_cards()
 
         except Exception as error:
             self.connection_label.setText(
-                f"Agent API：连接失败\n{error}"
+                f"智能体服务：连接失败\n{error}"
             )
 
     def rebuild_cards(self):

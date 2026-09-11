@@ -10,6 +10,7 @@ from PyQt6.QtNetwork import (
     QNetworkRequest,
 )
 from PyQt6.QtWidgets import (
+    QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -21,19 +22,20 @@ from PyQt6.QtWidgets import (
 
 API_BASE_URL = "http://127.0.0.1:8000"
 
-DEFAULT_STREAMS = [
-    ("global", "矿山全局视角"),
-    ("inspection_vehicle_01", "矿区巡检矿卡01"),
-    ("inspection_vehicle_02", "边坡复核矿卡02"),
-    ("emergency_vehicle_01", "综合巡检矿卡03"),
+VIEW_SLOTS = [
+    ("global", "矿山全局视角", False),
+    ("vehicle_slot_1", "车辆视角 1", True),
+    ("vehicle_slot_2", "车辆视角 2", True),
+    ("vehicle_slot_3", "车辆视角 3", True),
 ]
 
 
 class CameraTile(QFrame):
 
-    def __init__(self, stream_id, title, parent=None):
+    def __init__(self, slot_id, title, selectable=False, parent=None):
         super().__init__(parent)
-        self.stream_id = stream_id
+        self.slot_id = slot_id
+        self.stream_id = "global" if slot_id == "global" else None
         self._source_pixmap = None
         self.setObjectName("cameraTile")
         self.setStyleSheet(
@@ -45,11 +47,28 @@ class CameraTile(QFrame):
         layout.setContentsMargins(7, 6, 7, 7)
         layout.setSpacing(5)
 
-        self.title_label = QLabel(title)
-        self.title_label.setStyleSheet(
-            "font-size:15px;font-weight:bold;color:#e9f3f7;"
-        )
-        layout.addWidget(self.title_label)
+        if selectable:
+            title_row = QHBoxLayout()
+            self.title_label = QLabel(title)
+            self.title_label.setStyleSheet(
+                "font-size:15px;font-weight:bold;color:#e9f3f7;"
+            )
+            title_row.addWidget(self.title_label)
+            self.selector = QComboBox()
+            self.selector.setMinimumWidth(190)
+            self.selector.setToolTip("选择要跟随的运行车辆")
+            self.selector.currentIndexChanged.connect(
+                self._on_stream_changed
+            )
+            title_row.addWidget(self.selector, 1)
+            layout.addLayout(title_row)
+        else:
+            self.selector = None
+            self.title_label = QLabel(title)
+            self.title_label.setStyleSheet(
+                "font-size:15px;font-weight:bold;color:#e9f3f7;"
+            )
+            layout.addWidget(self.title_label)
 
         self.image_label = QLabel("等待 CARLA 摄像头画面……")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -61,6 +80,29 @@ class CameraTile(QFrame):
 
     def set_title(self, title):
         self.title_label.setText(str(title))
+
+    def set_stream_choices(self, streams, preferred_index=0):
+        if self.selector is None:
+            return
+        previous = self.stream_id
+        self.selector.blockSignals(True)
+        self.selector.clear()
+        for item in streams:
+            self.selector.addItem(str(item.get("name") or item["id"]), item["id"])
+        selected = self.selector.findData(previous) if previous else -1
+        if selected < 0 and self.selector.count():
+            selected = min(preferred_index, self.selector.count() - 1)
+        self.selector.setCurrentIndex(selected)
+        self.stream_id = self.selector.currentData() if selected >= 0 else None
+        self.selector.blockSignals(False)
+        if previous != self.stream_id:
+            self._source_pixmap = None
+            self.set_waiting("等待所选车辆画面……")
+
+    def _on_stream_changed(self):
+        self.stream_id = self.selector.currentData()
+        self._source_pixmap = None
+        self.set_waiting("正在切换车辆视角……")
 
     def set_frame(self, payload):
         pixmap = QPixmap()
@@ -126,9 +168,9 @@ class CameraWall(QWidget):
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(7)
         grid.setVerticalSpacing(7)
-        for index, (stream_id, stream_name) in enumerate(DEFAULT_STREAMS):
-            tile = CameraTile(stream_id, stream_name)
-            self.tiles[stream_id] = tile
+        for index, (slot_id, stream_name, selectable) in enumerate(VIEW_SLOTS):
+            tile = CameraTile(slot_id, stream_name, selectable=selectable)
+            self.tiles[slot_id] = tile
             grid.addWidget(tile, index // 2, index % 2)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
@@ -176,11 +218,26 @@ class CameraWall(QWidget):
                 for item in streams
                 if item.get("frame_available")
             }
-            for item in streams:
-                stream_id = str(item.get("id", ""))
-                tile = self.tiles.get(stream_id)
-                if tile is not None and item.get("name"):
-                    tile.set_title(item["name"])
+            overview = next(
+                (item for item in streams if item.get("kind") == "overview"),
+                None,
+            )
+            global_tile = self.tiles["global"]
+            global_tile.stream_id = str(
+                overview.get("id", "global") if overview else "global"
+            )
+            if overview and overview.get("name"):
+                global_tile.set_title(overview["name"])
+            vehicle_streams = [
+                {"id": str(item.get("id", "")),
+                 "name": str(item.get("name") or item.get("id", ""))}
+                for item in streams if item.get("kind") == "vehicle"
+            ]
+            for index, slot_id in enumerate(
+                    ("vehicle_slot_1", "vehicle_slot_2", "vehicle_slot_3")):
+                self.tiles[slot_id].set_stream_choices(
+                    vehicle_streams, preferred_index=index
+                )
             if payload.get("status") == "online":
                 self.connection_label.setText("● 四路画面实时更新")
                 self.connection_label.setStyleSheet(
@@ -194,30 +251,34 @@ class CameraWall(QWidget):
             reply.deleteLater()
 
     def refresh_frames(self):
-        for stream_id in self.available_stream_ids:
-            if stream_id not in self.tiles:
+        for slot_id, tile in self.tiles.items():
+            stream_id = tile.stream_id
+            if not stream_id or stream_id not in self.available_stream_ids:
                 continue
-            if stream_id in self._frame_requests_active:
+            if slot_id in self._frame_requests_active:
                 continue
-            self._frame_requests_active.add(stream_id)
+            self._frame_requests_active.add(slot_id)
             reply = self._request(
                 "/camera/{}/frame?t={}".format(
                     stream_id, int(time.time() * 1000)
                 )
             )
             reply.setProperty("stream_id", stream_id)
+            reply.setProperty("slot_id", slot_id)
             reply.finished.connect(
                 lambda current_reply=reply: self._handle_frame(current_reply)
             )
 
     def _handle_frame(self, reply):
         stream_id = str(reply.property("stream_id"))
-        self._frame_requests_active.discard(stream_id)
+        slot_id = str(reply.property("slot_id"))
+        self._frame_requests_active.discard(slot_id)
         try:
             if reply.error() != QNetworkReply.NetworkError.NoError:
                 return
-            tile = self.tiles.get(stream_id)
-            if tile is not None and tile.set_frame(bytes(reply.readAll())):
+            tile = self.tiles.get(slot_id)
+            if (tile is not None and tile.stream_id == stream_id
+                    and tile.set_frame(bytes(reply.readAll()))):
                 self._last_frame_time = time.monotonic()
         finally:
             reply.deleteLater()

@@ -84,22 +84,22 @@ class HumanDispatchWindow(QDialog):
         subtitle.setStyleSheet("font-size:15px;color:#555;")
         root.addWidget(subtitle)
 
-        self.connection_label = QLabel("Agent API：正在连接")
+        self.connection_label = QLabel("智能体服务：正在连接")
         root.addWidget(self.connection_label)
 
         body = QHBoxLayout()
 
-        recommendation_box = QGroupBox("AI决策方案")
+        recommendation_box = QGroupBox("智能决策建议与候选评分")
         recommendation_layout = QVBoxLayout()
         self.recommendation_text = QTextEdit()
         self.recommendation_text.setReadOnly(True)
         recommendation_layout.addWidget(self.recommendation_text)
 
-        self.accept_button = QPushButton("按AI推荐下派接管任务")
+        self.accept_button = QPushButton("按智能推荐下派接管任务")
         self.accept_button.clicked.connect(self.accept_ai_plan)
         recommendation_layout.addWidget(self.accept_button)
 
-        self.reject_button = QPushButton("驳回AI方案")
+        self.reject_button = QPushButton("驳回智方案并保持安全等待")
         self.reject_button.clicked.connect(self.reject_ai_plan)
         recommendation_layout.addWidget(self.reject_button)
 
@@ -218,12 +218,12 @@ class HumanDispatchWindow(QDialog):
             if not isinstance(self.pending_decision_points, list):
                 self.pending_decision_points = []
             self.api_error = None
-            self.connection_label.setText("Agent API：已连接")
+            self.connection_label.setText("智能体服务：已连接")
             self.connection_label.setStyleSheet("color:#1b8f3a;")
         except Exception as error:
             self.api_error = str(error)
             self.connection_label.setText(
-                "Agent API连接失败：{}".format(error)
+                "智能体服务连接失败：{}".format(error)
             )
             self.connection_label.setStyleSheet("color:#b71c1c;")
             return
@@ -307,7 +307,7 @@ class HumanDispatchWindow(QDialog):
                     "running": "执行中",
                     "completed": "已完成",
                 }.get(task_status, status_label(task_status))
-                prefix = "【AI接管·{}】".format(phase)
+                prefix = "【智能接管·{}】".format(phase)
                 vehicle_text = "接管车：{}".format(
                     vehicle_name_by_id(
                         assigned_id or recommended_id,
@@ -401,11 +401,11 @@ class HumanDispatchWindow(QDialog):
         assigned_id = task.get("assigned_vehicle_id")
         if task.get("handover_reason") and recommended_id:
             if task_status == "completed":
-                title = "AI接管方案（已完成）"
+                title = "智能接管方案（已完成）"
             elif task_status in {"executing", "assigned", "running"}:
-                title = "AI接管方案（执行中）"
+                title = "智能接管方案（执行中）"
             else:
-                title = "AI接管方案（待调度员确认）"
+                title = "智能接管方案（待调度员确认）"
             relation = "原车：{} → 推荐接管：{}".format(
                 vehicle_name_by_id(original_id, self.vehicle_data),
                 vehicle_name_by_id(recommended_id, self.vehicle_data),
@@ -448,7 +448,7 @@ class HumanDispatchWindow(QDialog):
         self.accept_button.setEnabled(pending_handover)
         self.reject_button.setEnabled(pending_handover)
         if pending_handover:
-            self.accept_button.setText("按AI推荐下派接管任务")
+            self.accept_button.setText("按智能推荐下派接管任务")
         elif task and status in {"executing", "assigned", "running"}:
             self.accept_button.setText("接管方案执行中")
         elif task and status == "completed":
@@ -459,26 +459,94 @@ class HumanDispatchWindow(QDialog):
     def build_recommendation_text(self):
         if self.pending_decision_points:
             point = self.pending_decision_points[0]
+            candidate_lines = []
+            candidates = (
+                point.get("candidate_evaluations")
+                or point.get("candidate_actions")
+                or []
+            )
+            for index, candidate in enumerate(candidates):
+                if not isinstance(candidate, dict):
+                    continue
+                vehicle_id = (
+                    candidate.get("vehicle_id")
+                    or candidate.get("selected_vehicle_id")
+                    or (candidate.get("native_payload") or {}).get(
+                        "vehicle_id"
+                    )
+                )
+                score = candidate.get("total_cost")
+                if score is None:
+                    score = candidate.get("score")
+                feasible = candidate.get("feasible")
+                constraint_results = candidate.get(
+                    "constraint_results", []
+                )
+                if isinstance(constraint_results, dict):
+                    failed_constraints = [
+                        key for key, value in constraint_results.items()
+                        if value is False
+                    ]
+                else:
+                    failed_constraints = [
+                        str(item.get("constraint") or item.get("name"))
+                        for item in constraint_results
+                        if isinstance(item, dict)
+                        and item.get("passed") is False
+                    ]
+                state_text = (
+                    "通过硬约束" if feasible is not False
+                    else "不可行：{}".format(
+                        "、".join(failed_constraints) or "未通过安全约束"
+                    )
+                )
+                score_text = (
+                    "综合代价 {:.3f}".format(float(score))
+                    if score is not None else "综合代价待评估"
+                )
+                candidate_lines.append(
+                    "{}. {} ｜ {} ｜ {}".format(
+                        index + 1,
+                        vehicle_name_by_id(vehicle_id, self.vehicle_data),
+                        state_text,
+                        score_text,
+                    )
+                )
+            recommendation = point.get("recommended_action") or {}
+            recommended_vehicle = (
+                point.get("recommended_vehicle_id")
+                or recommendation.get("selected_vehicle_id")
+                or recommendation.get("vehicle_id")
+            )
             return (
                 "【需要人工确认】\n"
                 "决策编号：{}\n"
                 "场景：{}\n"
                 "推荐动作：{}\n"
+                "推荐车辆：{}\n"
                 "决策原因：{}\n\n"
-                "批准后，CARLA执行已生成的安全接管/改道方案；"
-                "驳回或不处理时，受影响车队保持安全暂停。"
+                "【候选车辆与约束】\n{}\n\n"
+                "【调度员操作】\n"
+                "接受推荐：点击下方“批准当前事件调度方案”。\n"
+                "人工改派：在右侧选择任务和车辆并下派，"
+                "确认指令入队后再批准当前事件方案。\n"
+                "暂不处理或驳回时，受影响车队保持安全等待。"
             ).format(
                 point.get("decision_point_id", "-"),
                 point.get("scenario_key", "-"),
-                point.get("action_type", "-"),
+                action_label(point.get("action_type", "-")),
+                vehicle_name_by_id(
+                    recommended_vehicle, self.vehicle_data
+                ),
                 point.get("reason", "-"),
+                "\n".join(candidate_lines) or "暂无可显示的候选评分",
             )
         tasks = self.dispatch_data.get("tasks", [])
         if not tasks:
-            return "当前没有AI调度建议。\n\n请先运行Agent场景。"
+            return "当前没有智能调度建议。\n\n请先运行场景。"
         recommended_task = self.ai_recommended_task()
         if recommended_task is None:
-            return "当前没有AI调度建议。"
+            return "当前没有智能调度建议。"
         is_takeover = bool(recommended_task.get("handover_reason"))
         candidate_lines = []
         if is_takeover:
@@ -565,7 +633,7 @@ class HumanDispatchWindow(QDialog):
         task_status = str(recommended_task.get("status", "")).lower()
         if is_takeover and task_status == "pending":
             next_step = (
-                "点击“按AI推荐下派接管任务”，"
+                "点击“按智能推荐下派接管任务”，"
                 "或在右侧更换车辆后人工下派。"
             )
         elif task_status in {"executing", "assigned", "running"}:
@@ -631,7 +699,7 @@ class HumanDispatchWindow(QDialog):
             return
         task = self.ai_recommended_task()
         if task is None:
-            QMessageBox.warning(self, "没有方案", "当前没有AI方案。")
+            QMessageBox.warning(self, "没有方案", "当前没有智能调度方案。")
             return
         is_handover = bool(
             task.get("handover_reason")
@@ -649,7 +717,7 @@ class HumanDispatchWindow(QDialog):
                 "vehicle_id": vehicle_id,
                 "source": "human_operator",
             },
-            "已接受AI方案",
+            "已接受智能调度方案",
         )
         if is_handover and vehicle_id:
             self.queue_control_command(
@@ -674,7 +742,7 @@ class HumanDispatchWindow(QDialog):
                 "run_id": self.dispatch_data.get("run_id"),
                 "source": "human_operator",
             },
-            "已驳回AI方案",
+            "已驳回智能调度方案",
         )
 
     def resolve_pending_decision_point(self, response):
