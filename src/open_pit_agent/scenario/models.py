@@ -312,6 +312,22 @@ def build_unified_decisions(result: Dict[str, Any]) -> List[Dict[str, Any]]:
         ("route_response", "route_changes"),
         ("compound_failure_response", "compound_failure_decisions"),
     ]
+    multi_objective_rankings = {}
+    policy_comparison = result.get("policy_comparison")
+    if isinstance(policy_comparison, dict):
+        for comparison in policy_comparison.get("comparisons", []):
+            if not isinstance(comparison, dict) or not comparison.get("task_id"):
+                continue
+            ranking = comparison.get("v1_candidate_ranking")
+            if isinstance(ranking, list) and ranking:
+                multi_objective_rankings[str(comparison["task_id"])] = [
+                    dict(candidate) for candidate in ranking
+                    if isinstance(candidate, dict)
+                ]
+    baseline_rankings = result.get("candidate_rankings")
+    if not isinstance(baseline_rankings, dict):
+        baseline_rankings = {}
+
     records = []
     for decision_type, field_name in collections:
         values = result.get(field_name)
@@ -325,6 +341,16 @@ def build_unified_decisions(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 item.get("selected_vehicle_id") or item.get("vehicle_id")
                 or item.get("assigned_vehicle_id")
             )
+            candidate_evaluations = item.get("candidate_evaluations", [])
+            if not isinstance(candidate_evaluations, list):
+                candidate_evaluations = []
+            if not candidate_evaluations and decision_type == "assignment" \
+                    and task_id is not None:
+                candidate_evaluations = (
+                    multi_objective_rankings.get(str(task_id))
+                    or baseline_rankings.get(str(task_id))
+                    or []
+                )
             records.append({
                 "schema_version": DECISION_RECORD_SCHEMA_VERSION,
                 "decision_id": str(item.get("decision_id") or "{}:{}:{}".format(
@@ -340,7 +366,10 @@ def build_unified_decisions(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "score": item.get("score") if item.get("score") is not None else item.get("total_cost"),
                 "reason": item.get("reason") or item.get("recommendation_reason"),
                 "constraint_results": item.get("constraint_results", {}),
-                "candidate_evaluations": item.get("candidate_evaluations", []),
+                "candidate_evaluations": [
+                    dict(candidate) for candidate in candidate_evaluations
+                    if isinstance(candidate, dict)
+                ],
                 "native_payload": dict(item),
             })
     return records
@@ -364,6 +393,10 @@ def build_decision_points(
     response_decisions = [
         item for item in decisions if item.get("decision_type") != "assignment"
     ]
+    assignment_candidates_by_task = {
+        str(item.get("task_id")): list(item.get("candidate_evaluations") or [])
+        for item in assignment_decisions if item.get("task_id")
+    }
     points = []
 
     def point_payload(
@@ -371,6 +404,26 @@ def build_decision_points(
         review_policy: str, affected: Dict[str, Any], event_id: Optional[str],
     ) -> Dict[str, Any]:
         recommended = dict(items[0]) if items else None
+        candidate_evaluations = []
+        for item in items:
+            values = item.get("candidate_evaluations", [])
+            if isinstance(values, list):
+                candidate_evaluations.extend(
+                    dict(candidate) for candidate in values
+                    if isinstance(candidate, dict)
+                )
+        unique_candidates = []
+        seen_candidates = set()
+        for candidate in candidate_evaluations:
+            identity = (
+                candidate.get("vehicle_id"),
+                candidate.get("action_type"),
+                candidate.get("task_id"),
+            )
+            if identity in seen_candidates:
+                continue
+            seen_candidates.add(identity)
+            unique_candidates.append(candidate)
         return {
             "schema_version": DECISION_POINT_SCHEMA_VERSION,
             "decision_point_id": point_id,
@@ -379,7 +432,20 @@ def build_decision_points(
             "trigger_event_id": event_id,
             "affected_entities": dict(affected),
             "candidate_actions": [dict(item) for item in items],
+            "candidate_evaluations": unique_candidates,
             "recommended_action": recommended,
+            "recommended_vehicle_id": (
+                recommended.get("selected_vehicle_id")
+                if recommended else None
+            ),
+            "action_type": (
+                recommended.get("action_type") if recommended else None
+            ),
+            "reason": recommended.get("reason") if recommended else None,
+            "constraint_results": (
+                recommended.get("constraint_results", {})
+                if recommended else {}
+            ),
             "policy_version": (
                 recommended.get("policy_version") if recommended
                 else result.get("policy_version")
@@ -428,8 +494,12 @@ def build_decision_points(
                 "score": item.get("score"),
                 "reason": item.get("reason"),
                 "constraint_results": item.get("constraint_results", {}),
-                "candidate_evaluations": item.get(
-                    "candidate_evaluations", []
+                "candidate_evaluations": (
+                    item.get("candidate_evaluations", [])
+                    or assignment_candidates_by_task.get(
+                        str(item.get("task_id"))
+                    )
+                    or []
                 ),
                 "native_payload": dict(item),
             })

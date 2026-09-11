@@ -887,7 +887,7 @@ class SqliteEvidenceStoreTest(unittest.TestCase):
                 ).fetchone()[0],
             )
             self.assertEqual(
-                2,
+                3,
                 store.connection.execute(
                     "SELECT COUNT(*) FROM episode_tasks WHERE run_id = ?",
                     (episode.run_id,),

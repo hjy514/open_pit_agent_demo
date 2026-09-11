@@ -38,3 +38,8 @@ data/models/
 open_pit_dispatch_app/data/*.json
 open_pit_dispatch_app/.venv/
 open_pit_dispatch_app/__pycache__/
+
+# 本机界面改版参考与旧摄像头备份，仅供开发者本地保留。
+dashboard_redesign_current.txt
+old_camera_source.tar.gz
+old_dashboard_reference.tar.gz

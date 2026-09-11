@@ -951,6 +951,15 @@ class UnifiedScenarioRunnerTests(unittest.TestCase):
         )
         self.assertEqual("STRUCTURALLY_EVALUATED", point["execution_status"])
         self.assertTrue(point["candidate_actions"])
+        self.assertTrue(point["candidate_evaluations"])
+        self.assertEqual(
+            point["recommended_action"]["selected_vehicle_id"],
+            point["recommended_vehicle_id"],
+        )
+        self.assertTrue(all(
+            item.get("vehicle_id")
+            for item in point["candidate_evaluations"]
+        ))
         self.assertIsNone(point["operator_response"])
 
     def test_compound_event_timeline_and_decisions_keep_event_order(self):

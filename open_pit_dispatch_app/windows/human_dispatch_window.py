@@ -460,11 +460,11 @@ class HumanDispatchWindow(QDialog):
         if self.pending_decision_points:
             point = self.pending_decision_points[0]
             candidate_lines = []
+            scored_candidates = point.get("candidate_evaluations") or []
             candidates = (
-                point.get("candidate_evaluations")
-                or point.get("candidate_actions")
-                or []
+                scored_candidates or point.get("candidate_actions") or []
             )
+            showing_action_options = not bool(scored_candidates)
             for index, candidate in enumerate(candidates):
                 if not isinstance(candidate, dict):
                     continue
@@ -504,6 +504,16 @@ class HumanDispatchWindow(QDialog):
                     "综合代价 {:.3f}".format(float(score))
                     if score is not None else "综合代价待评估"
                 )
+                if showing_action_options:
+                    candidate_lines.append(
+                        "处置方案 {} ｜ {} ｜ {} ｜ {}".format(
+                            index + 1,
+                            vehicle_name_by_id(vehicle_id, self.vehicle_data),
+                            action_label(candidate.get("action_type")),
+                            state_text,
+                        )
+                    )
+                    continue
                 candidate_lines.append(
                     "{}. {} ｜ {} ｜ {}".format(
                         index + 1,
@@ -525,7 +535,7 @@ class HumanDispatchWindow(QDialog):
                 "推荐动作：{}\n"
                 "推荐车辆：{}\n"
                 "决策原因：{}\n\n"
-                "【候选车辆与约束】\n{}\n\n"
+                "{}\n{}\n\n"
                 "【调度员操作】\n"
                 "接受推荐：点击下方“批准当前事件调度方案”。\n"
                 "人工改派：在右侧选择任务和车辆并下派，"
@@ -539,6 +549,11 @@ class HumanDispatchWindow(QDialog):
                     recommended_vehicle, self.vehicle_data
                 ),
                 point.get("reason", "-"),
+                (
+                    "【处置方案与安全约束】"
+                    if showing_action_options
+                    else "【候选车辆与综合代价】"
+                ),
                 "\n".join(candidate_lines) or "暂无可显示的候选评分",
             )
         tasks = self.dispatch_data.get("tasks", [])
