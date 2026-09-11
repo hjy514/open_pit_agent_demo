@@ -43,6 +43,8 @@ Map Resources / Route Planner → CARLA Adapter
 - `scripts/`：统一场景、数据治理和地图资源工具。
 - `tests/`：离线回归测试，用于验证数据契约、场景逻辑和调度接口；目标机器可进一步开展CARLA物理验收。
 
+环境版本、依赖安装、CARLA/地图附件和跨电脑部署步骤见：[环境配置与部署说明](docs/环境配置与部署说明.md)。
+
 ## 最短启动流程
 
 在三个终端中依次启动CARLA、Agent API和调度中心：
